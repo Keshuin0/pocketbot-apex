@@ -1,0 +1,14 @@
+{
+  "budget_usd": 10000.0,
+  "max_risk_pct": 0.5,
+  "max_daily_loss_pct": 2.0,
+  "max_open_positions": 2,
+  "max_position_pct": 25.0,
+  "max_order_usd": 2500.0,
+  "cash_buffer_pct": 10.0,
+  "min_order_usd": 5.0,
+  "min_reward_risk": 1.5,
+  "no_entries_before": "09:45",
+  "no_entries_after": "15:30",
+  "flat_by": "15:55"
+}
