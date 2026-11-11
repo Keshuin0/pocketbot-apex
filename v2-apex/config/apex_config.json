@@ -1,0 +1,83 @@
+{
+  "account_mode": "DEMO",
+  "symbols": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "XAUUSD",
+    "BTCUSD"
+  ],
+  "timeframes": [
+    "M5",
+    "M15"
+  ],
+  "feeds": {
+    "mesh_mode": "AUTO_HYDRA_MESH",
+    "primary": "ctrader",
+    "standby": "mt5",
+    "ctrader_demo_host": "demo.ctraderapi.com",
+    "ctrader_live_host": "live.ctraderapi.com",
+    "ctrader_port": 5035,
+    "dom_top_n_levels": 5,
+    "liquidity_wall_multiplier": 3.0,
+    "ctrader_commission_per_lot_usd": 4.5,
+    "mt5_commission_per_lot_usd": 4.5,
+    "ctrader_ping_ms": 12.0,
+    "mt5_ping_ms": 18.0,
+    "latency_penalty_pips_per_100ms": 0.05,
+    "spike_max_basis_multiple": 2.5
+  },
+  "filters": {
+    "regime": {
+      "enabled": true,
+      "adx_period": 14,
+      "hurst_window": 100,
+      "trending_hurst_threshold": 0.52,
+      "trending_er_threshold": 0.25,
+      "max_spread_median_multiple": 1.5,
+      "max_tick_velocity_sigma": 4.0
+    },
+    "dom_obi": {
+      "enabled": true,
+      "top_n_levels": 5,
+      "min_abs_obi_threshold": 0.15,
+      "max_spread_pct_of_sl": 0.15,
+      "min_impulse_atr_multiple": 1.5,
+      "extreme_close_fraction": 0.25,
+      "wall_min_median_multiple": 3.0,
+      "wall_max_distance_r": 0.35,
+      "max_slippage_pips": 1.5
+    },
+    "correlation_cap": {
+      "enabled": true,
+      "max_factor_risk_pct": 1.0,
+      "max_pairwise_correlation": 0.75,
+      "lookback_bars": 96
+    },
+    "ai_veto": {
+      "enabled": true,
+      "mode": "auto_studio_first",
+      "priority_order": [
+        "studio_api",
+        "agy_pro",
+        "pure_math"
+      ],
+      "studio_timeout_seconds": 4.0,
+      "agy_pro_timeout_seconds": 15.0,
+      "mcp_server": "ctrader-local",
+      "timeout_seconds": 4.0
+    },
+    "dual_feed_guard": {
+      "enabled": true,
+      "z_score_threshold": 3.0,
+      "rolling_window_ticks": 100,
+      "min_samples": 10,
+      "max_tick_age_seconds": 5.0
+    }
+  },
+  "risk": {
+    "require_hard_sl_tp": true,
+    "max_risk_per_trade_pct": 0.5,
+    "max_daily_drawdown_pct": 2.0
+  }
+}
