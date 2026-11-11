@@ -20,17 +20,38 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
-from apex.feeds.models import Side
+from apex.feeds.alias_mapper import SmartAliasMapper
+from apex.feeds.models import AssetClass, Side
 
 CANONICAL_FACTORS: tuple[str, ...] = (
     "USD",
     "EUR",
     "GBP",
     "JPY",
+    "AUD",
+    "CAD",
+    "CHF",
+    "NZD",
     "Gold",
+    "Silver",
+    "Metals_Beta",
+    "Energy_Beta",
+    "Commodities_Beta",
     "US_Tech_Beta",
+    "US_Broad_Market_Beta",
+    "Global_Equity_Beta",
     "Crypto_Beta",
 )
+
+TECH_STOCKS: set[str] = {
+    "NVDA", "TSLA", "AAPL", "MSFT", "AMZN", "META", "GOOGL", "GOOG",
+    "AMD", "NFLX", "COIN", "INTC", "CSCO", "ORCL", "CRM", "UBER",
+    "SHOP", "PLTR", "TSM", "PYPL", "SQ", "HOOD", "SNOW", "ABNB",
+    "SPOT", "QCOM", "AVGO", "TXN", "MU", "AMAT", "ADBE", "NOW",
+    "INTU", "EBAY", "ETSY", "ROKU", "TWLO", "DOCU", "PINS", "SNAP",
+    "LYFT", "BIDU", "JD", "PDD", "NTES", "BABA", "ASML", "NVIDIA",
+    "TESLA", "APPLE", "MICROSOFT", "AMAZON", "ALPHABET-A", "ALPHABET-C",
+}
 
 # Base factor decomposition for a LONG (BUY) position of +1 unit of risk.
 # A SHORT (SELL) position negates every factor weight.
@@ -50,33 +71,36 @@ _SYMBOL_LONG_FACTOR_MAP: dict[str, dict[str, float]] = {
     "BTCUSD": {"Crypto_Beta": +1.0, "USD": -1.0},
     "ETHUSD": {"Crypto_Beta": +1.0, "USD": -1.0},
     "SOLUSD": {"Crypto_Beta": +1.0, "USD": -1.0},
-    "US500": {"US_Tech_Beta": +1.0, "USD": -0.5},
-    "SPX": {"US_Tech_Beta": +1.0, "USD": -0.5},
-    "SPX500": {"US_Tech_Beta": +1.0, "USD": -0.5},
+    "US500": {"US_Broad_Market_Beta": +1.0, "USD": -0.5},
+    "SPX": {"US_Broad_Market_Beta": +1.0, "USD": -0.5},
+    "SPX500": {"US_Broad_Market_Beta": +1.0, "USD": -0.5},
     "NAS100": {"US_Tech_Beta": +1.0, "USD": -0.5},
     "NQ": {"US_Tech_Beta": +1.0, "USD": -0.5},
     "USTEC": {"US_Tech_Beta": +1.0, "USD": -0.5},
-    "TSLA": {"US_Tech_Beta": +1.0},
-    "NVDA": {"US_Tech_Beta": +1.0},
-    "AAPL": {"US_Tech_Beta": +1.0},
-    "MSFT": {"US_Tech_Beta": +1.0},
-    "AMD": {"US_Tech_Beta": +1.0},
-    "META": {"US_Tech_Beta": +1.0},
-    "AMZN": {"US_Tech_Beta": +1.0},
-    "GOOGL": {"US_Tech_Beta": +1.0},
+    "TSLA": {"US_Tech_Beta": +1.0, "Stock_TSLA": +1.0},
+    "NVDA": {"US_Tech_Beta": +1.0, "Stock_NVDA": +1.0},
+    "AAPL": {"US_Tech_Beta": +1.0, "Stock_AAPL": +1.0},
+    "MSFT": {"US_Tech_Beta": +1.0, "Stock_MSFT": +1.0},
+    "AMD": {"US_Tech_Beta": +1.0, "Stock_AMD": +1.0},
+    "META": {"US_Tech_Beta": +1.0, "Stock_META": +1.0},
+    "AMZN": {"US_Tech_Beta": +1.0, "Stock_AMZN": +1.0},
+    "GOOGL": {"US_Tech_Beta": +1.0, "Stock_GOOGL": +1.0},
 }
 
 
 def decompose_symbol_factors(symbol: str, side: Side | str) -> dict[str, float]:
-    """Decompose a symbol + side into signed underlying factor weights.
+    """Decompose any of the 251 universe symbols into signed institutional factor weights.
 
-    Examples:
-      - ``decompose_symbol_factors("EURUSD", Side.BUY)`` -> ``{"EUR": +1.0, "USD": -1.0}``
-      - ``decompose_symbol_factors("USDJPY", Side.SELL)`` -> ``{"USD": -1.0, "JPY": +1.0}``
-      - ``decompose_symbol_factors("XAUUSD", Side.BUY)`` -> ``{"Gold": +1.0, "USD": -1.0}``
+    Handles:
+      - All 86 Forex pairs across G10 and exotic currencies (e.g. EURTRY -> +EUR, -TRY).
+      - Metals: Gold (XAUUSD/XAUEUR), Silver (XAGUSD/XAGEUR), and industrial metals.
+      - Energy: WTI (XTIUSD), Brent (XBRUSD), Natural Gas (XNGUSD).
+      - Commodities: Softs & Agriculture (COFARA, CORN, COTTON, OJ, SOYBEAN, etc.).
+      - Crypto: BTC, ETH, SOL, LTC, DOGE, ADA, DOT, AVAX, LNK, XLM, etc. -> Crypto_Beta & USD.
+      - Indices: US Tech (NAS100), Broad Market (US500, US30, US2000), and Global Indices (GER40, UK100, JPN225).
+      - US Equities: All 109 single stocks mapped to US_Tech_Beta or US_Broad_Market_Beta + individual stock factor.
     """
     clean = symbol.upper().strip().lstrip("#")
-    # Strip broker suffixes such as EURUSDm, EURUSD.pro, EURUSD_i
     base_sym = clean.split(".")[0].split("_")[0]
     if len(base_sym) == 7 and base_sym.endswith("M") and base_sym[:6] in _SYMBOL_LONG_FACTOR_MAP:
         base_sym = base_sym[:6]
@@ -87,17 +111,60 @@ def decompose_symbol_factors(symbol: str, side: Side | str) -> dict[str, float]:
     if base_sym in _SYMBOL_LONG_FACTOR_MAP:
         return {factor: sign * weight for factor, weight in _SYMBOL_LONG_FACTOR_MAP[base_sym].items()}
 
-    # Generic 6-character FX pair decomposition (e.g., AUDJPY -> +AUD, -JPY)
-    if len(base_sym) == 6 and base_sym.isalpha():
-        base_ccy = base_sym[:3]
-        quote_ccy = base_sym[3:]
-        if base_ccy == "XAU":
-            base_ccy = "Gold"
-        elif base_ccy in ("BTC", "ETH", "SOL"):
-            base_ccy = "Crypto_Beta"
+    mapper = SmartAliasMapper()
+    canon = mapper.canonicalize(clean)
+    asset_class = mapper.classify_asset_class(clean)
+
+    # 1. Forex: Any 6-letter currency pair (G10 or exotics)
+    if asset_class == AssetClass.FOREX and len(canon) == 6 and canon.isalpha():
+        base_ccy = canon[:3]
+        quote_ccy = canon[3:]
         return {base_ccy: +1.0 * sign, quote_ccy: -1.0 * sign}
 
-    # Default single-stock equity -> US_Tech_Beta
+    # 2. Metals
+    if asset_class == AssetClass.METALS:
+        if canon.startswith("XAU") or canon == "GOLD":
+            quote = canon[3:] if len(canon) >= 6 else "USD"
+            return {"Gold": +1.0 * sign, quote: -1.0 * sign}
+        if canon.startswith("XAG") or canon == "SILVER":
+            quote = canon[3:] if len(canon) >= 6 else "USD"
+            return {"Silver": +1.0 * sign, quote: -1.0 * sign}
+        quote = canon[3:] if len(canon) >= 6 else "USD"
+        return {"Metals_Beta": +1.0 * sign, quote: -1.0 * sign}
+
+    # 3. Energy
+    if asset_class == AssetClass.ENERGY:
+        return {"Energy_Beta": +1.0 * sign, "USD": -1.0 * sign}
+
+    # 4. Commodities
+    if asset_class == AssetClass.COMMODITIES:
+        return {"Commodities_Beta": +1.0 * sign, "USD": -1.0 * sign}
+
+    # 5. Crypto
+    if asset_class == AssetClass.CRYPTO:
+        quote = canon[-3:] if canon.endswith(("USD", "EUR")) else "USD"
+        return {"Crypto_Beta": +1.0 * sign, quote: -1.0 * sign}
+
+    # 6. Indices
+    if asset_class == AssetClass.INDICES:
+        if canon in ("NAS100", "USTEC", "NQ"):
+            return {"US_Tech_Beta": +1.0 * sign, "USD": -0.5 * sign}
+        if canon in ("US500", "US30", "US2000", "SPX"):
+            return {"US_Broad_Market_Beta": +1.0 * sign, "USD": -0.5 * sign}
+        ccy = "EUR" if canon in ("GER40", "FRA40", "EUSTX50", "E35") else ("GBP" if canon == "UK100" else ("JPY" if canon == "JPN225" else "USD"))
+        return {"Global_Equity_Beta": +1.0 * sign, ccy: -0.5 * sign}
+
+    # 7. US Equities (all 109 single-stock CFDs)
+    if asset_class == AssetClass.US_EQUITIES:
+        ticker = mapper.canonicalize(clean)
+        is_tech = ticker in TECH_STOCKS or clean in TECH_STOCKS
+        beta_factor = "US_Tech_Beta" if is_tech else "US_Broad_Market_Beta"
+        return {beta_factor: +1.0 * sign, f"Stock_{ticker}": +1.0 * sign}
+
+    # 8. Generic 6-letter fallback
+    if len(base_sym) == 6 and base_sym.isalpha():
+        return {base_sym[:3]: +1.0 * sign, base_sym[3:]: -1.0 * sign}
+
     return {"US_Tech_Beta": +1.0 * sign}
 
 

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.1.0] - 2026-11-11
+
+### Added
+- **Full Broker Catalog Auto-Discovery (251 Symbols across MT5 & cTrader):**
+  - Dynamic broker catalog enumeration via `mt5.symbols_get()` and cTrader `ProtoOASymbolsListReq` with bidirectional smart alias mapping (`SmartAliasMapper`).
+  - Auto-categorization of 251 tradable instruments into 7 distinct asset classes: `US_EQUITIES` (109), `FOREX` (86), `INDICES` (16), `CRYPTO` (14), `METALS` (12), `COMMODITIES` (11), `ENERGY` (3).
+  - Smart ticker normalization for Fusion Markets equity CFDs (e.g., `NVIDIA` $\leftrightarrow$ `NVDA`, `Tesla` $\leftrightarrow$ `TSLA`, `Alphabet-A` $\leftrightarrow$ `GOOGL`, `JPMorganChase` $\leftrightarrow$ `JPM`) and standard aliases (`US500`/`SPX500`/`SPX`, `NAS100`/`USTEC`/`NQ`, `XTIUSD`/`WTI`/`USOUSD`).
+- **Two-Stage Full-Market Funnel Scanner (`apex/quant/universe_scanner.py`):**
+  - **Stage A (Sub-Second Universe Sweep):** High-speed filter measuring spread friction, session open/close status, and momentum/Kaufman Efficiency Ratio (ER) mover scores across all 251 symbols.
+  - **Stage B (Deep Quantitative Evaluation):** Top ranked movers feed into Hurst regime classification, Momentum/DOM OBI gating, 10,000-path Monte Carlo Time Machine, and factor exposure checks.
+  - **TUI Cockpit Universe Header:** Real-time sweep progress visualization (`Universe: X/251 Symbols Scanned (Y Closed)`).
+- **Institutional Correlation Shield Factor Decomposition:**
+  - Expanded factor decomposition mapping all 251 universe instruments into canonical factors: signed currency legs (+base / -quote), commodities, energy, crypto beta, broad market/tech beta, and single-stock factor caps (`Stock_<Ticker>`).
+  - Strict 1.0% single-factor risk capping across all active positions, preventing cross-pair concentration traps and sector/stock overexposure.
+- **Verification Suite Expansion:**
+  - Added `tests/test_phase6_universe_scanner.py`, expanding automated institutional test coverage from 25 to 32 tests (100% passing).
+
+---
+
 ## [2.0.0] - 2026-11-11
 
 ### Added
