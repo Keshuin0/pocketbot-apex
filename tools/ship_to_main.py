@@ -87,11 +87,9 @@ def main() -> int:
     print("=" * 78)
 
     # 1. Verify on develop branch
-    current_branch = get_current_branch()
-    if current_branch != "develop":
-        print(f"[*] Current branch is '{current_branch}'. Switching to 'develop'...")
+    if get_current_branch() != "develop":
+        print("[*] Switching to 'develop' branch...")
         run_cmd(["git", "checkout", "develop"])
-        current_branch = "develop"
 
     # 2. Run Security & Integrity Audit
     print("\n[Step 1/5] Running Pre-Commit Security & Integrity Audit...")
