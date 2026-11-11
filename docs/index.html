@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PocketBot Apex — Zero-Coding Beginner's Master Manual</title>
+<style>
+  :root {
+    --bg-primary: #0a0e17;
+    --bg-secondary: #111827;
+    --bg-card: #162032;
+    --bg-card-hover: #1e293b;
+    --border-color: #243247;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-dim: #64748b;
+    --accent-cyan: #06b6d4;
+    --accent-cyan-glow: rgba(6, 182, 212, 0.25);
+    --accent-green: #10b981;
+    --accent-green-bg: rgba(16, 185, 129, 0.15);
+    --accent-amber: #f59e0b;
+    --accent-amber-bg: rgba(245, 158, 11, 0.15);
+    --accent-red: #ef4444;
+    --accent-red-bg: rgba(239, 68, 68, 0.15);
+    --accent-purple: #a855f7;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    line-height: 1.6;
+    padding: 0;
+    margin: 0;
+  }
+
+  /* Layout */
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 30px 24px 80px 24px;
+  }
+
+  /* Header Hero */
+  header {
+    background: linear-gradient(180deg, #131d2e 0%, var(--bg-primary) 100%);
+    border-bottom: 1px solid var(--border-color);
+    padding: 48px 24px 40px 24px;
+    text-align: center;
+  }
+  .hero-badge {
+    display: inline-block;
+    background: var(--accent-cyan-glow);
+    color: var(--accent-cyan);
+    border: 1px solid var(--accent-cyan);
+    padding: 4px 14px;
+    border-radius: 9999px;
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+  h1 {
+    font-size: 2.75rem;
+    font-weight: 800;
+    letter-spacing: -0.025em;
+    color: #fff;
+    margin-bottom: 12px;
+  }
+  h1 span {
+    background: linear-gradient(135deg, var(--accent-cyan) 0%, #38bdf8 50%, #818cf8 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .hero-subtitle {
+    font-size: 1.2rem;
+    color: var(--text-secondary);
+    max-width: 820px;
+    margin: 0 auto 24px auto;
+  }
+
+  /* Navigation Bar */
+  .quick-nav {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 20px;
+  }
+  .nav-btn {
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-decoration: none;
+    transition: all 0.2s ease;
+  }
+  .nav-btn:hover {
+    background: var(--accent-cyan);
+    color: #041019;
+    border-color: var(--accent-cyan);
+    transform: translateY(-2px);
+  }
+
+  /* Cards & Sections */
+  .section-title {
+    font-size: 1.85rem;
+    font-weight: 700;
+    margin: 48px 0 20px 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border-bottom: 2px solid var(--border-color);
+    padding-bottom: 10px;
+  }
+  .step-num {
+    background: var(--accent-cyan);
+    color: #041019;
+    width: 36px;
+    height: 36px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    font-weight: 800;
+    font-size: 1.1rem;
+  }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+  }
+  .card-header {
+    font-size: 1.25rem;
+    font-weight: 700;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: #fff;
+  }
+
+  /* Alert Boxes */
+  .alert {
+    padding: 16px 20px;
+    border-radius: 8px;
+    margin: 16px 0;
+    font-size: 0.95rem;
+    border-left: 4px solid;
+  }
+  .alert-info {
+    background: rgba(6, 182, 212, 0.1);
+    border-color: var(--accent-cyan);
+    color: #e0f2fe;
+  }
+  .alert-warning {
+    background: var(--accent-amber-bg);
+    border-color: var(--accent-amber);
+    color: #fef3c7;
+  }
+  .alert-danger {
+    background: var(--accent-red-bg);
+    border-color: var(--accent-red);
+    color: #fee2e2;
+  }
+  .alert-success {
+    background: var(--accent-green-bg);
+    border-color: var(--accent-green);
+    color: #d1fae5;
+  }
+
+  /* Step by Step Boxes */
+  .step-box {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+  }
+  .step-box h4 {
+    color: var(--accent-cyan);
+    font-size: 1.05rem;
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 0.92rem;
+  }
+  th {
+    background: var(--bg-secondary);
+    color: var(--accent-cyan);
+    text-align: left;
+    padding: 12px 14px;
+    border: 1px solid var(--border-color);
+    font-weight: 700;
+  }
+  td {
+    padding: 10px 14px;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+  }
+  tr:nth-child(even) td {
+    background: rgba(255,255,255,0.02);
+  }
+  tr:hover td {
+    background: rgba(6, 182, 212, 0.05);
+    color: var(--text-primary);
+  }
+
+  /* Code Blocks */
+  code, pre {
+    font-family: var(--font-mono);
+  }
+  code {
+    background: rgba(0,0,0,0.3);
+    color: #38bdf8;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.88em;
+  }
+  pre {
+    background: #06090e;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 14px 18px;
+    overflow-x: auto;
+    color: #e2e8f0;
+    font-size: 0.85rem;
+    margin: 12px 0;
+  }
+
+  /* Math & Pill Badges */
+  .math-card {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.1) 0%, rgba(6, 182, 212, 0.05) 100%);
+    border: 1px solid rgba(16, 185, 129, 0.3);
+    border-radius: 12px;
+    padding: 24px;
+    margin: 20px 0;
+  }
+  .badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+  .badge-green { background: var(--accent-green-bg); color: var(--accent-green); border: 1px solid var(--accent-green); }
+  .badge-amber { background: var(--accent-amber-bg); color: var(--accent-amber); border: 1px solid var(--accent-amber); }
+  .badge-cyan  { background: var(--accent-cyan-glow); color: var(--accent-cyan); border: 1px solid var(--accent-cyan); }
+  .badge-red   { background: var(--accent-red-bg); color: var(--accent-red); border: 1px solid var(--accent-red); }
+
+  /* 7 Buttons Grid */
+  .grid-launchers {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 16px;
+    margin: 20px 0;
+  }
+  .launcher-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 18px;
+    border-left: 5px solid var(--accent-cyan);
+    transition: transform 0.2s ease, border-color 0.2s ease;
+  }
+  .launcher-card:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent-cyan);
+  }
+  .launcher-card h3 {
+    font-size: 1.05rem;
+    color: #fff;
+    margin-bottom: 6px;
+    font-family: var(--font-mono);
+  }
+  .launcher-card p {
+    font-size: 0.88rem;
+    color: var(--text-secondary);
+    line-height: 1.45;
+  }
+
+  footer {
+    text-align: center;
+    border-top: 1px solid var(--border-color);
+    padding: 40px 24px;
+    color: var(--text-dim);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="hero-badge">Institutional Algorithmic Trading Suite • v1.0</div>
+  <h1>PocketBot <span>Apex</span></h1>
+  <p class="hero-subtitle">
+    Zero-Coding Beginner's Master Manual & USB Quick-Start Guide.<br>
+    Everything you need to know to run institutional quant strategies from a USB drive in 3 minutes.
+  </p>
+  <nav class="quick-nav">
+    <a href="#quickstart" class="nav-btn">⚡ 3-Min Quick Start</a>
+    <a href="#power" class="nav-btn">🔌 Never Sleep Power Setup</a>
+    <a href="#mt5" class="nav-btn">📈 MetaTrader 5 Setup</a>
+    <a href="#math" class="nav-btn">💰 The 2R Profit Math</a>
+    <a href="#launchers" class="nav-btn">🔘 The 7 Launchers</a>
+    <a href="#dashboard" class="nav-btn">🖥️ Reading Dashboard</a>
+    <a href="#hours" class="nav-btn">⏰ Best Trading Hours</a>
+    <a href="#troubleshooting" class="nav-btn">🔧 Troubleshooting FAQ</a>
+  </nav>
+</header>
+
+<div class="container">
+
+  <!-- ==================================================================== -->
+  <!-- QUICK START -->
+  <!-- ==================================================================== -->
+  <section id="quickstart">
+    <h2 class="section-title"><span class="step-num">⚡</span> Quick Start: From USB to Autonomous Trading in 3 Minutes</h2>
+    
+    <div class="card">
+      <div class="alert alert-success">
+        <strong>Zero Coding Required:</strong> You do NOT need to write Python, manage dependencies, or touch Windows environment variables. The included 1-click batch scripts automate everything.
+      </div>
+
+      <div class="step-box">
+        <h4>1. Copy to Your Computer</h4>
+        <p>Do NOT run directly from a slow USB pendrive. Copy the <code>PocketBot_Apex</code> folder from your USB drive directly to your main drive, for example:</p>
+        <pre>C:\PocketBot_Apex   (or on your Desktop: Desktop\PocketBot_Apex)</pre>
+      </div>
+
+      <div class="step-box">
+        <h4>2. Double-Click "0_FIRST_TIME_SETUP.bat"</h4>
+        <p>Inside <code>C:\PocketBot_Apex</code>, double-click <span class="badge badge-cyan">0_FIRST_TIME_SETUP.bat</span>. It will:</p>
+        <ul style="margin: 8px 0 0 20px; font-size: 0.9rem; color: var(--text-secondary);">
+          <li>Verify 64-bit Windows.</li>
+          <li>Locate or automatically install official 64-bit Python 3.12 via Windows Package Manager (winget).</li>
+          <li>Create your local, private <code>.venv</code> environment (keeping your computer 100% clean).</li>
+          <li>Install MetaTrader 5, NumPy, SciPy, cTrader Open API, and rich quant libraries.</li>
+          <li>Run the automated test suite to prove all 25 institutional safety and quant checks pass.</li>
+          <li>Probe your live MetaTrader 5 connection and display your demo account telemetry!</li>
+        </ul>
+      </div>
+
+      <div class="step-box">
+        <h4>3. Open MetaTrader 5 & Click "Algo Trading"</h4>
+        <p>Launch MetaTrader 5, log into your free Demo account, and look at the top toolbar. Click the <span class="badge badge-green">Algo Trading</span> button so it lights up <strong>GREEN with a Play Triangle</strong>.</p>
+      </div>
+
+      <div class="step-box">
+        <h4>4. Start Trading!</h4>
+        <p>Double-click <span class="badge badge-green">2_START_APEX_AUTO_DEMO.bat</span> to start institutional autonomous execution, or <span class="badge badge-cyan">4_APEX_LIVE_DASHBOARD.bat</span> to monitor market microstructure in real time!</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================================================================== -->
+  <!-- POWER SETUP -->
+  <!-- ==================================================================== -->
+  <section id="power">
+    <h2 class="section-title"><span class="step-num">1</span> Windows "Never Sleep" Power Setup (Every Click)</h2>
+    <div class="card">
+      <p style="margin-bottom: 14px;">An algorithmic bot executes high-frequency calculations and manages active Stop-Loss/Take-Profit orders in real time. If Windows goes to sleep, your network connection pauses and the bot cannot monitor price action. Follow these clicks to prevent sleep:</p>
+
+      <div class="step-box">
+        <h4>Method A: Windows 11 & Windows 10 Settings</h4>
+        <ol style="margin-left: 20px; font-size: 0.9rem; color: var(--text-secondary);">
+          <li>Press <kbd>Win + I</kbd> to open Windows <strong>Settings</strong>.</li>
+          <li>Click <strong>System</strong> &rarr; <strong>Power &amp; battery</strong> (or <strong>Power &amp; sleep</strong>).</li>
+          <li>Under <strong>Screen and sleep</strong>:
+            <ul style="margin-top: 4px;">
+              <li><em>When plugged in, turn off my screen after:</em> Set to <strong>10 or 15 minutes</strong> (screen can turn off to save power).</li>
+              <li><em>When plugged in, put my device to sleep after:</em> Set strictly to <strong style="color: var(--accent-green);">NEVER</strong>.</li>
+            </ul>
+          </li>
+        </ol>
+      </div>
+
+      <div class="step-box">
+        <h4>Method B: Classic Control Panel (Recommended for 24/7 Laptops & Desktops)</h4>
+        <ol style="margin-left: 20px; font-size: 0.9rem; color: var(--text-secondary);">
+          <li>Press <kbd>Win + R</kbd>, type <code>powercfg.cpl</code>, and press <kbd>Enter</kbd>.</li>
+          <li>Select <strong>High Performance</strong> or <strong>Balanced</strong>, and click <strong>Change plan settings</strong>.</li>
+          <li>Set <strong>Put the computer to sleep:</strong> to <strong style="color: var(--accent-green);">Never</strong>.</li>
+          <li>If using a laptop, click <em>"Choose what closing the lid does"</em> on the left sidebar, and set <em>When I close the lid</em> to <strong style="color: var(--accent-green);">Do nothing</strong> so the bot trades with the lid closed!</li>
+        </ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================================================================== -->
+  <!-- METATRADER 5 SETUP -->
+  <!-- ==================================================================== -->
+  <section id="mt5">
+    <h2 class="section-title"><span class="step-num">2</span> MetaTrader 5 Setup &amp; Avoiding Error 10026</h2>
+    <div class="card">
+      <div class="step-box">
+        <h4>Step 1: Download &amp; Install MetaTrader 5</h4>
+        <p>Download the free official MetaTrader 5 terminal from <a href="https://www.metatrader5.com" target="_blank" style="color: var(--accent-cyan); text-decoration: underline;">https://www.metatrader5.com</a> or from any regulated broker (Fusion Markets, IC Markets, Pepperstone). Install it with default settings.</p>
+      </div>
+
+      <div class="step-box">
+        <h4>Step 2: Create a Free $10,000 Demo Account in 30 Seconds</h4>
+        <ol style="margin-left: 20px; font-size: 0.9rem; color: var(--text-secondary);">
+          <li>Open MetaTrader 5.</li>
+          <li>In the top menu, click <strong>File &rarr; Open an Account</strong>.</li>
+          <li>Select <strong>MetaQuotes Software Corp.</strong> (or search for your broker) and click <strong>Next</strong>.</li>
+          <li>Choose <strong>"Open a demo account to trade with virtual money"</strong> and click <strong>Next</strong>.</li>
+          <li>Enter your Name, Email, set Deposit to <strong>$10,000</strong>, Leverage to <strong>1:100</strong> or <strong>1:500</strong>, check the agreement box, and click <strong>Next</strong> &rarr; <strong>Finish</strong>!</li>
+        </ol>
+      </div>
+
+      <div class="step-box">
+        <h4>Step 3: Toggle the Green "Algo Trading" Button</h4>
+        <p>Look at the top icon toolbar in MetaTrader 5. Locate the <strong>"Algo Trading"</strong> button:</p>
+        <p style="margin-top: 6px;">
+          <span class="badge badge-red">Red Stop Square</span> = Algorithmic order submission is BLOCKED.<br>
+          <span class="badge badge-green">Green Play Triangle</span> = Algorithmic trading is ACTIVE &amp; APPROVED.
+        </p>
+        <p style="margin-top: 6px; font-size: 0.88rem; color: var(--text-secondary);">Click the button so it shows the green play triangle. Also click <strong>Tools &rarr; Options &rarr; Expert Advisors</strong> and check <em>"Allow algorithmic trading"</em>.</p>
+      </div>
+
+      <div class="alert alert-warning">
+        <strong>Why Pocket Option Fails (Error 10026 / 10027):</strong> Binary options sites (like Pocket Option) do not support true CFD/Forex order execution through MetaTrader 5. Their server locks trading and returns <code>Error 10026: Trade is disabled</code>. PocketBot Apex requires a genuine CFD broker account (such as MetaQuotes-Demo, Fusion Markets, or IC Markets).
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================================================================== -->
+  <!-- THE 2R PROFIT MATH -->
+  <!-- ==================================================================== -->
+  <section id="math">
+    <h2 class="section-title"><span class="step-num">3</span> How PocketBot Apex Makes Money: The 2R Profit Math</h2>
+    
+    <div class="math-card">
+      <h3 style="color: var(--accent-green); font-size: 1.3rem; margin-bottom: 10px;">The $0 Upfront Stake &amp; Asymmetric Risk/Reward</h3>
+      <p style="font-size: 0.95rem; margin-bottom: 14px;">
+        Unlike binary options or casinos where you "bet $100 and lose $100", professional institutional trading uses <strong>Dynamic Stop-Loss &amp; Take-Profit brackets</strong>. You do NOT pay an upfront stake. You only pay or gain the price distance the market travels:
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Parameter</th>
+            <th>Specification</th>
+            <th>Exact Dollar Impact on $10,000 Account</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Account Capital</strong></td>
+            <td>$10,000.00 (Demo/Live)</td>
+            <td>Total portfolio balance</td>
+          </tr>
+          <tr>
+            <td><strong>Max Risk per Trade (1R)</strong></td>
+            <td>0.5% of Equity</td>
+            <td><strong style="color: var(--accent-red);">$50.00 max risk</strong></td>
+          </tr>
+          <tr>
+            <td><strong>Stop-Loss Distance</strong></td>
+            <td>20.0 pips (1.5x ATR dynamic stop)</td>
+            <td>If stopped out: <span class="badge badge-red">-$50.00</span></td>
+          </tr>
+          <tr>
+            <td><strong>Take-Profit Target (2R)</strong></td>
+            <td>40.0 pips (2.0x risk distance)</td>
+            <td>If target reached: <span class="badge badge-green">+$100.00</span></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h4 style="margin: 20px 0 8px 0; color: #fff;">The 10-Trade Scenario: Winning with Only a 40% Win Rate!</h4>
+      <p style="font-size: 0.92rem; margin-bottom: 12px;">Most retail traders lose because they risk $100 to make $20. PocketBot Apex forces an asymmetric <strong>2:1 reward-to-risk ratio</strong> on every setup. Look at what happens over 10 trades even if the market moves against you 6 times out of 10:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Outcome</th>
+            <th>Trades</th>
+            <th>Math</th>
+            <th>Net Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><span class="badge badge-green">WINS (Target Hit)</span></td>
+            <td>4 trades</td>
+            <td>4 &times; +$100.00</td>
+            <td><strong style="color: var(--accent-green);">+$400.00</strong></td>
+          </tr>
+          <tr>
+            <td><span class="badge badge-red">LOSSES (Stop Hit)</span></td>
+            <td>6 trades</td>
+            <td>6 &times; -$50.00</td>
+            <td><strong style="color: var(--accent-red);">-$300.00</strong></td>
+          </tr>
+          <tr style="background: rgba(16, 185, 129, 0.15); font-weight: 700;">
+            <td colspan="3" style="color: #fff;">NET REALIZED PROFIT (40% Win Rate):</td>
+            <td style="color: var(--accent-green); font-size: 1.1rem;">+$100.00 Pure Profit</td>
+          </tr>
+        </tbody>
+      </table>
+      <p style="font-size: 0.85rem; color: var(--text-dim); margin-top: 8px;">
+        * You are wrong 60% of the time, yet your account grows by +$100.00 (+1.0% equity gain). That is the mathematical foundation of institutional quantitative trading.
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="card-header">The 6 Quantitative &amp; Microstructure Defense Layers ($0 AI Token Cost)</div>
+      <p style="font-size: 0.9rem; margin-bottom: 14px;">Every trade candidate must survive 6 rigorous quantitative filters before any order reaches a broker:</p>
+      
+      <ol style="margin-left: 20px; font-size: 0.9rem; color: var(--text-secondary); line-height: 1.8;">
+        <li><strong>Dual-Broker Ingestion:</strong> Ingests live binary Protobuf TCP ticks from cTrader and IPC ticks from MetaTrader 5 simultaneously.</li>
+        <li><strong>Real-Time Market Regime Classifier:</strong> Calculates rolling Hurst Exponents and Kaufman Efficiency Ratios. If the market is in choppy mean-reverting noise, breakout entries are blocked.</li>
+        <li><strong>Level 2 Depth of Market (DOM) Gate:</strong> Measures Order-Book Imbalance (OBI &ge; +0.15) and blocks trades if an opposing resting wall (>3x book depth) sits within 0.35R.</li>
+        <li><strong>10,000-Path Block-Bootstrap Time Machine:</strong> Resamples 60 days of historical intraday bars using Stationary Block-Bootstrap, deducting live spreads and commission friction on every path. Requires positive net Expected Value (net_avg_R &gt; 0) and sizes volume via Quarter-Kelly.</li>
+        <li><strong>Event-Driven AI Risk Veto (0-5 times/day):</strong> An adversarial AI audit acting as Macro Trap Auditor and Structural Devil's Advocate with a strict 4-second timeout. Falls back to pure math if offline.</li>
+        <li><strong>Active-Active Smart Order Router &amp; Auto-Quarantine Ledger:</strong> Routes execution to the broker venue with lowest all-in cost and demotes underperforming symbols to Paper-Shadow mode if realized EV drops 1.5 standard errors below expectation.</li>
+      </ol>
+    </div>
+  </section>
+
+  <!-- ==================================================================== -->
+  <!-- THE 7 LAUNCHERS -->
+  <!-- ==================================================================== -->
+  <section id="launchers">
+    <h2 class="section-title"><span class="step-num">4</span> The 7 Numbered Launchers Explained</h2>
+    <p style="color: var(--text-secondary); margin-bottom: 16px;">All 7 launchers are pre-configured with portable relative paths. You can double-click them right from Windows Explorer:</p>
+
+    <div class="grid-launchers">
+      <div class="launcher-card">
+        <h3>0_FIRST_TIME_SETUP.bat</h3>
+        <p><strong>The 1-Click Installer.</strong> Verifies 64-bit Windows, sets up Python 3.12, creates your private <code>.venv</code>, installs all 11 quant libraries, runs 25 automated tests, and probes MetaTrader 5.</p>
+      </div>
+
+      <div class="launcher-card">
+        <h3>1_SETUP_CTRADER_KEYS.bat</h3>
+        <p><strong>cTrader OAuth2 Key Wizard.</strong> A 60-second interactive browser setup to connect free Fusion Markets cTrader Demo accounts for Level 2 Depth of Market and ECN raw-spread trading.</p>
+      </div>
+
+      <div class="launcher-card" style="border-left-color: var(--accent-green);">
+        <h3>2_START_APEX_AUTO_DEMO.bat</h3>
+        <p><strong>Autonomous Execution Mode.</strong> Scans all 5 symbols, runs the 6 quantitative filters, evaluates 10,000 Time Machine paths, and automatically submits approved orders with server-side SL/TP.</p>
+      </div>
+
+      <div class="launcher-card" style="border-left-color: var(--accent-amber);">
+        <h3>3_START_APEX_CONFIRM.bat</h3>
+        <p><strong>Interactive Semi-Autonomous Mode.</strong> Runs the complete quant and AI pipeline, but pauses and prompts you with full trade metrics, asking <code>[Y/N]</code> before submitting any order to the broker.</p>
+      </div>
+
+      <div class="launcher-card" style="border-left-color: #818cf8;">
+        <h3>4_APEX_LIVE_DASHBOARD.bat</h3>
+        <p><strong>Live Microstructure Cockpit.</strong> Displays real-time Hurst exponents, Kaufman ER, Level 2 DOM OBI visual meters, Time Machine R expectations, best execution venues, and account P/L.</p>
+      </div>
+
+      <div class="launcher-card" style="border-left-color: var(--accent-purple);">
+        <h3>5_CONFIGURE_AI_MODE.bat</h3>
+        <p><strong>3-Tier AI Router Switcher.</strong> Zero-code menu to switch between Google AI Studio API, Google AI Pro (agy.exe), or 0ms Pure Math mode with live hot-reload without restarting the bot!</p>
+      </div>
+
+      <div class="launcher-card" style="border-left-color: #38bdf8;">
+        <h3>6_CONFIGURE_BROKER_MESH.bat</h3>
+        <p><strong>Apex Hydra Mesh &amp; SOR Switcher.</strong> Toggle Auto Hydra Mesh, cTrader Eyes + MT5 Hands, 50/50 Split Execution, or run a live broker spread, commission, and ping shootout.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================================================================== -->
+  <!-- READING THE DASHBOARD -->
+  <!-- ==================================================================== -->
+  <section id="dashboard">
+    <h2 class="section-title"><span class="step-num">5</span> Reading the Live Terminal Dashboard</h2>
+    <div class="card">
+      <p style="margin-bottom: 14px;">When running <span class="badge badge-cyan">4_APEX_LIVE_DASHBOARD.bat</span> or <span class="badge badge-green">2_START_APEX_AUTO_DEMO.bat</span>, you will see the institutional Rich terminal cockpit. Here is what each column means:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Column Header</th>
+            <th>Example</th>
+            <th>What It Means in Plain English</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Symbol</strong></td>
+            <td><code>EURUSD</code>, <code>XAUUSD</code></td>
+            <td>The currency pair, gold, or cryptocurrency being evaluated.</td>
+          </tr>
+          <tr>
+            <td><strong>Tier / TF</strong></td>
+            <td><code>TIGHT M5</code>, <code>WIDE M15</code></td>
+            <td>Tight-spread assets trade on M5; wide assets (BTC, TSLA) trade on M15 with strict momentum gates.</td>
+          </tr>
+          <tr>
+            <td><strong>Bid / Ask</strong></td>
+            <td><code>1.10913 / 1.10913</code></td>
+            <td>Live consolidated broker quote price.</td>
+          </tr>
+          <tr>
+            <td><strong>Spread</strong></td>
+            <td><code>0.2p</code></td>
+            <td>Live spread in pips. If spread widens >15% of your Stop-Loss, the bot automatically rejects entries.</td>
+          </tr>
+          <tr>
+            <td><strong>Best Venue</strong></td>
+            <td><code>MT5 (0.6p)</code>, <code>CTRADER (-0.8p)</code></td>
+            <td>The winning broker selected by the Hydra Smart Order Router based on all-in effective cost.</td>
+          </tr>
+          <tr>
+            <td><strong>Market Regime</strong></td>
+            <td><span class="badge badge-green">TRENDING_EXPANSION</span><br><span class="badge badge-amber">MEAN_REVERTING_CHOP</span></td>
+            <td><strong>Green:</strong> Clean directional trend; breakouts allowed.<br><strong>Yellow:</strong> Choppy sideways noise; breakouts blocked to protect capital.</td>
+          </tr>
+          <tr>
+            <td><strong>Hurst / ER</strong></td>
+            <td><code>H=0.62 | ER=0.45</code></td>
+            <td><code>H &gt; 0.52</code> confirms persistent trend; <code>ER &gt; 0.25</code> confirms directional efficiency.</td>
+          </tr>
+          <tr>
+            <td><strong>L2 DOM OBI</strong></td>
+            <td><code>+0.35 ███··</code></td>
+            <td>Level 2 Order-Book Imbalance visual meter. Green bars show buyer dominance; red bars show sellers.</td>
+          </tr>
+          <tr>
+            <td><strong>TM net_avg_R</strong></td>
+            <td><code>+0.428R</code></td>
+            <td>Expected Value across 10,000 Block-Bootstrap paths, after deducting live spreads and commissions.</td>
+          </tr>
+          <tr>
+            <td><strong>Q-Kelly Risk</strong></td>
+            <td><code>0.35%</code></td>
+            <td>Optimal mathematical position risk percentage (strictly capped at 0.5% max equity risk).</td>
+          </tr>
+          <tr>
+            <td><strong>AI Veto</strong></td>
+            <td><code>APPROVE (agy_pro)</code><br><code>IDLE (Quant Filtered)</code></td>
+            <td>Adversarial AI decision. Only triggers when all quantitative and microstructure filters pass.</td>
+          </tr>
+          <tr>
+            <td><strong>Ledger State</strong></td>
+            <td><span class="badge badge-cyan">ACTIVE (PF 1.45)</span><br><span class="badge badge-red">PAPER_SHADOW (PF 0.82)</span></td>
+            <td>Auto-Quarantine status. If realized outcomes bleed, the symbol is demoted to paper trading until recovery.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ==================================================================== -->
+  <!-- BEST TRADING HOURS & HONEST LIMITS -->
+  <!-- ==================================================================== -->
+  <section id="hours">
+    <h2 class="section-title"><span class="step-num">6</span> Best Trading Hours &amp; Honest Limits</h2>
+    <div class="card">
+      <div class="card-header">Institutional Liquidity Windows (New York &amp; London)</div>
+      <p style="font-size: 0.92rem; margin-bottom: 12px;">The foreign exchange and commodity markets trade 24 hours a day, but trading volume is not equal. PocketBot Apex performs best when institutional volume is highest:</p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Market Session</th>
+            <th>EST (New York Time)</th>
+            <th>UTC Time</th>
+            <th>Institutional Conditions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>London Open</strong></td>
+            <td>3:00 AM – 6:30 AM</td>
+            <td>08:00 – 11:30 UTC</td>
+            <td><span class="badge badge-green">Excellent</span> High volume, sharp European trend breakouts.</td>
+          </tr>
+          <tr>
+            <td><strong>NY / London Overlap</strong></td>
+            <td>8:00 AM – 11:30 AM</td>
+            <td>13:00 – 16:30 UTC</td>
+            <td><span class="badge badge-green">Prime Window</span> Peak worldwide liquidity, tightest spreads, lowest slippage.</td>
+          </tr>
+          <tr>
+            <td><strong>Late NY Afternoon</strong></td>
+            <td>1:00 PM – 4:00 PM</td>
+            <td>18:00 – 21:00 UTC</td>
+            <td><span class="badge badge-amber">Moderate</span> Volume dries up; market consolidates.</td>
+          </tr>
+          <tr>
+            <td><strong>Asian Session</strong></td>
+            <td>7:00 PM – 1:00 AM</td>
+            <td>00:00 – 06:00 UTC</td>
+            <td><span class="badge badge-amber">Low Volume</span> Spreads widen slightly; regime filter blocks most breakouts.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="card-header" style="margin-top: 24px;">Honest Limits &amp; The 50-Trade Profit Factor &ge; 1.30 Rule</div>
+      <div class="alert alert-danger">
+        <strong>The Golden Safety Rule:</strong> Do NOT trade with real money until you complete at least <strong>50 automated demo trades</strong> with a rolling Profit Factor of <strong>1.30 or higher</strong>!
+      </div>
+      <p style="font-size: 0.9rem; color: var(--text-secondary); line-height: 1.6;">
+        Algorithmic trading is not a get-rich-quick scheme. It is an asymmetric risk management framework. High-impact economic news events (like US Non-Farm Payrolls or CPI inflation reports) can cause sudden 10-pip spread widening. PocketBot Apex's 6 circuit breakers will automatically freeze entries during high volatility spikes, but exercising patience and letting the bot compound in Demo mode is the mark of a disciplined quantitative trader.
+      </p>
+    </div>
+  </section>
+
+  <!-- ==================================================================== -->
+  <!-- TROUBLESHOOTING FAQ -->
+  <!-- ==================================================================== -->
+  <section id="troubleshooting">
+    <h2 class="section-title"><span class="step-num">7</span> Troubleshooting FAQ (Common Fixes)</h2>
+    
+    <div class="card">
+      <div class="step-box">
+        <h4>Q: MetaTrader 5 says "Error 10026: Trade is disabled" or "Algo Trading is disabled"?</h4>
+        <p><strong>Fix:</strong> Look at the top toolbar in MetaTrader 5 and click the <strong>"Algo Trading"</strong> button so the icon turns <strong>GREEN (Play triangle)</strong>. If using Pocket Option, switch to a real CFD broker demo (MetaQuotes-Demo or Fusion Markets Demo) because binary brokers disable MetaTrader's trade API.</p>
+      </div>
+
+      <div class="step-box">
+        <h4>Q: How do I enable Google Gemini AI Veto?</h4>
+        <p><strong>Fix:</strong> Get a free Gemini API key from <a href="https://aistudio.google.com/app/apikey" target="_blank" style="color: var(--accent-cyan);">Google AI Studio</a>. Double-click <code>5_CONFIGURE_AI_MODE.bat</code>, select option <code>[1]</code>, and paste your key. It saves to <code>.env</code> automatically with hot-reload!</p>
+      </div>
+
+      <div class="step-box">
+        <h4>Q: Can I use Google Antigravity (agy.exe) for free AI audits?</h4>
+        <p><strong>Fix:</strong> Yes! If you have Antigravity installed and logged in, PocketBot Apex automatically discovers <code>agy.exe</code> and routes adversarial risk audits through your Google AI Pro session at $0 API cost.</p>
+      </div>
+
+      <div class="step-box">
+        <h4>Q: What if I have NO internet or NO AI keys?</h4>
+        <p><strong>Fix:</strong> PocketBot Apex seamlessly operates in <strong>Pure Math Mode (0ms, $0 token cost)</strong>. 100% of real-time trading logic relies on mathematical regime filtering, Level 2 order-book math, and 10,000-path Monte Carlo simulations.</p>
+      </div>
+
+      <div class="step-box">
+        <h4>Q: How do I close all open trades immediately in an emergency?</h4>
+        <p><strong>Fix:</strong> If you configured Telegram remote control, message <code>/panic_flatten</code> to your Telegram bot. Alternatively, in MetaTrader 5, press <kbd>Ctrl + T</kbd> to open the Trade tab, right-click, and select "Close All Positions".</p>
+      </div>
+    </div>
+  </section>
+
+</div>
+
+<footer>
+  <p>PocketBot Apex v1.0 • Built with Institutional Quantitative Architecture • Hard-Locked to DEMO by Default</p>
+  <p style="margin-top: 6px;">PocketBot_Apex is intended for algorithmic research and automated demo paper execution.</p>
+</footer>
+
+</body>
+</html>
