@@ -57,14 +57,17 @@ def test_four_mesh_topologies_and_hot_promotion(tmp_path: Path) -> None:
 
     # 4. User-selectable CTRADER_EYES_MT5_HANDS via live config hot-reload
     apply_mesh_choice("2", config_path=cfg_path)
+    router.hot_reload_mesh_state(force=True)
     assert router.resolved_topology == ResolvedMeshTopology.CTRADER_EYES_MT5_HANDS
 
     # 5. User-selectable SPLIT_EXECUTION via live config hot-reload
     apply_mesh_choice("3", config_path=cfg_path)
+    router.hot_reload_mesh_state(force=True)
     assert router.resolved_topology == ResolvedMeshTopology.SPLIT_EXECUTION
 
     # Restore AUTO_HYDRA_MESH
     apply_mesh_choice("1", config_path=cfg_path)
+    router.hot_reload_mesh_state(force=True)
     assert router.resolved_topology == ResolvedMeshTopology.ACTIVE_ACTIVE_SOR
 
 

@@ -58,6 +58,12 @@ def apply_mesh_choice(
     dual_cfg["enabled"] = True
     dual_cfg["mesh_mode"] = preset["mesh_mode"]
     config_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    try:
+        import os, time
+        now = time.time() + 1.0
+        os.utime(config_path, (now, now))
+    except Exception:
+        pass
     return dual_cfg
 
 
