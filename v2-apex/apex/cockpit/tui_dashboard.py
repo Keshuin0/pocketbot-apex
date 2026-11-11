@@ -88,6 +88,9 @@ class ApexTUIDashboard:
         mesh_badge: str = "Mesh: HYDRA_AUTO [MT5 Active | cTrader Ready-On-Key]",
         sor_saved_pips: float = 0.0,
         sor_saved_usd: float = 0.0,
+        universe_scanned_count: int = 0,
+        universe_total_count: int = 0,
+        universe_badge: str | None = None,
     ) -> Group:
         """Build the composite Rich Dashboard layout."""
         dd_pct = (daily_pnl_usd / account_equity_usd * 100.0) if account_equity_usd > 0 else 0.0
@@ -95,6 +98,16 @@ class ApexTUIDashboard:
 
         ct_badge = "[bold green]ONLINE[/bold green]" if ctrader_connected else "[yellow]STANDBY (.env unset)[/yellow]"
         mt5_badge = "[bold green]ONLINE[/bold green]" if mt5_connected else "[red]OFFLINE[/red]"
+
+        universe_str = ""
+        if universe_badge:
+            universe_str = f"\n[bold bright_yellow]{universe_badge}[/bold bright_yellow]"
+        elif universe_total_count > 0:
+            closed = max(0, universe_total_count - universe_scanned_count)
+            universe_str = (
+                f"\n[bold bright_yellow]Universe: {universe_scanned_count}/{universe_total_count} Symbols Scanned "
+                f"({closed} Closed) | Top Active Candidates Shown[/bold bright_yellow]"
+            )
 
         header_text = (
             f"[bold cyan]POCKETBOT APEX v1.0[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
@@ -104,6 +117,7 @@ class ApexTUIDashboard:
             f"Equity: [bold]${account_equity_usd:,.2f}[/bold] | "
             f"Daily P/L: [{pnl_style}]${daily_pnl_usd:+,.2f} ({dd_pct:+.2f}%)[/{pnl_style}] | "
             f"Open Positions: [bold]{open_positions_count}/2[/bold]"
+            f"{universe_str}"
         )
         header_panel = Panel(header_text, border_style="cyan", padding=(0, 1))
 
@@ -174,6 +188,9 @@ class ApexTUIDashboard:
         mesh_badge: str = "Mesh: HYDRA_AUTO [MT5 Active | cTrader Ready-On-Key]",
         sor_saved_pips: float = 0.0,
         sor_saved_usd: float = 0.0,
+        universe_scanned_count: int = 0,
+        universe_total_count: int = 0,
+        universe_badge: str | None = None,
     ) -> None:
         """Render a static Rich snapshot table to the terminal."""
         group = self.build_renderable(
@@ -189,5 +206,8 @@ class ApexTUIDashboard:
             mesh_badge=mesh_badge,
             sor_saved_pips=sor_saved_pips,
             sor_saved_usd=sor_saved_usd,
+            universe_scanned_count=universe_scanned_count,
+            universe_total_count=universe_total_count,
+            universe_badge=universe_badge,
         )
         self.console.print(group)

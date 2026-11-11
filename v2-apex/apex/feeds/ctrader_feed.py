@@ -16,11 +16,14 @@ from ctrader_open_api.messages import (
 )
 from dotenv import load_dotenv
 
+from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.models import (
+    AssetClass,
     Candle,
     ContractSpec,
     DOMAnalytics,
     DepthLevel,
+    DiscoveredSymbol,
     LiquidityWall,
     OrderBookSnapshot,
     Side,
@@ -421,6 +424,8 @@ class CTraderOpenApiFeed:
         self._latest_ticks: dict[str, Tick] = {}
         self._tick_callbacks: list[Callable[[Tick], None]] = []
         self._dom_callbacks: list[Callable[[DOMAnalytics], None]] = []
+        self.alias_mapper: SmartAliasMapper = SmartAliasMapper()
+        self._catalog: dict[str, DiscoveredSymbol] = {}
         self._lock = threading.RLock()
 
     @property
@@ -635,7 +640,48 @@ class CTraderOpenApiFeed:
             norm = symbol.upper()
             self._symbol_name_to_id[norm] = int(symbol_id)
             self._symbol_id_to_name[int(symbol_id)] = norm
+            self.alias_mapper.register_symbol(norm, broker="ctrader")
+            canon = self.alias_mapper.canonicalize(norm)
+            ac = self.alias_mapper.classify_asset_class(norm)
+            self._catalog[norm] = DiscoveredSymbol(
+                name=norm,
+                canonical_name=canon,
+                asset_class=ac,
+                path="",
+                digits=int(digits),
+                point=float(10 ** (-digits)),
+                trade_mode=4,
+                is_visible=True,
+                source="ctrader",
+            )
             self.get_or_create_dom_engine(norm, pip_size=pip_size, digits=digits)
+
+    def discover_catalog(self) -> list[DiscoveredSymbol]:
+        """Return discovered catalog symbols registered in cTrader."""
+        with self._lock:
+            if not self._catalog and self._symbol_name_to_id:
+                for name, sid in self._symbol_name_to_id.items():
+                    spec = self._contract_specs.get(name)
+                    dig = spec.digits if spec else 5
+                    pt = spec.point_size if spec else 1e-5
+                    canon = self.alias_mapper.canonicalize(name)
+                    ac = self.alias_mapper.classify_asset_class(name)
+                    self._catalog[name] = DiscoveredSymbol(
+                        name=name,
+                        canonical_name=canon,
+                        asset_class=ac,
+                        path="",
+                        digits=dig,
+                        point=pt,
+                        trade_mode=4,
+                        is_visible=True,
+                        source="ctrader",
+                    )
+            return list(self._catalog.values())
+
+    def get_discovered_symbols(self) -> list[DiscoveredSymbol]:
+        """Return cached discovered cTrader symbols."""
+        return self.discover_catalog()
 
     def subscribe_spots(self, symbols: Sequence[str], subscribe_to_spot_timestamp: bool = True) -> object:
         """Send ``ProtoOASubscribeSpotsReq`` for the requested symbols."""

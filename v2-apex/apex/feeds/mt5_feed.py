@@ -9,7 +9,15 @@ from typing import Sequence
 
 import MetaTrader5 as mt5
 
-from apex.feeds.models import Candle, ContractSpec, Tick, verify_live_unlock
+from apex.feeds.alias_mapper import SmartAliasMapper
+from apex.feeds.models import (
+    AssetClass,
+    Candle,
+    ContractSpec,
+    DiscoveredSymbol,
+    Tick,
+    verify_live_unlock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +53,8 @@ class MT5Feed:
         self._initialized: bool = False
         self._server_utc_offset_seconds: int = 0
         self._symbol_map: dict[str, str] = {}
+        self.alias_mapper: SmartAliasMapper = SmartAliasMapper()
+        self._catalog: dict[str, DiscoveredSymbol] = {}
 
     @property
     def is_connected(self) -> bool:
@@ -135,7 +145,7 @@ class MT5Feed:
         return self._server_utc_offset_seconds
 
     def resolve_symbol(self, symbol: str) -> str | None:
-        """Resolve a canonical symbol (e.g. ``EURUSD``) to the broker's exact symbol name (e.g. ``EURUSDm``, ``EURUSD.pro``)."""
+        """Resolve a canonical symbol (e.g. ``EURUSD``, ``NVDA``) to the broker's exact symbol name."""
         norm = symbol.upper().strip()
         if norm in self._symbol_map:
             return self._symbol_map[norm]
@@ -143,6 +153,21 @@ class MT5Feed:
         if not self._initialized:
             return None
 
+        # Check SmartAliasMapper first (e.g. NVDA -> NVIDIA, SPX500 -> US500, USOUSD -> XTIUSD)
+        candidate = self.alias_mapper.resolve_to_broker(norm, broker="mt5")
+        if candidate in self._symbol_map:
+            return self._symbol_map[candidate]
+
+        info = mt5.symbol_info(candidate)
+        if info is not None:
+            if not info.visible:
+                mt5.symbol_select(candidate, True)
+            self._symbol_map[norm] = candidate
+            self._symbol_map[candidate] = candidate
+            self.alias_mapper.register_symbol(candidate, canonical_name=norm, broker="mt5")
+            return candidate
+
+        # Try raw symbol
         info = mt5.symbol_info(norm)
         if info is not None:
             if not info.visible:
@@ -159,6 +184,77 @@ class MT5Feed:
             return best
 
         return None
+
+    def discover_catalog(self, auto_enable_market_watch: bool = True) -> list[DiscoveredSymbol]:
+        """Discover and categorize ALL symbols available in the MT5 broker catalog.
+
+        Scans the full broker catalog via ``mt5.symbols_get()``, categorizes each into an
+        exact ``AssetClass`` (FOREX, METALS, INDICES, ENERGY, CRYPTO, US_EQUITIES, COMMODITIES),
+        and optionally auto-enables all tradable instruments in Market Watch.
+        """
+        if not self._initialized:
+            if not self.connect():
+                return list(self._catalog.values())
+
+        symbols_raw = mt5.symbols_get()
+        if not symbols_raw:
+            return list(self._catalog.values())
+
+        discovered: list[DiscoveredSymbol] = []
+        for s in symbols_raw:
+            sym_name = str(s.name)
+            sym_path = str(getattr(s, "path", ""))
+            sym_desc = str(getattr(s, "description", ""))
+            trade_mode = int(getattr(s, "trade_mode", 0))
+            is_vis = bool(getattr(s, "visible", False))
+
+            asset_class = self.alias_mapper.classify_asset_class(
+                symbol=sym_name,
+                path=sym_path,
+                description=sym_desc,
+            )
+            canonical_name = self.alias_mapper.canonicalize(sym_name)
+
+            if auto_enable_market_watch and not is_vis:
+                try:
+                    mt5.symbol_select(sym_name, True)
+                    is_vis = True
+                except Exception as exc:
+                    logger.debug("Failed to select symbol %s in Market Watch: %s", sym_name, exc)
+
+            self.alias_mapper.register_symbol(
+                broker_symbol=sym_name,
+                canonical_name=canonical_name,
+                broker="mt5",
+            )
+            self._symbol_map[canonical_name] = sym_name
+            self._symbol_map[sym_name.upper()] = sym_name
+
+            item = DiscoveredSymbol(
+                name=sym_name,
+                canonical_name=canonical_name,
+                asset_class=asset_class,
+                path=sym_path,
+                digits=int(s.digits),
+                point=float(s.point),
+                trade_mode=trade_mode,
+                is_visible=is_vis,
+                source="mt5",
+                description=sym_desc,
+            )
+            self._catalog[sym_name] = item
+            discovered.append(item)
+
+        logger.info(
+            "MT5 catalog discovery complete: %d symbols found across %d asset classes.",
+            len(discovered),
+            len(set(d.asset_class for d in discovered)),
+        )
+        return discovered
+
+    def get_discovered_symbols(self) -> list[DiscoveredSymbol]:
+        """Return cached discovered catalog symbols."""
+        return list(self._catalog.values())
 
     @staticmethod
     def compute_pip_size(digits: int, point: float) -> float:
