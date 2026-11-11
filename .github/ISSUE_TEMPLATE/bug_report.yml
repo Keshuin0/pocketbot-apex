@@ -1,0 +1,56 @@
+name: Bug Report
+description: Create a report to help us improve PocketBot Apex
+title: "[BUG]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report an issue! Please ensure you do **NOT** share personal API keys, passwords, or live account credentials.
+  - type: dropdown
+    id: edition
+    attributes:
+      label: PocketBot Edition
+      description: Which edition of PocketBot are you running?
+      options:
+        - "PocketBot Apex v2 (Hydra SOR)"
+        - "PocketBot v1 Classic"
+    validations:
+      required: true
+  - type: dropdown
+    id: broker
+    attributes:
+      label: Broker & Feed Setup
+      description: Which broker connection was active?
+      options:
+        - "MetaTrader 5 (Local Terminal)"
+        - "cTrader Open API"
+        - "Dual Active-Active SOR (Both MT5 & cTrader)"
+        - "Paper-Shadow Mode"
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description of the Bug
+      description: A clear and concise description of what happened.
+      placeholder: "e.g. When running 2_START_APEX_AUTO_DEMO.bat, MT5 connection timed out..."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to Reproduce
+      description: Detailed steps to reproduce the behavior.
+      value: |
+        1. Double-click '...'
+        2. Select option '...'
+        3. See error '...'
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal Output / Error Traceback
+      description: Paste any relevant terminal logs (sanitize all account numbers/keys!).
+      render: shell

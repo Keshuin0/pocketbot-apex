@@ -1,0 +1,34 @@
+name: Broker Symbol Mapping Request
+description: Request symbol normalization or support for a new broker's naming scheme
+title: "[SYMBOL]: "
+labels: ["broker-feed", "enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Different brokers use diverse ticker suffixes (e.g., `EURUSD.raw`, `EURUSDm`, `XAUUSD.pro`). Use this form to request standard mappings or test-verified configurations.
+  - type: input
+    id: broker_name
+    attributes:
+      label: Broker Name
+      description: Name of the broker (e.g. IC Markets, Pepperstone, FTMO, Fusion Markets).
+      placeholder: "e.g. IC Markets (cTrader / MT5 Raw ECN)"
+    validations:
+      required: true
+  - type: textarea
+    id: symbol_examples
+    attributes:
+      label: Symbol Tickers & Suffixes
+      description: List the exact symbol names displayed in your Market Watch.
+      placeholder: |
+        EURUSD.raw
+        GBPUSD.raw
+        XAUUSD.raw
+        BTCUSD.raw
+    validations:
+      required: true
+  - type: textarea
+    id: specs
+    attributes:
+      label: Contract Specifications (Optional)
+      description: Mention pip size, digits, or standard lot sizes if unusual.

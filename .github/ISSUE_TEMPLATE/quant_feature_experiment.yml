@@ -1,0 +1,32 @@
+name: Quantitative Proposal / Experiment
+description: Propose an institutional quantitative feature, filter, or simulation methodology
+title: "[QUANT]: "
+labels: ["quant", "research", "feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We welcome mathematical proposals, microstructure metrics, and risk management enhancements.
+  - type: input
+    id: feature_title
+    attributes:
+      label: Feature / Filter Title
+      placeholder: "e.g. Rolling Kyle Lambda for Price Impact Estimation"
+    validations:
+      required: true
+  - type: textarea
+    id: mathematical_basis
+    attributes:
+      label: Mathematical / Statistical Basis
+      description: Provide the mathematical formulation, statistical intuition, or references.
+      placeholder: "Formulas, LaTeX math, or academic references..."
+    validations:
+      required: true
+  - type: textarea
+    id: walkforward_ab
+    attributes:
+      label: A/B Testing & Ablation Plan
+      description: How should this filter be toggled via `config/apex_config.json` for walk-forward verification?
+      placeholder: "Define the JSON toggle boolean and baseline vs. treatment hypothesis..."
+    validations:
+      required: true
