@@ -37,6 +37,7 @@ from apex.quant.momentum_dom import (
 )
 from apex.quant.regime import MarketRegime, RegimeClassifier
 from apex.quant.timemachine_v2 import BlockBootstrapTimeMachine, TimeMachineCostModel
+from apex.quant.universe_scanner import UniverseScanner, UniverseScanSummary
 
 console = Console(width=145)
 
@@ -121,165 +122,29 @@ class ApexOrchestrator:
             execution_router=self.execution_router,
             ledger_db=self.ledger,
         )
+        self.universe_scanner = UniverseScanner(
+            feed_router=self.feed_router,
+            regime_classifier=self.regime_classifier,
+            momentum_dom_gate=self.momentum_dom_gate,
+            time_machine=self.time_machine,
+            ai_committee=self.ai_committee,
+            ledger=self.ledger,
+            config=self.config,
+        )
+        self.last_scan_summary: UniverseScanSummary | None = None
 
     def run_cycle(self, symbols: Sequence[str] | None = None) -> list[SymbolCockpitRow]:
         """Run a full quantitative scan, regime classification, Time Machine v2, and ledger cycle."""
-        target_symbols = list(symbols or self.config.get("symbols", ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "BTCUSD"]))
         active_src = self.feed_router.connect()
-        rows: list[SymbolCockpitRow] = []
+        use_funnel = symbols is None and self.config.get("scanner", {}).get("mode", "FULL_MARKET_FUNNEL") == "FULL_MARKET_FUNNEL"
 
-        for sym in target_symbols:
-            norm_sym = sym.upper()
-            tier = classify_instrument_tier(norm_sym)
-            tf = "M5" if tier == InstrumentTier.TIGHT_SPREAD_M5 else "M15"
-
-            spec = self.feed_router.get_contract_spec(norm_sym)
-            pip_size = spec.pip_size if spec else (0.01 if "JPY" in norm_sym or "XAU" in norm_sym else 0.0001)
-
-            tick, _ = self.feed_router.get_tick(norm_sym)
-            candles = self.feed_router.get_candles(norm_sym, timeframe=tf, count=200)
-            dom = self.feed_router.get_dom_analytics(norm_sym)
-            q_state = self.ledger.get_quarantine_state(norm_sym)
-
-            if tick is None or len(candles) < 30:
-                rows.append(
-                    SymbolCockpitRow(
-                        symbol=norm_sym,
-                        tier=tier.value,
-                        timeframe=tf,
-                        bid=tick.bid if tick else 0.0,
-                        ask=tick.ask if tick else 0.0,
-                        spread_pips=(tick.spread / pip_size) if tick else 0.0,
-                        regime="NO_DATA",
-                        hurst=0.5,
-                        kaufman_er=0.0,
-                        obi=dom.obi if dom else None,
-                        net_avg_r=None,
-                        rec_risk_pct=None,
-                        ai_verdict="STANDBY",
-                        quarantine_mode=q_state.mode.value,
-                        profit_factor=q_state.profit_factor,
-                    )
-                )
-                continue
-
-            spread_px = tick.spread
-            spread_pips = spread_px / max(pip_size, 1e-9)
-
-            diag = self.regime_classifier.classify_candles(
-                symbol=norm_sym,
-                candles=candles,
-                current_spread=spread_px,
-            )
-
-            # Evaluate candidate 1.5x ATR stop and 2.0R target
-            atr_val = max(diag.current_atr, pip_size * 5.0)
-            sl_dist = 1.5 * atr_val
-            entry_px = tick.ask
-            stop_px = entry_px - sl_dist
-            target_px = entry_px + 2.0 * sl_dist
-
-            nbbo = self.feed_router.evaluate_nbbo(
-                symbol=norm_sym,
-                one_r_price_distance=sl_dist,
-                side=Side.BUY,
-            )
-            if nbbo.pips_saved > 0.0:
-                best_venue_str = f"{nbbo.winning_venue.upper()} (-{nbbo.pips_saved:.1f}p)"
-            else:
-                best_venue_str = f"{nbbo.winning_venue.upper()} ({nbbo.winning_cost_pips:.1f}p)"
-
-            gate_verdict = self.momentum_dom_gate.evaluate(
-                symbol=norm_sym,
-                side=Side.BUY,
-                entry_price=entry_px,
-                stop_price=stop_px,
-                candles=candles,
-                current_spread=spread_px,
-                dom_analytics=dom,
-            )
-
-            cost_model = TimeMachineCostModel(
-                commission_per_lot_round_turn_usd=4.50,
-                lots=0.10,
-                risk_per_lot_usd=100.0,
-                spread_price=spread_px,
-                vwap_slippage_price=0.2 * pip_size,
-            )
-            tm_res = self.time_machine.simulate_candles(
-                symbol=norm_sym,
-                side=Side.BUY,
-                entry_price=entry_px,
-                stop_price=stop_px,
-                target_price=target_px,
-                candles=candles,
-                horizon_bars=36,
-                cost_model=cost_model,
-            )
-
-            passed_all_quant = (
-                diag.allow_breakout_entries
-                and gate_verdict.passed
-                and tm_res.net_avg_R > 0.0
-            )
-
-            self.ledger.log_scan_event(
-                symbol=norm_sym,
-                timeframe=tf,
-                regime=diag.regime.value,
-                hurst=diag.hurst_exponent,
-                kaufman_er=diag.kaufman_er,
-                vol_pct=diag.volatility_percentile,
-                dom_obi=dom.obi if dom else None,
-                spread_pct_of_sl=gate_verdict.spread_pct_of_sl,
-                passed_quant=passed_all_quant,
-                detail=diag.reason,
-            )
-
-            ai_label = "IDLE (Quant Filtered)"
-            if passed_all_quant:
-                ctx = CandidateSetupAuditContext(
-                    symbol=norm_sym,
-                    side=Side.BUY,
-                    timeframe=tf,
-                    entry_price=entry_px,
-                    stop_loss=stop_px,
-                    take_profit=target_px,
-                    regime=diag.regime.value,
-                    hurst_exponent=diag.hurst_exponent,
-                    kaufman_er=diag.kaufman_er,
-                    volatility_percentile=diag.volatility_percentile,
-                    dom_obi=dom.obi if dom else None,
-                    spread_pct_of_sl=gate_verdict.spread_pct_of_sl,
-                    net_avg_R=tm_res.net_avg_R,
-                    prob_profit=tm_res.prob_profit,
-                    cvar_95_R=tm_res.cvar_95_R,
-                    recommended_risk_pct=tm_res.recommended_risk_pct,
-                    session_utc_iso=datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                )
-                ai_dec = self.ai_committee.evaluate_sync(ctx)
-                ai_label = f"{ai_dec.decision} ({ai_dec.provider_used})"
-
-            rows.append(
-                SymbolCockpitRow(
-                    symbol=norm_sym,
-                    tier=tier.value,
-                    timeframe=tf,
-                    bid=tick.bid,
-                    ask=tick.ask,
-                    spread_pips=spread_pips,
-                    regime=diag.regime.value,
-                    hurst=diag.hurst_exponent,
-                    kaufman_er=diag.kaufman_er,
-                    obi=dom.obi if dom else None,
-                    net_avg_r=tm_res.net_avg_R,
-                    rec_risk_pct=tm_res.recommended_risk_pct,
-                    ai_verdict=ai_label,
-                    quarantine_mode=q_state.mode.value,
-                    profit_factor=q_state.profit_factor,
-                    best_venue=best_venue_str,
-                )
-            )
+        if use_funnel:
+            rows, summary = self.universe_scanner.scan_cycle()
+            self.last_scan_summary = summary
+        else:
+            target_symbols = list(symbols or self.config.get("symbols", ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "BTCUSD"]))
+            rows, summary = self.universe_scanner.scan_cycle(target_symbols=target_symbols)
+            self.last_scan_summary = summary
 
         ai_status = self.ai_committee.get_router_status()
         sor_pips, sor_usd = self.execution_router.cumulative_sor_savings
@@ -296,6 +161,8 @@ class ApexOrchestrator:
             mesh_badge=self.feed_router.dashboard_mesh_badge,
             sor_saved_pips=sor_pips,
             sor_saved_usd=sor_usd,
+            universe_scanned_count=self.last_scan_summary.open_scanned if self.last_scan_summary else 0,
+            universe_total_count=self.last_scan_summary.total_scanned if self.last_scan_summary else 0,
         )
         return rows
 

@@ -15,6 +15,40 @@ class Side(str, Enum):
     SELL = "SELL"
 
 
+class AssetClass(str, Enum):
+    """Categorization for trading universe symbols across MT5 and cTrader."""
+
+    FOREX = "FOREX"
+    METALS = "METALS"
+    INDICES = "INDICES"
+    ENERGY = "ENERGY"
+    CRYPTO = "CRYPTO"
+    US_EQUITIES = "US_EQUITIES"
+    COMMODITIES = "COMMODITIES"
+    OTHER = "OTHER"
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredSymbol:
+    """Discovered broker symbol with asset class classification and trading status."""
+
+    name: str
+    canonical_name: str
+    asset_class: AssetClass
+    path: str
+    digits: int
+    point: float
+    trade_mode: int
+    is_visible: bool
+    source: str
+    description: str = ""
+
+    @property
+    def is_tradable(self) -> bool:
+        """Return True if symbol allows trading (not disabled)."""
+        return self.trade_mode != 0
+
+
 class LiveLockViolationError(RuntimeError):
     """Raised when attempting to connect to a LIVE broker without dual safety unlock."""
 

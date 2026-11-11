@@ -21,9 +21,11 @@ from apex.feeds.hydra_nbbo import (
     VenueFeeProfile,
 )
 from apex.feeds.models import (
+    AssetClass,
     Candle,
     ContractSpec,
     DOMAnalytics,
+    DiscoveredSymbol,
     Side,
     Tick,
     TickDiscrepancyAlert,
@@ -420,6 +422,20 @@ class MarketFeedRouter:
             self._active_source = "offline"
         return self.active_source
 
+    def discover_catalog(self, auto_enable_market_watch: bool = True) -> list[DiscoveredSymbol]:
+        """Discover the combined universe catalog across active broker venues."""
+        combined: dict[str, DiscoveredSymbol] = {}
+        if self.mt5.is_connected or self._active_source in ("mt5", "hydra_sor"):
+            for s in self.mt5.discover_catalog(auto_enable_market_watch=auto_enable_market_watch):
+                combined[s.name] = s
+
+        if self.ctrader.is_connected or self._active_source in ("ctrader", "hydra_sor"):
+            for s in self.ctrader.discover_catalog():
+                if s.name not in combined:
+                    combined[s.name] = s
+
+        return list(combined.values())
+
     def shutdown(self) -> None:
         """Cleanly stop both cTrader and MT5 feeds."""
         self.ctrader.stop()
@@ -526,7 +542,11 @@ class MarketFeedRouter:
         """Return Cross-Pollinated Level 2 DOM analytics for ``symbol`` whenever cTrader DOM has quotes."""
         norm = symbol.upper()
         if norm not in self.ctrader._dom_engines:
-            return None
+            canon = self.ctrader.alias_mapper.canonicalize(norm)
+            if canon in self.ctrader._dom_engines:
+                norm = canon
+            else:
+                return None
         snap = self.ctrader._dom_engines[norm].snapshot()
         if not snap.bids and not snap.asks:
             return None
@@ -539,5 +559,10 @@ class MarketFeedRouter:
         target_volume_units: float,
     ) -> VWAPExecutionEstimate:
         """Compute expected Level 2 DOM VWAP fill price and slippage for ``symbol``."""
-        engine = self.ctrader.get_or_create_dom_engine(symbol.upper())
+        norm = symbol.upper()
+        if norm not in self.ctrader._dom_engines:
+            canon = self.ctrader.alias_mapper.canonicalize(norm)
+            if canon in self.ctrader._dom_engines:
+                norm = canon
+        engine = self.ctrader.get_or_create_dom_engine(norm)
         return engine.compute_vwap_fill(side=side, target_volume_units=target_volume_units)

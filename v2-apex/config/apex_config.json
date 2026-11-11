@@ -75,6 +75,13 @@
       "max_tick_age_seconds": 5.0
     }
   },
+  "scanner": {
+    "mode": "FULL_MARKET_FUNNEL",
+    "max_candidates_per_cycle": 12,
+    "auto_enable_market_watch": true,
+    "max_tick_age_seconds": 180.0,
+    "min_candles_required": 30
+  },
   "risk": {
     "require_hard_sl_tp": true,
     "max_risk_per_trade_pct": 0.5,
