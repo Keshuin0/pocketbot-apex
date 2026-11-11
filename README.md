@@ -10,7 +10,7 @@
 
 PocketBot Apex is an institutional-grade, multi-venue quantitative algorithmic trading system engineered for MetaTrader 5 (MT5) and cTrader. It is structured as a **Dual-Edition Monorepo** providing two distinct production tiers:
 1. **PocketBot v1 Classic (`v1-classic/`):** Lightweight, zero-configuration autonomous trading designed for beginners running a single MetaTrader 5 account.
-2. **PocketBot Apex v2 Hydra SOR (`v2-apex/`):** Institutional multi-venue execution engine with an Active-Active Smart Order Router (SOR), Level 2 Depth of Market (DOM) Order-Book Imbalance (OBI), 10,000-path stationary block-bootstrap simulations, and an event-driven 3-Tier AI Risk Committee.
+2. **PocketBot Apex v2 Hydra SOR (`v2-apex/`):** Institutional multi-venue execution engine with an Active-Active Smart Order Router (SOR), full 251-symbol broker catalog auto-discovery across 7 asset classes, Level 2 Depth of Market (DOM) Order-Book Imbalance (OBI), 10,000-path stationary block-bootstrap simulations, and an event-driven 3-Tier AI Risk Committee.
 
 ---
 
@@ -47,6 +47,27 @@ flowchart TD
         SOR --> DB[(SQLite Walk-Forward Auto-Quarantine Ledger)]
     end
 ```
+
+---
+
+## 🌌 251-Symbol Two-Stage Universe Funnel & Smart Alias Mapper
+
+PocketBot Apex dynamically queries the full broker catalog via MetaTrader 5 (`mt5.symbols_get()`) and cTrader Open API (`ProtoOASymbolsListReq`), classifying all tradable instruments into 7 asset classes:
+
+| Asset Class | Symbols | Key Instruments & Coverage |
+| :--- | :--- | :--- |
+| **US Equities** | **109** | Tech giants (`NVDA`, `TSLA`, `AAPL`, `MSFT`, `AMZN`, `GOOGL`, `META`) + broad-market equities |
+| **Forex** | **86** | Majors, minors, and exotic cross pairs (`EURUSD`, `GBPUSD`, `USDJPY`, `EURTRY`, `USDZAR`...) |
+| **Indices** | **16** | `US500` (S&P 500), `NAS100` (Nasdaq), `US30` (Dow), `GER40` (DAX), `UK100` (FTSE), `JPN225`... |
+| **Crypto** | **14** | `BTCUSD`, `ETHUSD`, `SOLUSD`, `LTCUSD`, `DOGEUSD`, `AVAXUSD`, `DOTUSD`... |
+| **Metals** | **12** | Gold (`XAUUSD`, `XAUEUR`), Silver (`XAGUSD`), Platinum (`XPTUSD`), Palladium, Copper |
+| **Commodities** | **11** | Arabica Coffee (`COFARA`), Corn, Cotton, Orange Juice (`OJ`), Soybeans, Sugar, Wheat |
+| **Energy** | **3** | WTI Crude Oil (`XTIUSD`), Brent Crude Oil (`XBRUSD`), Natural Gas (`XNGUSD`) |
+
+### Funnel Execution Workflow:
+- **Stage A (Sub-Second Universe Sweep):** Filters symbols by market open/closed session, stale tick age, and spread friction ceiling ($\le 15\%$ of SL). Ranks active symbols by momentum and Kaufman Efficiency Ratio (ER) mover scores.
+- **Stage B (Deep Quantitative Evaluation):** Top ranked movers enter the complete quant pipeline (Hurst regime classification $\to$ Momentum/DOM OBI gate $\to$ 10,000-Path Monte Carlo Time Machine $\to$ Institutional Factor Exposure Shield).
+- **Expanded Correlation Shield:** Decomposes all 251 symbols into underlying factors (+base/-quote FX, Beta, single-stock factors `Stock_<Ticker>`) and enforces strict 1.0% single-factor risk caps.
 
 ---
 
@@ -119,12 +140,14 @@ flowchart TD
 | Capability | PocketBot v1 Classic (`v1-classic/`) | PocketBot Apex v2 Hydra SOR (`v2-apex/`) |
 | :--- | :--- | :--- |
 | **Intended User** | Beginners, single MT5 account, zero-config | Prop traders, institutional quants, multi-broker |
+| **Market Universe** | Fixed major FX & US tech symbols (5–10) | Full 251-symbol broker catalog auto-discovery (7 asset classes) |
+| **Universe Scanner** | Single-symbol polling loop | 2-Stage Funnel (Stage A sweep $\to$ Stage B deep quant) |
 | **Supported Venues** | MetaTrader 5 (Local IPC) | MT5 IPC + cTrader Open API Protobuf TCP (Active-Active) |
 | **Execution Engine** | Single-venue direct routing with SL/TP | Synthetic NBBO Smart Order Router + 50/50 Risk Split |
 | **Microstructure** | Candle impulse + ATR volatility filter | Full Level 2 Depth of Market (DOM) + Order-Book Imbalance (OBI) |
 | **Friction Control** | Fixed spread filter | VWAP Depth Slippage Model + Liquidity Wall Detection |
 | **Monte Carlo Engine** | Deterministic 2R Expectancy Model | 10,000-Path Stationary Block-Bootstrap Time Machine v2 |
-| **Portfolio Shield** | Fixed 0.5% ($50) risk cap | Correlation Shield (Pearson & Kendall Tau factor cap) |
+| **Portfolio Shield** | Fixed 0.5% ($50) risk cap | Expanded Correlation Shield (251-symbol factor exposure cap) |
 | **AI Risk Committee** | None ($0 token cost) | 3-Tier Waterfall (AI Studio $\to$ Google AI Pro $\to$ Pure Math) |
 | **Telemetry & UI** | Console logging & command-line stats | Rich Terminal UI (TUI) Cockpit + Telegram Smartphone Remote |
 | **Database & Ledger** | JSON flat files (`orders.json`) | SQLite Auto-Quarantine Ledger (`WalkForwardLedgerDB`) |
@@ -139,7 +162,7 @@ You do **not** need any coding experience to use PocketBot Apex.
 1. **Download the Release:**
    Download `PocketBot_Apex_v2_Portable_Windows.zip` from [GitHub Releases](https://github.com/Keshuin0/pocketbot-apex/releases) and extract it anywhere on your computer (or USB pendrive).
 2. **Run First-Time Setup:**
-   Open the folder and double-click `0_FIRST_TIME_SETUP.bat`. It automatically verifies your system, installs 64-bit Python 3.12, creates a local `.venv`, installs all quantitative libraries, runs 25 automated verification tests, and checks your MT5 connection.
+   Open the folder and double-click `0_FIRST_TIME_SETUP.bat`. It automatically verifies your system, installs 64-bit Python 3.12, creates a local `.venv`, installs all quantitative libraries, runs 32 automated verification tests, and checks your MT5 connection.
 3. **Start Autonomous Trading:**
    Double-click `2_START_APEX_AUTO_DEMO.bat` for hands-free autonomous trading, or `4_APEX_LIVE_DASHBOARD.bat` to launch the full-screen live telemetry cockpit!
 

@@ -590,6 +590,22 @@ class CTraderOpenApiFeed:
                         sid = int(light_sym.symbolId)
                         self._symbol_name_to_id[name] = sid
                         self._symbol_id_to_name[sid] = name
+                        canon = self.alias_mapper.canonicalize(name)
+                        desc = str(getattr(light_sym, "description", ""))
+                        ac = self.alias_mapper.classify_asset_class(name, description=desc)
+                        self.alias_mapper.register_symbol(name, canonical_name=canon, broker="ctrader")
+                        self._catalog[name] = DiscoveredSymbol(
+                            name=name,
+                            canonical_name=canon,
+                            asset_class=ac,
+                            path="",
+                            digits=5,
+                            point=1e-5,
+                            trade_mode=4 if light_sym.enabled else 0,
+                            is_visible=True,
+                            source="ctrader",
+                            description=desc,
+                        )
 
         elif isinstance(extracted, oa_msg.ProtoOASymbolByIdRes):
             with self._lock:
@@ -615,6 +631,20 @@ class CTraderOpenApiFeed:
                         step_volume_lots=step_lots,
                         source="ctrader",
                     )
+                    if name in self._catalog:
+                        old = self._catalog[name]
+                        self._catalog[name] = DiscoveredSymbol(
+                            name=old.name,
+                            canonical_name=old.canonical_name,
+                            asset_class=old.asset_class,
+                            path=old.path,
+                            digits=digits,
+                            point=point_size,
+                            trade_mode=old.trade_mode,
+                            is_visible=old.is_visible,
+                            source="ctrader",
+                            description=old.description,
+                        )
                     self.get_or_create_dom_engine(name, pip_size=pip_size, digits=digits)
 
         elif isinstance(extracted, oa_msg.ProtoOASpotEvent):
@@ -656,8 +686,22 @@ class CTraderOpenApiFeed:
             )
             self.get_or_create_dom_engine(norm, pip_size=pip_size, digits=digits)
 
+    def resolve_symbol(self, symbol: str) -> str | None:
+        """Resolve a canonical or broker symbol to the cTrader symbol name."""
+        norm = symbol.upper().strip()
+        with self._lock:
+            if norm in self._symbol_name_to_id:
+                return norm
+            mapped = self.alias_mapper.resolve_to_broker(norm, broker="ctrader")
+            if mapped in self._symbol_name_to_id:
+                return mapped
+            canon = self.alias_mapper.canonicalize(norm)
+            if canon in self._symbol_name_to_id:
+                return canon
+            return norm if norm in self._symbol_name_to_id else None
+
     def discover_catalog(self) -> list[DiscoveredSymbol]:
-        """Return discovered catalog symbols registered in cTrader."""
+        """Return discovered catalog symbols registered in cTrader, requesting from server if empty."""
         with self._lock:
             if not self._catalog and self._symbol_name_to_id:
                 for name, sid in self._symbol_name_to_id.items():
@@ -677,6 +721,11 @@ class CTraderOpenApiFeed:
                         is_visible=True,
                         source="ctrader",
                     )
+            elif not self._symbol_name_to_id and self.is_connected and self._client is not None:
+                sym_req = oa_msg.ProtoOASymbolsListReq()
+                sym_req.ctidTraderAccountId = self.account_id
+                self._client.send(sym_req)
+
             return list(self._catalog.values())
 
     def get_discovered_symbols(self) -> list[DiscoveredSymbol]:

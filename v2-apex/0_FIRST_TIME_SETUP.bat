@@ -8,7 +8,7 @@ echo ===========================================================================
 echo   POCKETBOT APEX -- CHILD-PROOF 1-CLICK INSTALLER ^& SETUP WIZARD
 echo ============================================================================
 echo   This script will automatically set up Python 3.12, create your private
-echo   isolated environment, install all institutional quant libraries, run 25
+echo   isolated environment, install all institutional quant libraries, run 32
 echo   automated safety tests, and connect to MetaTrader 5.
 echo ============================================================================
 echo.
@@ -106,13 +106,13 @@ echo   [OK] All institutional packages successfully installed.
 echo.
 
 :: -----------------------------------------------------------------------------
-:: STEP E: Run Full 25-Test Automated Verification Suite
+:: STEP E: Run Full 32-Test Automated Verification Suite
 :: -----------------------------------------------------------------------------
-echo [Step E/F] Running full 25-test institutional safety and quant verification suite...
+echo [Step E/F] Running full 32-test institutional safety, quant, and universe funnel verification suite...
 echo.
 "%~dp0.venv\Scripts\python.exe" -m pytest "%~dp0tests" -q
 if !ERRORLEVEL! NEQ 0 goto :fail_tests
-echo   [OK] All 25 safety, quant, AI-waterfall, and Hydra-mesh tests PASSED!
+echo   [OK] All 32 safety, quant, AI-waterfall, Hydra-mesh, and Universe Scanner tests PASSED!
 echo.
 
 :: -----------------------------------------------------------------------------

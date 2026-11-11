@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
-import time
 from unittest.mock import MagicMock
-
 import pytest
 
 from apex.ai.veto_committee import AIVetoCommittee
 from apex.cockpit.tui_dashboard import ApexTUIDashboard, SymbolCockpitRow
 from apex.feeds.alias_mapper import SmartAliasMapper
+from apex.feeds.ctrader_feed import CTraderOpenApiFeed
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import AssetClass, Candle, DiscoveredSymbol, Side, Tick
 from apex.ledger.walkforward_db import WalkForwardLedgerDB
+from apex.quant.correlation_shield import (
+    CorrelationShield,
+    PositionRiskSpec,
+    decompose_symbol_factors,
+)
 from apex.quant.momentum_dom import MomentumDOMGate
 from apex.quant.regime import RegimeClassifier
 from apex.quant.timemachine_v2 import BlockBootstrapTimeMachine
-from apex.quant.universe_scanner import CandidatePreScore, UniverseScanner, UniverseScanSummary
+from apex.quant.universe_scanner import UniverseScanner
 
 
 def test_smart_alias_mapper_equities_and_indices() -> None:
@@ -233,3 +237,112 @@ def test_tui_dashboard_universe_header_formatting() -> None:
     # Check that panel contains the formatted string
     assert "Universe: 108/251 Symbols Scanned" in str(header_panel.renderable)
     assert "(143 Closed)" in str(header_panel.renderable)
+
+
+def test_multi_currency_and_multi_stock_factor_capping() -> None:
+    """Verify factor decomposition and 1.0% single-factor risk capping across all 251 universe symbols."""
+    # 1. Exotic/Cross Currency factor decomposition
+    assert decompose_symbol_factors("EURTRY", Side.BUY) == {"EUR": 1.0, "TRY": -1.0}
+    assert decompose_symbol_factors("USDZAR", Side.BUY) == {"USD": 1.0, "ZAR": -1.0}
+    assert decompose_symbol_factors("GBPNOK", Side.BUY) == {"GBP": 1.0, "NOK": -1.0}
+
+    # 2. Commodities & Energy & Crypto decomposition
+    assert decompose_symbol_factors("XTIUSD", Side.BUY) == {"Energy_Beta": 1.0, "USD": -1.0}
+    assert decompose_symbol_factors("COFARA", Side.BUY) == {"Commodities_Beta": 1.0, "USD": -1.0}
+    assert decompose_symbol_factors("SOLUSD", Side.BUY) == {"Crypto_Beta": 1.0, "USD": -1.0}
+
+    # 3. Equities decomposition
+    assert decompose_symbol_factors("NVIDIA", Side.BUY) == {"US_Tech_Beta": 1.0, "Stock_NVDA": 1.0}
+    assert decompose_symbol_factors("Tesla", Side.BUY) == {"US_Tech_Beta": 1.0, "Stock_TSLA": 1.0}
+    assert decompose_symbol_factors("JPMorgan", Side.BUY) == {"US_Broad_Market_Beta": 1.0, "Stock_JPM": 1.0}
+
+    shield = CorrelationShield(
+        enabled=True,
+        max_factor_risk_pct=1.0,
+        account_equity_usd=10_000.0,
+    )
+
+    # Multi-Currency: EUR concentration trap
+    # Long EURUSD (0.6%) + Long EURTRY (0.6%) -> EUR = +1.2% (> 1.0% cap -> BLOCKED!)
+    pos_eurusd = PositionRiskSpec(symbol="EURUSD", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    v_eurusd = shield.evaluate_proposed_trade(pos_eurusd, open_positions=[])
+    assert v_eurusd.allowed is True
+    assert pytest.approx(v_eurusd.factor_exposures_after_pct["EUR"]) == 0.6
+
+    pos_eurtry = PositionRiskSpec(symbol="EURTRY", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    v_eurtry = shield.evaluate_proposed_trade(pos_eurtry, open_positions=[pos_eurusd])
+    assert v_eurtry.allowed is False
+    assert "EUR" in v_eurtry.breached_factors
+    assert pytest.approx(v_eurtry.factor_exposures_after_pct["EUR"]) == 1.2
+    assert "CORRELATION_SHIELD_BLOCK" in v_eurtry.reason
+
+    # Multi-Stock Tech Sector: Long NVIDIA (0.6%) + Long Tesla (0.6%) -> US_Tech_Beta = +1.2% (> 1.0% -> BLOCKED!)
+    pos_nvda = PositionRiskSpec(symbol="NVIDIA", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    v_nvda = shield.evaluate_proposed_trade(pos_nvda, open_positions=[])
+    assert v_nvda.allowed is True
+    assert pytest.approx(v_nvda.factor_exposures_after_pct["US_Tech_Beta"]) == 0.6
+    assert pytest.approx(v_nvda.factor_exposures_after_pct["Stock_NVDA"]) == 0.6
+
+    pos_tsla = PositionRiskSpec(symbol="Tesla", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    v_tsla = shield.evaluate_proposed_trade(pos_tsla, open_positions=[pos_nvda])
+    assert v_tsla.allowed is False
+    assert "US_Tech_Beta" in v_tsla.breached_factors
+    assert pytest.approx(v_tsla.factor_exposures_after_pct["US_Tech_Beta"]) == 1.2
+
+    # Same Stock Stacking: 2x NVDA trades (0.6% each) -> Stock_NVDA = 1.2% (> 1.0% -> BLOCKED!)
+    pos_nvda_2 = PositionRiskSpec(symbol="NVDA", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    v_nvda_2 = shield.evaluate_proposed_trade(pos_nvda_2, open_positions=[pos_nvda])
+    assert v_nvda_2.allowed is False
+    assert "Stock_NVDA" in v_nvda_2.breached_factors
+
+    # Crypto Beta Capping: Long BTCUSD (0.6%) + Long SOLUSD (0.6%) -> Crypto_Beta = 1.2% (> 1.0% -> BLOCKED!)
+    pos_btc = PositionRiskSpec(symbol="BTCUSD", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    pos_sol = PositionRiskSpec(symbol="SOLUSD", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    v_sol = shield.evaluate_proposed_trade(pos_sol, open_positions=[pos_btc])
+    assert v_sol.allowed is False
+    assert "Crypto_Beta" in v_sol.breached_factors
+
+    # Energy Beta Capping: Long XTIUSD (0.6%) + Long XBRUSD (0.6%) -> Energy_Beta = 1.2% (> 1.0% -> BLOCKED!)
+    pos_xti = PositionRiskSpec(symbol="XTIUSD", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    pos_xbr = PositionRiskSpec(symbol="XBRUSD", side=Side.BUY, risk_pct=0.6, risk_usd=60.0)
+    v_xbr = shield.evaluate_proposed_trade(pos_xbr, open_positions=[pos_xti])
+    assert v_xbr.allowed is False
+    assert "Energy_Beta" in v_xbr.breached_factors
+
+
+def test_ctrader_catalog_discovery_and_alias_mapping() -> None:
+    """Verify cTrader feed auto-discovery, AssetClass mapping, and symbol resolution."""
+    feed = CTraderOpenApiFeed(
+        account_id=12345,
+        client_id="cid_test",
+        client_secret="csec_test",
+        access_token="tok_test",
+    )
+
+    # Register symbols representing distinct asset classes
+    feed.register_symbol_mapping("EURUSD", 1, pip_size=0.0001, digits=5)
+    feed.register_symbol_mapping("XAUUSD", 2, pip_size=0.01, digits=2)
+    feed.register_symbol_mapping("US500", 3, pip_size=0.1, digits=1)
+    feed.register_symbol_mapping("BTCUSD", 4, pip_size=0.01, digits=2)
+    feed.register_symbol_mapping("NVIDIA", 5, pip_size=0.01, digits=2)
+    feed.register_symbol_mapping("XTIUSD", 6, pip_size=0.01, digits=2)
+    feed.register_symbol_mapping("COFARA", 7, pip_size=0.01, digits=2)
+
+    catalog = feed.discover_catalog()
+    assert len(catalog) == 7
+
+    cat_map = {item.name: item for item in catalog}
+    assert cat_map["EURUSD"].asset_class == AssetClass.FOREX
+    assert cat_map["XAUUSD"].asset_class == AssetClass.METALS
+    assert cat_map["US500"].asset_class == AssetClass.INDICES
+    assert cat_map["BTCUSD"].asset_class == AssetClass.CRYPTO
+    assert cat_map["NVIDIA"].asset_class == AssetClass.US_EQUITIES
+    assert cat_map["XTIUSD"].asset_class == AssetClass.ENERGY
+    assert cat_map["COFARA"].asset_class == AssetClass.COMMODITIES
+
+    # Bidirectional resolution testing
+    assert feed.resolve_symbol("EURUSD") == "EURUSD"
+    assert feed.resolve_symbol("NVDA") == "NVIDIA"
+    assert feed.resolve_symbol("GOLD") == "XAUUSD"
+    assert feed.resolve_symbol("SPX500") == "US500"
+    assert feed.resolve_symbol("NONEXISTENT") is None

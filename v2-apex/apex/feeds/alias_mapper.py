@@ -8,7 +8,6 @@ Fusion Markets, Pepperstone, IC Markets).
 from __future__ import annotations
 
 import re
-from typing import Dict, Set
 
 from apex.feeds.models import AssetClass
 
@@ -321,6 +320,7 @@ EQUITY_TICKER_TO_FUSION: dict[str, str] = {
 FUSION_TO_EQUITY_TICKER: dict[str, str] = {
     v.upper(): k for k, v in EQUITY_TICKER_TO_FUSION.items()
 }
+FUSION_TO_EQUITY_TICKER["JPMORGAN"] = "JPM"
 
 CRYPTO_BASES: set[str] = {
     "BTC", "ETH", "SOL", "LTC", "DOGE", "ADA", "XRP", "DOT",
