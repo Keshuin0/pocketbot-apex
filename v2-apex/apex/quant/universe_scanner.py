@@ -311,7 +311,8 @@ class UniverseScanner:
         open_scores = [ps for ps in prescores if ps.is_open and ps.status_reason != "INSUFFICIENT_BARS"]
         open_scores.sort(key=lambda x: x.composite_mover_score, reverse=True)
 
-        top_selected = open_scores[: self.max_candidates_per_cycle]
+        effective_candidates = open_scores if open_scores else prescores
+        top_selected = effective_candidates if target_symbols is not None else effective_candidates[: self.max_candidates_per_cycle]
         top_names = tuple(c.symbol for c in top_selected)
 
         summary = UniverseScanSummary(
@@ -324,7 +325,7 @@ class UniverseScanner:
             asset_class_counts=asset_counts,
         )
 
-        return open_scores, summary
+        return (open_scores if open_scores else prescores), summary
 
     def evaluate_candidate_pipeline(
         self,
@@ -483,8 +484,8 @@ class UniverseScanner:
         now_utc: float | None = None,
     ) -> tuple[list[SymbolCockpitRow], UniverseScanSummary]:
         """Execute a full two-stage funnel scan cycle."""
-        open_candidates, summary = self.sweep_universe(target_symbols=target_symbols, now_utc=now_utc)
-        top_candidates = open_candidates[: self.max_candidates_per_cycle]
+        candidates, summary = self.sweep_universe(target_symbols=target_symbols, now_utc=now_utc)
+        top_candidates = candidates if target_symbols is not None else candidates[: self.max_candidates_per_cycle]
 
         rows: list[SymbolCockpitRow] = []
         for candidate in top_candidates:
