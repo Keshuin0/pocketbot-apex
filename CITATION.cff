@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use PocketBot or PocketBot Apex in quantitative research, algorithmic trading studies, or financial engineering publications, please cite it as below."
+authors:
+  - family-names: "Keshu"
+    given-names: "Keshuin0"
+    alias: "Keshuin0"
+title: "PocketBot Apex: Multi-Venue Active-Active Smart Order Router (Hydra SOR), Level 2 Depth of Market Microstructure & 3-Tier AI Risk Committee"
+version: 2.0.0
+date-released: 2026-11-11
+url: "https://github.com/Keshuin0/pocketbot-apex"
+repository-code: "https://github.com/Keshuin0/pocketbot-apex"
+keywords:
+  - algorithmic-trading
+  - quantitative-finance
+  - smart-order-router
+  - level2-dom
+  - order-book-imbalance
+  - monte-carlo
+  - ctrader-open-api
+  - metatrader5
+license: MIT

@@ -1,0 +1,24 @@
+# Enforce Git line endings across Windows, Linux, and macOS
+* text=auto
+
+# Windows command launchers MUST retain Windows CRLF line endings
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Cross-platform source files use LF
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.txt text eol=lf
+*.html text eol=lf
+*.cff text eol=lf
+
+# Binary assets
+*.pdf binary
+*.docx binary
+*.png binary
+*.jpg binary
+*.ico binary
