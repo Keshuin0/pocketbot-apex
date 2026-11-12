@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.1.1] - 2026-11-12
+
+### Added
+- **Adaptive Multi-Factor Gemini Model & Quota Selector (`apex/ai/model_selector.py`):**
+  - Dynamic model discovery via Google AI Studio `/v1beta/models` and `agy.exe models` (in an isolated empty temp directory with `stdin=subprocess.DEVNULL`), automatically classifying models into `PRO_REASONING`, `FLASH_FAST`, and `FLASH_LITE`.
+  - Real-time multi-factor scoring across **Remaining Quota & Budget Pacing** (RPM/RPD, HTTP 429 exponential cooldowns, Pro quota conservation), **Setup Complexity & Stakes** (volatility percentile, borderline `net_avg_R`, risk %), and **Rolling EWMA Latency vs Timeframe Urgency** (penalizing >6s models on fast `M5` breakouts).
+  - Intra-provider model cascade + per-candle `(symbol, side, timeframe, bar_timestamp)` verdict caching.
+  - Added option `[6] Inspect Discovered Gemini Models, Quota Health & Latency` to `tools/configure_ai_mode.py` (`5_CONFIGURE_AI_MODE.bat`).
+- **Verification Suite:**
+  - Added `tests/test_phase7_adaptive_model_selector.py` and 3 regression tests in `tests/test_phase6_universe_scanner.py` (39/39 total tests passing).
+
+### Fixed
+- **Live Order Dispatch & Fusion Markets CAD Sizing (`apex_runner.py`, `apex/feeds/mt5_feed.py`, `apex/execution/router.py`):**
+  - Wired `_dispatch_approved_trades()` in `ApexOrchestrator.run_cycle()` for `--mode demo-auto` and `--mode shadow-ab`, routing AI-approved setups through all 6 pre-trade circuit breakers directly to MT5/cTrader execution.
+  - Added `compute_compliant_lot_size()` using exact broker `trade_tick_value` (in account currency such as `CAD` or `USD`), `trade_tick_size`, `volume_min`, `volume_step`, and `volume_max`.
+  - Synced live MT5 account equity, currency (`CAD`/`USD`), floating P/L, and open positions count (`get_open_positions()`, `get_open_symbols()`) to prevent duplicate symbol orders.
+- **TUI Cockpit Execution Telemetry (`apex/cockpit/tui_dashboard.py`):**
+  - Added the **Last Execution / Broker Events** panel displaying the last 5 order attempts, ticket IDs, lot sizes, SL/TP, venue/status, and exact MT5 retcodes/rejection details.
+  - Dynamically formatted equity and P/L badges using the live account currency (`CAD`, `USD`, etc.).
+- **`agy_pro` Subprocess Timeout & Per-Candle Caching (`apex/ai/veto_committee.py`):**
+  - Executed `agy.exe -p` in an isolated empty temporary directory (`pocketbot_agy_isolated`) with `stdin=subprocess.DEVNULL` to avoid workspace `.agents/mcp_config.json` offline timeouts.
+  - Added per-candle verdict caching `(symbol, side, timeframe, bar_timestamp)` and a 10-minute cooldown to `pure_math` after 2 consecutive failures.
+- **Minimum Expected Value Gate (`config/apex_config.json`, `apex/quant/universe_scanner.py`, `apex/ai/veto_committee.py`):**
+  - Enforced `min_net_avg_R: 0.10` floor across scanner and AI pure-math fallback evaluations.
+- **Verification Suite:**
+  - Added 3 regression tests in `tests/test_phase6_universe_scanner.py` (35/35 total tests passing).
+
+---
+
 ## [2.1.0] - 2026-11-11
 
 ### Added

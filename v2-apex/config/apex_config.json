@@ -63,7 +63,7 @@
         "pure_math"
       ],
       "studio_timeout_seconds": 4.0,
-      "agy_pro_timeout_seconds": 15.0,
+      "agy_pro_timeout_seconds": 30.0,
       "mcp_server": "ctrader-local",
       "timeout_seconds": 4.0
     },
@@ -80,7 +80,8 @@
     "max_candidates_per_cycle": 12,
     "auto_enable_market_watch": true,
     "max_tick_age_seconds": 180.0,
-    "min_candles_required": 30
+    "min_candles_required": 30,
+    "min_net_avg_R": 0.10
   },
   "risk": {
     "require_hard_sl_tp": true,

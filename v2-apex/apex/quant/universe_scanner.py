@@ -18,14 +18,14 @@ from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
 from apex.cockpit.tui_dashboard import SymbolCockpitRow
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.dual_router import MarketFeedRouter
-from apex.feeds.models import AssetClass, Candle, DiscoveredSymbol, Side, Tick
+from apex.feeds.models import AssetClass, DiscoveredSymbol, Side, Tick
 from apex.ledger.walkforward_db import WalkForwardLedgerDB
 from apex.quant.momentum_dom import (
     InstrumentTier,
     MomentumDOMGate,
     classify_instrument_tier,
 )
-from apex.quant.regime import MarketRegime, RegimeClassifier, compute_hurst_exponent
+from apex.quant.regime import RegimeClassifier, compute_hurst_exponent
 from apex.quant.timemachine_v2 import BlockBootstrapTimeMachine, TimeMachineCostModel
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,7 @@ class UniverseScanner:
         self.auto_enable_market_watch: bool = bool(scanner_cfg.get("auto_enable_market_watch", True))
         self.max_tick_age_seconds: float = float(scanner_cfg.get("max_tick_age_seconds", 180.0))
         self.min_candles_required: int = int(scanner_cfg.get("min_candles_required", 30))
+        self.min_net_avg_R: float = float(scanner_cfg.get("min_net_avg_R", 0.10))
 
         self.alias_mapper: SmartAliasMapper = SmartAliasMapper()
         self._cached_catalog: list[DiscoveredSymbol] = []
@@ -419,7 +420,7 @@ class UniverseScanner:
         passed_all_quant = (
             diag.allow_breakout_entries
             and gate_verdict.passed
-            and tm_res.net_avg_R > 0.0
+            and tm_res.net_avg_R >= self.min_net_avg_R
         )
 
         self.ledger.log_scan_event(
@@ -437,6 +438,7 @@ class UniverseScanner:
 
         ai_label = "IDLE (Quant Filtered)"
         if passed_all_quant:
+            latest_bar_ts = candles[-1].timestamp_utc if candles else 0.0
             ctx = CandidateSetupAuditContext(
                 symbol=sym,
                 side=Side.BUY,
@@ -455,6 +457,7 @@ class UniverseScanner:
                 cvar_95_R=tm_res.cvar_95_R,
                 recommended_risk_pct=tm_res.recommended_risk_pct,
                 session_utc_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                bar_timestamp=latest_bar_ts,
             )
             ai_decision = self.ai_committee.evaluate_sync(ctx)
             ai_label = f"{ai_decision.decision} ({ai_decision.confidence:.2f} via {ai_decision.provider_used})"
@@ -476,6 +479,10 @@ class UniverseScanner:
             quarantine_mode=q_state.mode.value,
             profit_factor=q_state.profit_factor,
             best_venue=best_venue_str,
+            side=Side.BUY,
+            entry_price=entry_px,
+            stop_loss=stop_px,
+            take_profit=target_px,
         )
 
     def scan_cycle(

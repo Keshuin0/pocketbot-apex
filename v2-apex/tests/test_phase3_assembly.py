@@ -334,6 +334,8 @@ def test_end_to_end_orchestrator_dry_run(tmp_path: Path) -> None:
     )
     try:
         rows = orch.run_cycle(symbols=["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "BTCUSD"])
-        assert len(rows) == 5
+        assert orch.last_scan_summary is not None
+        assert orch.last_scan_summary.total_scanned == 5
+        assert len(rows) <= 5
     finally:
         orch.shutdown()

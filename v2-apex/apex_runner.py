@@ -30,6 +30,7 @@ from apex.execution.router import DualBrokerExecutionRouter, ExecutionOrderReque
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import Side, verify_live_unlock
 from apex.ledger.walkforward_db import SymbolExecutionMode, WalkForwardLedgerDB
+from apex.quant.correlation_shield import PositionRiskSpec
 from apex.quant.momentum_dom import (
     InstrumentTier,
     MomentumDOMGate,
@@ -39,6 +40,7 @@ from apex.quant.regime import MarketRegime, RegimeClassifier
 from apex.quant.timemachine_v2 import BlockBootstrapTimeMachine, TimeMachineCostModel
 from apex.quant.universe_scanner import UniverseScanner, UniverseScanSummary
 
+logger = logging.getLogger(__name__)
 console = Console(width=145)
 
 
@@ -146,6 +148,29 @@ class ApexOrchestrator:
             rows, summary = self.universe_scanner.scan_cycle(target_symbols=target_symbols)
             self.last_scan_summary = summary
 
+        # Sync live account equity and currency
+        self.execution_router.update_account_equity_from_broker()
+        account_currency = (
+            self.feed_router.mt5.get_account_currency()
+            if self.feed_router.mt5.is_connected
+            else "USD"
+        )
+        open_positions = self.execution_router.get_open_positions()
+
+        # Compute floating daily P/L from connected broker
+        daily_pnl = 0.0
+        if self.feed_router.mt5.is_connected:
+            acct_info = self.feed_router.mt5.get_account_info()
+            eq = float(acct_info.get("equity", 0.0))
+            bal = float(acct_info.get("balance", 0.0))
+            if eq > 0.0 and bal > 0.0:
+                daily_pnl = eq - bal
+
+        # In demo-auto or shadow-ab mode, automatically dispatch approved rows
+        if self.mode in ("demo-auto", "shadow-ab"):
+            self._dispatch_approved_trades(rows, open_positions=open_positions)
+            open_positions = self.execution_router.get_open_positions()
+
         ai_status = self.ai_committee.get_router_status()
         sor_pips, sor_usd = self.execution_router.cumulative_sor_savings
         self.dashboard.print_snapshot(
@@ -154,17 +179,87 @@ class ApexOrchestrator:
             ctrader_connected=self.feed_router.ctrader.is_connected,
             mt5_connected=self.feed_router.mt5.is_connected,
             account_equity_usd=self.execution_router.account_equity_usd,
-            daily_pnl_usd=0.0,
-            open_positions_count=len(self.execution_router._shadow_positions),
+            daily_pnl_usd=daily_pnl,
+            open_positions_count=len(open_positions),
             rows=rows,
-            ai_brain_badge=ai_status.dashboard_badge,
+            ai_brain_badge=ai_status.model_quota_badge,
             mesh_badge=self.feed_router.dashboard_mesh_badge,
             sor_saved_pips=sor_pips,
             sor_saved_usd=sor_usd,
             universe_scanned_count=self.last_scan_summary.open_scanned if self.last_scan_summary else 0,
             universe_total_count=self.last_scan_summary.total_scanned if self.last_scan_summary else 0,
+            account_currency=account_currency,
+            broker_events=self.execution_router.recent_broker_events,
         )
         return rows
+
+    def _dispatch_approved_trades(
+        self,
+        rows: Sequence[SymbolCockpitRow],
+        open_positions: Sequence[PositionRiskSpec],
+    ) -> None:
+        """Route approved candidates through the 6 circuit breakers to the execution router."""
+        if len(open_positions) >= self.execution_router.max_concurrent_positions:
+            return
+
+        open_symbols = self.execution_router.get_open_symbols()
+        min_net_r = float(self.config.get("scanner", {}).get("min_net_avg_R", 0.10))
+        risk_pct = float(self.config.get("risk", {}).get("max_risk_per_trade_pct", 0.5))
+        risk_amount = (
+            (self.execution_router.account_equity_usd * (risk_pct / 100.0))
+            if self.execution_router.account_equity_usd > 0
+            else 50.0
+        )
+
+        for row in rows:
+            if len(open_positions) >= self.execution_router.max_concurrent_positions:
+                break
+
+            # Filter: must have AI approval and meet the min_net_avg_R floor
+            is_approved = "APPROVE" in row.ai_verdict.upper()
+            if not is_approved:
+                continue
+            if row.net_avg_r < min_net_r:
+                continue
+
+            can_sym = self.feed_router.mt5.alias_mapper.canonicalize(row.symbol)
+            if can_sym.upper() in open_symbols or row.symbol.upper() in open_symbols:
+                continue
+
+            if row.entry_price <= 0.0 or row.stop_loss <= 0.0 or row.take_profit <= 0.0:
+                continue
+
+            # Compute compliant lot size
+            lots = self.execution_router.compute_compliant_lot_size(
+                symbol=row.symbol,
+                entry_price=row.entry_price,
+                stop_loss=row.stop_loss,
+                risk_usd=risk_amount,
+            )
+
+            side = row.side if row.side is not None else Side.BUY
+            order_req = ExecutionOrderRequest(
+                symbol=row.symbol,
+                side=side,
+                lots=lots,
+                entry_price=row.entry_price,
+                stop_loss=row.stop_loss,
+                take_profit=row.take_profit,
+                risk_pct=risk_pct,
+                risk_usd=risk_amount,
+                force_paper_shadow=(self.mode == "shadow-ab"),
+                comment="ApexAuto",
+            )
+
+            receipt = self.execution_router.execute_order(
+                order=order_req,
+                open_positions=open_positions,
+            )
+            logger.info("Dispatched order for %s: %s on %s", row.symbol, receipt.status, receipt.venue)
+            if receipt.status in ("FILLED", "PAPER_SHADOW_FILLED"):
+                open_symbols.add(can_sym.upper())
+                open_symbols.add(row.symbol.upper())
+                open_positions = self.execution_router.get_open_positions()
 
     def shutdown(self) -> None:
         self.feed_router.shutdown()

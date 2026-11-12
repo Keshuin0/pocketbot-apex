@@ -18,6 +18,24 @@ from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 
+from apex.feeds.models import Side
+
+
+@dataclass(frozen=True, slots=True)
+class BrokerExecutionEvent:
+    """Historical broker execution / rejection record for the live cockpit."""
+
+    timestamp_str: str
+    symbol: str
+    side: str
+    lots: float
+    price: float
+    stop_loss: float
+    take_profit: float
+    venue: str
+    status: str
+    details: str
+
 
 @dataclass(frozen=True, slots=True)
 class SymbolCockpitRow:
@@ -39,6 +57,10 @@ class SymbolCockpitRow:
     quarantine_mode: str
     profit_factor: float
     best_venue: str = "MT5"
+    side: Side = Side.BUY
+    entry_price: float = 0.0
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
 
 
 class ApexTUIDashboard:
@@ -91,6 +113,8 @@ class ApexTUIDashboard:
         universe_scanned_count: int = 0,
         universe_total_count: int = 0,
         universe_badge: str | None = None,
+        account_currency: str = "USD",
+        broker_events: Sequence[BrokerExecutionEvent] = (),
     ) -> Group:
         """Build the composite Rich Dashboard layout."""
         dd_pct = (daily_pnl_usd / account_equity_usd * 100.0) if account_equity_usd > 0 else 0.0
@@ -110,12 +134,12 @@ class ApexTUIDashboard:
             )
 
         header_text = (
-            f"[bold cyan]POCKETBOT APEX v1.0[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
+            f"[bold cyan]POCKETBOT APEX v2.1[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
             f"[bold bright_cyan]{mesh_badge}[/bold bright_cyan] (cTrader: {ct_badge} | MT5: {mt5_badge}) | "
-            f"SOR Saved: [bold green]+{sor_saved_pips:.1f}p (${sor_saved_usd:,.2f})[/bold green]\n"
+            f"SOR Saved: [bold green]+{sor_saved_pips:.1f}p ({sor_saved_usd:,.2f} {account_currency})[/bold green]\n"
             f"[bold magenta]{ai_brain_badge}[/bold magenta] | "
-            f"Equity: [bold]${account_equity_usd:,.2f}[/bold] | "
-            f"Daily P/L: [{pnl_style}]${daily_pnl_usd:+,.2f} ({dd_pct:+.2f}%)[/{pnl_style}] | "
+            f"Equity: [bold]{account_equity_usd:,.2f} {account_currency}[/bold] | "
+            f"Daily P/L: [{pnl_style}]{daily_pnl_usd:+,.2f} {account_currency} ({dd_pct:+.2f}%)[/{pnl_style}] | "
             f"Open Positions: [bold]{open_positions_count}/2[/bold]"
             f"{universe_str}"
         )
@@ -172,7 +196,47 @@ class ApexTUIDashboard:
                 self.format_quarantine_badge(r.quarantine_mode, r.profit_factor),
             )
 
-        return Group(header_panel, table)
+        events_table = Table(
+            title="Last 5 Execution & AI Router Events",
+            expand=True,
+            header_style="bold yellow",
+        )
+        events_table.add_column("Time UTC", style="dim", width=12)
+        events_table.add_column("Symbol", style="bold white", width=10)
+        events_table.add_column("Side", width=6)
+        events_table.add_column("Lots", justify="right", width=8)
+        events_table.add_column("Price / SL / TP", width=28)
+        events_table.add_column("Venue / Status", width=22)
+        events_table.add_column("AI Model / Latency / MT5 RetCode", style="dim")
+
+        if broker_events:
+            for ev in broker_events[-5:]:
+                st_color = (
+                    "bold green"
+                    if ev.status == "FILLED"
+                    else ("bold yellow" if "SHADOW" in ev.status else "bold red")
+                )
+                events_table.add_row(
+                    ev.timestamp_str,
+                    ev.symbol,
+                    ev.side,
+                    f"{ev.lots:.2f}",
+                    f"{ev.price:.4f} | {ev.stop_loss:.4f} | {ev.take_profit:.4f}",
+                    f"[{st_color}]{ev.venue.upper()} {ev.status}[/{st_color}]",
+                    ev.details,
+                )
+        else:
+            events_table.add_row(
+                "--:--:--",
+                "STANDBY",
+                "--",
+                "--",
+                "--",
+                "[dim]NO_ORDERS[/dim]",
+                "No live execution events yet in this session (monitoring active)",
+            )
+
+        return Group(header_panel, table, events_table)
 
     def print_snapshot(
         self,
@@ -191,6 +255,8 @@ class ApexTUIDashboard:
         universe_scanned_count: int = 0,
         universe_total_count: int = 0,
         universe_badge: str | None = None,
+        account_currency: str = "USD",
+        broker_events: Sequence[BrokerExecutionEvent] = (),
     ) -> None:
         """Render a static Rich snapshot table to the terminal."""
         group = self.build_renderable(
@@ -209,5 +275,7 @@ class ApexTUIDashboard:
             universe_scanned_count=universe_scanned_count,
             universe_total_count=universe_total_count,
             universe_badge=universe_badge,
+            account_currency=account_currency,
+            broker_events=broker_events,
         )
         self.console.print(group)

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock
 import pytest
 
-from apex.ai.veto_committee import AIVetoCommittee
-from apex.cockpit.tui_dashboard import ApexTUIDashboard, SymbolCockpitRow
+from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
+from apex.cockpit.tui_dashboard import ApexTUIDashboard, BrokerExecutionEvent, SymbolCockpitRow
+from apex.execution.router import DualBrokerExecutionRouter, ExecutionOrderRequest
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.ctrader_feed import CTraderOpenApiFeed
 from apex.feeds.dual_router import MarketFeedRouter
@@ -346,3 +348,141 @@ def test_ctrader_catalog_discovery_and_alias_mapping() -> None:
     assert feed.resolve_symbol("GOLD") == "XAUUSD"
     assert feed.resolve_symbol("SPX500") == "US500"
     assert feed.resolve_symbol("NONEXISTENT") is None
+
+
+def _sample_audit_context(**kwargs: Any) -> CandidateSetupAuditContext:
+    defaults: dict[str, Any] = {
+        "symbol": "US500",
+        "side": Side.BUY,
+        "timeframe": "M5",
+        "entry_price": 5000.0,
+        "stop_loss": 4990.0,
+        "take_profit": 5020.0,
+        "regime": "TRENDING_EXPANSION",
+        "hurst_exponent": 0.65,
+        "kaufman_er": 0.45,
+        "volatility_percentile": 60.0,
+        "dom_obi": 0.25,
+        "spread_pct_of_sl": 0.05,
+        "net_avg_R": 0.22,
+        "prob_profit": 0.58,
+        "cvar_95_R": -1.05,
+        "recommended_risk_pct": 0.5,
+        "session_utc_iso": "2026-11-11T16:00:00Z",
+        "bar_timestamp": 1700000000.0,
+    }
+    defaults.update(kwargs)
+    return CandidateSetupAuditContext(**defaults)
+
+
+def test_ai_verdict_caching_and_cooldown() -> None:
+    """Verify per-candle verdict caching and consecutive failure cooldown in AIVetoCommittee."""
+    committee = AIVetoCommittee(enabled=True, mode="pure_math", timeout_seconds=1.0)
+    committee._verdict_cache.clear()
+
+    ctx1 = _sample_audit_context(bar_timestamp=1700000000.0)
+
+    # First evaluation generates and caches verdict
+    v1 = committee.evaluate_sync(ctx1)
+    assert v1.decision == "APPROVE"
+    assert len(committee._verdict_cache) == 1
+
+    # Same symbol, side, tf, and bar_timestamp hits cache
+    v2 = committee.evaluate_sync(ctx1)
+    assert v2.decision == v1.decision
+    assert v2.reason == v1.reason
+
+    # New bar timestamp generates a new cache entry
+    ctx2 = _sample_audit_context(bar_timestamp=1700000300.0)
+    v3 = committee.evaluate_sync(ctx2)
+    assert v3.decision == "APPROVE"
+    assert len(committee._verdict_cache) == 2
+
+    # Test cooldown: consecutive failures trigger cooldown to pure_math
+    AIVetoCommittee._agy_consecutive_failures = 2
+    import time
+
+    AIVetoCommittee._agy_cooldown_until_utc = time.time() + 600.0
+
+    status = committee.get_router_status()
+    assert status.agy_pro_status.ready is False
+    assert "cooldown" in status.agy_pro_status.detail.lower()
+
+    # Cleanup class state
+    AIVetoCommittee._agy_consecutive_failures = 0
+    AIVetoCommittee._agy_cooldown_until_utc = 0.0
+
+
+def test_min_net_avg_r_filter() -> None:
+    """Verify net_avg_R >= 0.10 floor in pure_math fallback evaluation."""
+    committee = AIVetoCommittee(enabled=True, mode="pure_math", timeout_seconds=1.0)
+    committee._verdict_cache.clear()
+
+    # Candidate with net_avg_R = 0.05 (< 0.10 floor) must be VETOED
+    ctx_low = _sample_audit_context(symbol="EURUSD", bar_timestamp=1700000000.0, net_avg_R=0.05)
+    v_low = committee.evaluate_sync(ctx_low)
+    assert v_low.decision == "VETO"
+    assert "0.10" in v_low.reason
+
+    # Candidate with net_avg_R = 0.15 (>= 0.10 floor) must be APPROVED
+    ctx_high = _sample_audit_context(symbol="EURUSD", bar_timestamp=1700000300.0, net_avg_R=0.15)
+    v_high = committee.evaluate_sync(ctx_high)
+    assert v_high.decision == "APPROVE"
+
+
+def test_fusion_cad_lot_sizing_and_broker_events() -> None:
+    """Verify Fusion Markets CAD sizing and BrokerExecutionEvent recording."""
+    feed_router = MagicMock(spec=MarketFeedRouter)
+    feed_router.ctrader = MagicMock()
+    feed_router.ctrader.is_connected = False
+    feed_router.mt5 = MagicMock()
+    feed_router.mt5.is_connected = True
+
+    # Ensure get_dom_analytics returns None so DOM checks don't fail on MagicMock
+    feed_router.get_dom_analytics.return_value = None
+
+    # Sizing calculation mock
+    feed_router.mt5.compute_compliant_lot_size.return_value = 3.52
+    feed_router.mt5.get_open_positions.return_value = []
+    feed_router.mt5.alias_mapper = SmartAliasMapper()
+    feed_router.mt5.resolve_symbol.return_value = "US500"
+
+    nbbo_mock = MagicMock()
+    nbbo_mock.topology = MagicMock(value="MT5_SOLO")
+    nbbo_mock.winning_venue = "mt5"
+    nbbo_mock.pips_saved = 0.0
+    nbbo_mock.usd_saved_per_lot = 0.0
+    nbbo_mock.single_broker_spike_blocked = False
+    feed_router.evaluate_nbbo.return_value = nbbo_mock
+
+    router = DualBrokerExecutionRouter(
+        feed_router=feed_router,
+        account_equity_usd=10000.0,
+        is_live=False,
+    )
+
+    # Compliant lot size verification
+    lots = router.compute_compliant_lot_size("US500", 5000.0, 4990.0, 50.0)
+    assert lots == 3.52
+
+    # Execute paper shadow and verify BrokerExecutionEvent
+    order = ExecutionOrderRequest(
+        symbol="US500",
+        side=Side.BUY,
+        lots=3.52,
+        entry_price=5000.0,
+        stop_loss=4990.0,
+        take_profit=5020.0,
+        force_paper_shadow=True,
+    )
+    receipt = router.execute_order(order)
+    assert receipt.status == "PAPER_SHADOW_FILLED"
+
+    events = router.recent_broker_events
+    assert len(events) >= 1
+    last_event = events[-1]
+    assert last_event.symbol == "US500"
+    assert last_event.side == "BUY"
+    assert last_event.lots == 3.52
+    assert last_event.status == "PAPER_SHADOW_FILLED"
+
