@@ -115,6 +115,7 @@ class ApexTUIDashboard:
         universe_badge: str | None = None,
         account_currency: str = "USD",
         broker_events: Sequence[BrokerExecutionEvent] = (),
+        aegis_badge: str = "Aegis: 0% Hallucinations | 0 Verified Proofs",
     ) -> Group:
         """Build the composite Rich Dashboard layout."""
         dd_pct = (daily_pnl_usd / account_equity_usd * 100.0) if account_equity_usd > 0 else 0.0
@@ -134,10 +135,11 @@ class ApexTUIDashboard:
             )
 
         header_text = (
-            f"[bold cyan]POCKETBOT APEX v2.1[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
+            f"[bold cyan]POCKETBOT APEX v2.2[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
             f"[bold bright_cyan]{mesh_badge}[/bold bright_cyan] (cTrader: {ct_badge} | MT5: {mt5_badge}) | "
             f"SOR Saved: [bold green]+{sor_saved_pips:.1f}p ({sor_saved_usd:,.2f} {account_currency})[/bold green]\n"
             f"[bold magenta]{ai_brain_badge}[/bold magenta] | "
+            f"[bold green]{aegis_badge}[/bold green] | "
             f"Equity: [bold]{account_equity_usd:,.2f} {account_currency}[/bold] | "
             f"Daily P/L: [{pnl_style}]{daily_pnl_usd:+,.2f} {account_currency} ({dd_pct:+.2f}%)[/{pnl_style}] | "
             f"Open Positions: [bold]{open_positions_count}/2[/bold]"
@@ -197,7 +199,7 @@ class ApexTUIDashboard:
             )
 
         events_table = Table(
-            title="Last 5 Execution & AI Router Events",
+            title="Last 5 Execution & Aegis Audit Events",
             expand=True,
             header_style="bold yellow",
         )
@@ -207,7 +209,7 @@ class ApexTUIDashboard:
         events_table.add_column("Lots", justify="right", width=8)
         events_table.add_column("Price / SL / TP", width=28)
         events_table.add_column("Venue / Status", width=22)
-        events_table.add_column("AI Model / Latency / MT5 RetCode", style="dim")
+        events_table.add_column("AI Model / Aegis Proof / MT5 RetCode", style="dim")
 
         if broker_events:
             for ev in broker_events[-5:]:
@@ -257,6 +259,7 @@ class ApexTUIDashboard:
         universe_badge: str | None = None,
         account_currency: str = "USD",
         broker_events: Sequence[BrokerExecutionEvent] = (),
+        aegis_badge: str = "Aegis: 0% Hallucinations | 0 Verified Proofs",
     ) -> None:
         """Render a static Rich snapshot table to the terminal."""
         group = self.build_renderable(
@@ -277,5 +280,6 @@ class ApexTUIDashboard:
             universe_badge=universe_badge,
             account_currency=account_currency,
             broker_events=broker_events,
+            aegis_badge=aegis_badge,
         )
         self.console.print(group)

@@ -444,7 +444,11 @@ class MT5Feed:
             return vol_min
 
         tick_size = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0) or 1e-5)
-        tick_val = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+        tick_val = float(
+            getattr(info, "trade_tick_value_loss", 0.0)
+            or getattr(info, "trade_tick_value", 0.0)
+            or 0.0
+        )
 
         # In MT5, trade_tick_value is expressed in account currency per 1.0 lot per tick_size
         if tick_size > 0.0 and tick_val > 0.0:

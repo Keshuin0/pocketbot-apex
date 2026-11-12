@@ -4,10 +4,11 @@ Dynamically discovers available Gemini models across:
   - Google AI Studio REST API (`/v1beta/models`)
   - Google AI Pro CLI (`agy.exe -p` in isolated temp dir)
 
-Ranks candidate models before every AI Risk Veto audit using 3 real-time factors:
+Ranks candidate models before every AI Risk Veto audit using 4 real-time factors:
   - Factor A: Remaining Quota & Budget Pacing (RPM/RPD tracking, 429 exponential cooldown, Pro conservation)
   - Factor B: Setup Complexity & Stakes (volatility percentile, borderline net_avg_R, risk %)
-  - Factor C: Rolling EWMA Latency vs Timeframe Urgency (penalizes >6s models on fast M1/M5 breakouts)
+  - Factor C: Rolling EWMA Latency vs Timeframe Urgency (<8s target on M5)
+  - Factor D: Live Epistemic Trust Score (from Aegis Shield 6 Shadow Counterfactual Grading)
 """
 
 from __future__ import annotations
@@ -64,6 +65,9 @@ class DiscoveredModel:
     cooldown_until_utc: float = 0.0
     last_error: str = ""
     last_used_utc: float = 0.0
+    epistemic_trust_score: float = 1.0
+    epistemic_quarantined: bool = False
+    epistemic_quarantine_reason: str = ""
 
     def reset_daily_if_needed(self) -> None:
         today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
@@ -372,6 +376,9 @@ class AdaptiveModelSelector:
             rem = int(model.cooldown_until_utc - ts)
             return -1.0, f"cooldown ({rem}s)"
 
+        if model.epistemic_quarantined:
+            return -1.0, f"epistemically quarantined ({model.epistemic_quarantine_reason or 'compromised'})"
+
         rpm_used = len(model.minute_timestamps)
         if rpm_used >= model.rpm_limit:
             return -1.0, f"RPM exhausted ({rpm_used}/{model.rpm_limit})"
@@ -401,28 +408,40 @@ class AdaptiveModelSelector:
                 ModelTier.PRO_REASONING: 0.55,
             }[model.tier]
 
-        # Factor C: Rolling EWMA Latency vs Timeframe Urgency
+        # Factor C: Rolling EWMA Latency vs Timeframe Urgency (<8s target on M5)
         lat_s = model.ewma_latency_ms / 1000.0
         if stakes.is_urgent:
-            if lat_s > 6.0:
-                latency_score = max(0.05, 0.30 - 0.04 * (lat_s - 6.0))
+            if lat_s > 8.0:
+                latency_score = max(0.02, 0.22 - 0.03 * (lat_s - 8.0))
+            elif lat_s > 6.0:
+                latency_score = max(0.22, 0.45 - 0.115 * (lat_s - 6.0))
             else:
-                latency_score = max(0.20, 1.0 - (lat_s / 8.0))
+                latency_score = max(0.25, 1.0 - (lat_s / 8.0))
         else:
             latency_score = max(0.20, 1.0 - (lat_s / 15.0))
 
-        # Slight preference for newer generation (2.5 / 3.x) over older (1.5 / 2.0) on ties
+        # Factor D: Live Epistemic Trust Score (from Aegis Shield 6)
+        trust_score = max(0.0, min(1.0, float(model.epistemic_trust_score)))
+
+        # Slight preference for newer generation (2.5 / 3.x / 4.x) over older (1.5 / 2.0) on ties
         gen_bonus = 0.0
         low_id = model.model_id.lower()
-        if "2.5" in low_id or "3." in low_id:
+        if "2.5" in low_id or "3." in low_id or "4-" in low_id or "4." in low_id:
             gen_bonus = 0.03
         elif "2.0" in low_id:
             gen_bonus = 0.01
 
-        total = min(1.0, 0.35 * quota_score + 0.35 * stakes_fit + 0.30 * latency_score + gen_bonus)
+        total = min(
+            1.0,
+            0.28 * quota_score
+            + 0.27 * stakes_fit
+            + 0.25 * latency_score
+            + 0.20 * trust_score
+            + gen_bonus,
+        )
         reason = (
             f"score={total:.3f} (quota={quota_score:.2f}, stakes={stakes_fit:.2f}, "
-            f"lat={lat_s:.1f}s->fit={latency_score:.2f})"
+            f"lat={lat_s:.1f}s->fit={latency_score:.2f}, trust={trust_score:.2f})"
         )
         return round(total, 4), reason
 
@@ -485,13 +504,37 @@ class AdaptiveModelSelector:
         if any(tok in low_err for tok in ("404", "not found", "deprecated", "unsupported")):
             # Model retired or unsupported -> quarantine 1 hour
             model.cooldown_until_utc = ts + 3600.0
-        elif is_quota_or_429 or any(tok in low_err for tok in ("429", "quota", "rate", "exhaust", "resource_exhausted")):
+        elif is_quota_or_429 or any(
+            tok in low_err for tok in ("429", "quota", "rate", "exhaust", "resource_exhausted", "credits", "balance")
+        ):
             # Exponential backoff: 60s -> 120s -> 240s -> 480s -> 960s
             backoff = 60.0 * (2 ** min(model.consecutive_errors - 1, 4))
             model.cooldown_until_utc = ts + backoff
         elif model.consecutive_errors >= 2:
             # Repeated timeout/error -> 10 min cooldown
             model.cooldown_until_utc = ts + 600.0
+
+    def update_epistemic_trust(
+        self,
+        provider: str,
+        model_id: str,
+        trust_score: float,
+        quarantined: bool = False,
+        reason: str = "",
+    ) -> None:
+        """Update Factor D epistemic trust score (and optional quarantine) from Shield 6."""
+        model = self.register_model(provider, model_id)
+        model.epistemic_trust_score = max(0.0, min(1.0, float(trust_score)))
+        if quarantined:
+            model.epistemic_quarantined = True
+            model.epistemic_quarantine_reason = reason or "EPISTEMICALLY_COMPROMISED"
+
+    def quarantine_epistemically(self, provider: str, model_id: str, reason: str) -> None:
+        """Immediately quarantine a model as epistemically compromised (e.g. Canary Trap failure)."""
+        model = self.register_model(provider, model_id)
+        model.epistemic_trust_score = 0.0
+        model.epistemic_quarantined = True
+        model.epistemic_quarantine_reason = reason or "EPISTEMICALLY_COMPROMISED"
 
     def get_quota_health_summary(
         self,
