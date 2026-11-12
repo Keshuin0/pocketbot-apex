@@ -766,11 +766,11 @@ class AIVetoCommittee:
                 "--print-timeout",
                 f"{timeout_int}s",
                 "--disable-slash-commands",
-                "--effort",
-                "low",
             ]
             if model_id != "default":
                 cmd.extend(["--model", model_id])
+            else:
+                cmd.extend(["--effort", "low"])
             try:
                 proc = subprocess.run(
                     cmd,

@@ -329,11 +329,11 @@ class AdaptiveModelSelector:
                 "--print-timeout",
                 "28s",
                 "--disable-slash-commands",
-                "--effort",
-                "low",
             ]
             if probe_target.model_id != "default":
                 cmd.extend(["--model", probe_target.model_id])
+            else:
+                cmd.extend(["--effort", "low"])
             t0 = time.perf_counter()
             try:
                 proc = subprocess.run(

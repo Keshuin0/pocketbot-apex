@@ -377,7 +377,12 @@ def _sample_audit_context(**kwargs: Any) -> CandidateSetupAuditContext:
 
 def test_ai_verdict_caching_and_cooldown() -> None:
     """Verify per-candle verdict caching and consecutive failure cooldown in AIVetoCommittee."""
-    committee = AIVetoCommittee(enabled=True, mode="pure_math", timeout_seconds=1.0)
+    committee = AIVetoCommittee(
+        enabled=True,
+        mode="force_pure_math",
+        timeout_seconds=1.0,
+        config_path="__nonexistent__",
+    )
     committee._verdict_cache.clear()
 
     ctx1 = _sample_audit_context(bar_timestamp=1700000000.0)
@@ -398,24 +403,29 @@ def test_ai_verdict_caching_and_cooldown() -> None:
     assert v3.decision == "APPROVE"
     assert len(committee._verdict_cache) == 2
 
-    # Test cooldown: consecutive failures trigger cooldown to pure_math
-    AIVetoCommittee._agy_consecutive_failures = 2
+    # Test cooldown: consecutive failures trigger cooldown to pure_math (works with or without agy.exe installed)
     import time
 
-    AIVetoCommittee._agy_cooldown_until_utc = time.time() + 600.0
+    committee._agy_consecutive_failures = 2
+    committee._agy_cooldown_until_utc = time.time() + 600.0
 
     status = committee.get_router_status()
     assert status.agy_pro_status.ready is False
     assert "cooldown" in status.agy_pro_status.detail.lower()
 
-    # Cleanup class state
-    AIVetoCommittee._agy_consecutive_failures = 0
-    AIVetoCommittee._agy_cooldown_until_utc = 0.0
+    # Cleanup instance state
+    committee._agy_consecutive_failures = 0
+    committee._agy_cooldown_until_utc = 0.0
 
 
 def test_min_net_avg_r_filter() -> None:
     """Verify net_avg_R >= 0.10 floor in pure_math fallback evaluation."""
-    committee = AIVetoCommittee(enabled=True, mode="pure_math", timeout_seconds=1.0)
+    committee = AIVetoCommittee(
+        enabled=True,
+        mode="force_pure_math",
+        timeout_seconds=1.0,
+        config_path="__nonexistent__",
+    )
     committee._verdict_cache.clear()
 
     # Candidate with net_avg_R = 0.05 (< 0.10 floor) must be VETOED
