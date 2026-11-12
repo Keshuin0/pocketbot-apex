@@ -157,6 +157,8 @@ class CandidateSetupAuditContext:
     recommended_risk_pct: float
     session_utc_iso: str = ""
     bar_timestamp: float = 0.0
+    rollover_illiquidity_flag: bool = False
+    cross_asset_shock_z: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,7 +616,12 @@ class AIVetoCommittee:
     ) -> AIVetoDecision:
         """Run Aegis Shields 1-4 & 6 on a raw LLM response; fall back to pure_math on hallucination/abstain."""
         payload = self.clean_and_extract_json_payload(raw_text)
-        v_res = self.aegis.verify_response(payload, blinded)
+        v_res = self.aegis.verify_response(
+            payload,
+            blinded,
+            provider=provider_used,
+            model_id=model_used,
+        )
 
         audit_id = 0
         if self.ledger_db is not None:
@@ -953,21 +960,26 @@ class AIVetoCommittee:
         cascade_path: Sequence[str],
         fallback_reason_prefix: str = "",
     ) -> AIVetoDecision:
-        """Deterministic 0ms $0 Pure Math pass-through relying on Regime + DOM + TimeMachine + 6 Breakers."""
+        """Deterministic 0ms $0 Pure Math + Z3 Axiom Gate pass-through."""
         latency_ms = (time.perf_counter() - start_perf) * 1000.0
         min_net_r = float(getattr(self, "min_net_avg_R", 0.10))
-        # Pure math check: if net_avg_R < min_net_avg_R or spread_pct_of_sl > 0.15, VETO; otherwise APPROVE
+        blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
+        z3_dec, z3_note = self.aegis.z3_pure_math_axiom_gate(blinded.telemetry)
+
         if ctx.net_avg_R < min_net_r:
             dec = "VETO"
             reason = f"Pure Math Gate: net_avg_R ({ctx.net_avg_R:+.3f}R) < {min_net_r:.2f}R"
         elif ctx.spread_pct_of_sl > 0.15 + 1e-9:
             dec = "VETO"
             reason = f"Pure Math Gate: spread is {ctx.spread_pct_of_sl * 100:.1f}% of SL (> 15.0%)"
+        elif z3_dec == "VETO":
+            dec = "VETO"
+            reason = z3_note
         else:
             dec = "APPROVE"
             reason = (
-                f"Pure Math Deterministic Pass-Through: Regime={ctx.regime}, "
-                f"net_avg_R={ctx.net_avg_R:+.3f}R, ProbProfit={ctx.prob_profit * 100:.1f}%"
+                f"Pure Math + Z3 Pass-Through: Regime={ctx.regime}, "
+                f"net_avg_R={ctx.net_avg_R:+.3f}R, ProbProfit={ctx.prob_profit * 100:.1f}% ({z3_note})"
             )
 
         if fallback_reason_prefix:

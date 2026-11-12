@@ -709,9 +709,9 @@ class WalkForwardLedgerDB:
         if canary_failed:
             should_demote = True
             demote_reason = "EPISTEMICALLY_COMPROMISED: Failed Canary Trap audit"
-        elif total >= 20 and hall_rate > 0.10:
+        elif total >= 20 and hall_rate > 0.08:
             should_demote = True
-            demote_reason = f"Rolling hallucination_rate {hall_rate * 100:.1f}% > 10.0% over {total} audits"
+            demote_reason = f"Rolling hallucination_rate {hall_rate * 100:.1f}% > 8.0% over {total} audits"
         elif graded_vetoes >= 20 and avg_vva_r < -0.15:
             should_demote = True
             demote_reason = f"Rolling veto_value_added_R {avg_vva_r:+.3f}R < -0.15R over {graded_vetoes} vetoes"
@@ -739,8 +739,49 @@ class WalkForwardLedgerDB:
             demote_reason=demote_reason,
         )
 
+    def get_conformal_p_value(
+        self,
+        provider: str,
+        model_id: str,
+        raw_confidence: float,
+        window: int = 50,
+    ) -> float:
+        """Compute Split Conformal Prediction p-value against rolling graded calibration scores.
+
+        Non-conformity score `alpha_i = |y_i - p_i|` where `y_i in {0, 1}` is realized win
+        and `p_i` is predicted win probability. Higher p-value means the candidate confidence
+        conforms well to historical calibrated accuracy.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT raw_decision, confidence, shadow_realized_r
+                FROM ai_epistemic_audit
+                WHERE provider = ? AND model_id = ? AND is_graded = 1 AND shadow_realized_r IS NOT NULL
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (provider, model_id, int(max(1, window))),
+            ).fetchall()
+
+        if len(rows) < 5:
+            # Insufficient calibration history -> conservative neutral conformal p-value
+            return round(min(0.65, max(0.20, float(raw_confidence) * 0.75)), 4)
+
+        alphas: list[float] = []
+        for r in rows:
+            y_i = 1.0 if float(r["shadow_realized_r"]) > 0.0 else 0.0
+            c_i = float(r["confidence"])
+            p_i = (1.0 - c_i) if str(r["raw_decision"]).upper() == "VETO" else c_i
+            alphas.append(abs(y_i - p_i))
+
+        cand_alpha = 1.0 - max(0.0, min(1.0, float(raw_confidence)))
+        ge_count = sum(1 for a in alphas if a >= cand_alpha - 1e-9)
+        p_val = (ge_count + 1) / (len(alphas) + 1)
+        return round(float(p_val), 4)
+
     def get_aegis_integrity_summary(self, window: int = 100) -> dict[str, Any]:
-        """Return compact Aegis Epistemic Integrity summary for the TUI cockpit header."""
+        """Return compact Aegis Z3 Epistemic Integrity summary for the TUI cockpit header."""
         stats = self.get_model_epistemic_stats(window=window)
         hall_pct = stats.hallucination_rate * 100.0
         return {
@@ -750,5 +791,5 @@ class WalkForwardLedgerDB:
             "verified_proofs": stats.verified_proofs,
             "veto_value_added_r": stats.veto_value_added_r,
             "avg_brier_score": stats.avg_brier_score,
-            "badge": f"Aegis: {hall_pct:.0f}% Hallucinations | {stats.verified_proofs} Verified Proofs",
+            "badge": f"Aegis Z3: {stats.verified_proofs} Verified Proofs | {hall_pct:.0f}% Uncaught Hallucinations",
         }

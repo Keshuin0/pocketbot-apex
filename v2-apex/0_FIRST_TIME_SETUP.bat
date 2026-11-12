@@ -98,9 +98,9 @@ echo.
 :: -----------------------------------------------------------------------------
 echo [Step D/F] Installing required packages into .venv...
 echo   Installing MetaTrader5, numpy, scipy, ctrader-open-api, twisted, pyOpenSSL,
-echo   service_identity, aiohttp, python-dotenv, rich, pytest...
+echo   service_identity, aiohttp, python-dotenv, rich, pytest, z3-solver...
 echo.
-"%~dp0.venv\Scripts\python.exe" -m pip install MetaTrader5 numpy scipy ctrader-open-api twisted pyOpenSSL service_identity aiohttp python-dotenv rich pytest --quiet
+"%~dp0.venv\Scripts\python.exe" -m pip install MetaTrader5 numpy scipy ctrader-open-api twisted pyOpenSSL service_identity aiohttp python-dotenv rich pytest z3-solver --quiet
 if !ERRORLEVEL! NEQ 0 goto :fail_packages
 echo   [OK] All institutional packages successfully installed.
 echo.

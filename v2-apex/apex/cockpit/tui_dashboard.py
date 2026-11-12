@@ -115,7 +115,8 @@ class ApexTUIDashboard:
         universe_badge: str | None = None,
         account_currency: str = "USD",
         broker_events: Sequence[BrokerExecutionEvent] = (),
-        aegis_badge: str = "Aegis: 0% Hallucinations | 0 Verified Proofs",
+        aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught Hallucinations",
+        contagion_shock_z: float = 0.0,
     ) -> Group:
         """Build the composite Rich Dashboard layout."""
         dd_pct = (daily_pnl_usd / account_equity_usd * 100.0) if account_equity_usd > 0 else 0.0
@@ -140,6 +141,7 @@ class ApexTUIDashboard:
             f"SOR Saved: [bold green]+{sor_saved_pips:.1f}p ({sor_saved_usd:,.2f} {account_currency})[/bold green]\n"
             f"[bold magenta]{ai_brain_badge}[/bold magenta] | "
             f"[bold green]{aegis_badge}[/bold green] | "
+            f"Contagion Shock Z: [bold]{contagion_shock_z:.2f}[/bold] | "
             f"Equity: [bold]{account_equity_usd:,.2f} {account_currency}[/bold] | "
             f"Daily P/L: [{pnl_style}]{daily_pnl_usd:+,.2f} {account_currency} ({dd_pct:+.2f}%)[/{pnl_style}] | "
             f"Open Positions: [bold]{open_positions_count}/2[/bold]"
@@ -259,7 +261,8 @@ class ApexTUIDashboard:
         universe_badge: str | None = None,
         account_currency: str = "USD",
         broker_events: Sequence[BrokerExecutionEvent] = (),
-        aegis_badge: str = "Aegis: 0% Hallucinations | 0 Verified Proofs",
+        aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught Hallucinations",
+        contagion_shock_z: float = 0.0,
     ) -> None:
         """Render a static Rich snapshot table to the terminal."""
         group = self.build_renderable(
@@ -281,5 +284,6 @@ class ApexTUIDashboard:
             account_currency=account_currency,
             broker_events=broker_events,
             aegis_badge=aegis_badge,
+            contagion_shock_z=contagion_shock_z,
         )
         self.console.print(group)

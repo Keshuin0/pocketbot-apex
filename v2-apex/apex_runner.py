@@ -175,6 +175,7 @@ class ApexOrchestrator:
 
         ai_status = self.ai_committee.get_router_status()
         aegis_summary = self.ledger.get_aegis_integrity_summary()
+        contagion_z = self.universe_scanner.last_contagion.cross_asset_shock_z if self.universe_scanner.last_contagion else 0.0
         sor_pips, sor_usd = self.execution_router.cumulative_sor_savings
         self.dashboard.print_snapshot(
             run_mode=self.mode,
@@ -194,6 +195,7 @@ class ApexOrchestrator:
             account_currency=account_currency,
             broker_events=self.execution_router.recent_broker_events,
             aegis_badge=aegis_summary["badge"],
+            contagion_shock_z=contagion_z,
         )
         return rows
 
