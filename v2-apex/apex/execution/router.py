@@ -19,7 +19,9 @@ Enforces 6 non-negotiable pre-trade circuit breakers prior to wire transmission:
 
 from __future__ import annotations
 
+import datetime
 import logging
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -31,6 +33,7 @@ from ctrader_open_api.messages import (
     OpenApiModelMessages_pb2 as oa_model,
 )
 
+from apex.cockpit.tui_dashboard import BrokerExecutionEvent
 from apex.feeds.ctrader_feed import CTRADER_PRICE_SCALE, CTRADER_VOLUME_CENTS_PER_UNIT
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.hydra_nbbo import ResolvedMeshTopology, SyntheticNBBOResult
@@ -149,8 +152,113 @@ class DualBrokerExecutionRouter:
             account_equity_usd=self.account_equity_usd,
         )
         self._shadow_positions: list[dict[str, object]] = []
+        self._recent_broker_events: list[BrokerExecutionEvent] = []
         self._total_sor_pips_saved: float = 0.0
         self._total_sor_usd_saved: float = 0.0
+
+    @property
+    def recent_broker_events(self) -> tuple[BrokerExecutionEvent, ...]:
+        """Return recent broker execution events (up to last 20)."""
+        return tuple(self._recent_broker_events[-20:])
+
+    def record_broker_event(self, event: BrokerExecutionEvent) -> None:
+        """Record an execution or rejection event into the live telemetry buffer."""
+        self._recent_broker_events.append(event)
+        if len(self._recent_broker_events) > 50:
+            self._recent_broker_events.pop(0)
+
+    def update_account_equity_from_broker(self) -> float:
+        """Sync account equity with connected MT5 terminal if active."""
+        if self.feed_router.mt5.is_connected:
+            info = self.feed_router.mt5.get_account_info()
+            eq = float(info.get("equity", 0.0))
+            if eq > 0.0:
+                self.account_equity_usd = eq
+                self.correlation_shield.account_equity_usd = eq
+                return eq
+        return self.account_equity_usd
+
+    def get_open_positions(self) -> list[PositionRiskSpec]:
+        """Fetch all currently open positions across MT5 and Paper-Shadow, normalized to PositionRiskSpec."""
+        specs: list[PositionRiskSpec] = []
+        if self.feed_router.mt5.is_connected:
+            raw_pos = self.feed_router.mt5.get_open_positions()
+            for p in raw_pos:
+                raw_sym = str(p.get("symbol", ""))
+                can_sym = self.feed_router.mt5.alias_mapper.canonicalize(raw_sym)
+                is_buy = int(p.get("type", 0)) == int(mt5.ORDER_TYPE_BUY)
+                side = Side.BUY if is_buy else Side.SELL
+                vol = float(p.get("volume", 0.01))
+                entry_px = float(p.get("price_open", 0.0))
+                sl_px = float(p.get("sl", 0.0))
+                sl_dist = abs(entry_px - sl_px) if sl_px > 0.0 else 0.0
+                risk_usd = 50.0
+                if sl_dist > 0.0:
+                    info = mt5.symbol_info(raw_sym)
+                    if info is not None:
+                        tick_size = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0) or 1e-5)
+                        tick_val = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+                        if tick_size > 0.0 and tick_val > 0.0:
+                            risk_usd = (sl_dist / tick_size) * tick_val * vol
+                risk_pct = (risk_usd / self.account_equity_usd * 100.0) if self.account_equity_usd > 0.0 else 0.5
+                specs.append(
+                    PositionRiskSpec(
+                        symbol=can_sym,
+                        side=side,
+                        risk_pct=risk_pct,
+                        risk_usd=risk_usd,
+                    )
+                )
+
+        for sp in self._shadow_positions:
+            specs.append(
+                PositionRiskSpec(
+                    symbol=str(sp.get("symbol", "")),
+                    side=Side.BUY if str(sp.get("side", "")).upper() == "BUY" else Side.SELL,
+                    risk_pct=0.5,
+                    risk_usd=50.0,
+                )
+            )
+        return specs
+
+    def get_open_symbols(self) -> set[str]:
+        """Return set of all symbol names (both canonical and raw broker names) currently open."""
+        open_syms: set[str] = set()
+        for p in self.get_open_positions():
+            can = p.symbol.upper()
+            open_syms.add(can)
+            raw = self.feed_router.mt5.resolve_symbol(can) if self.feed_router.mt5.is_connected else None
+            if raw:
+                open_syms.add(raw.upper())
+        for sp in self._shadow_positions:
+            open_syms.add(str(sp.get("symbol", "")).upper())
+        return open_syms
+
+    def compute_compliant_lot_size(
+        self,
+        symbol: str,
+        entry_price: float,
+        stop_loss: float,
+        risk_usd: float,
+    ) -> float:
+        """Compute broker-compliant lot size using MT5 feed calculator or contract spec fallback."""
+        if self.feed_router.mt5.is_connected:
+            return self.feed_router.mt5.compute_compliant_lot_size(
+                symbol=symbol,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                risk_amount=risk_usd,
+            )
+        spec = self.feed_router.ctrader.get_contract_spec(symbol)
+        if spec is not None:
+            sl_dist = abs(float(entry_price) - float(stop_loss))
+            if sl_dist > 1e-12:
+                loss_per_lot = sl_dist * spec.lot_size
+                lots_raw = float(risk_usd) / loss_per_lot if loss_per_lot > 0.0 else spec.min_volume_lots
+                step = spec.step_volume_lots if spec.step_volume_lots > 0 else 0.01
+                snapped = round(lots_raw / step) * step
+                return max(spec.min_volume_lots, min(spec.max_volume_lots, round(snapped, 2)))
+        return 0.01
 
     @property
     def cumulative_sor_savings(self) -> tuple[float, float]:
@@ -438,6 +546,20 @@ class DualBrokerExecutionRouter:
                     if order.side == Side.BUY
                     else order.entry_price - vwap_slippage_price
                 )
+                self.record_broker_event(
+                    BrokerExecutionEvent(
+                        timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
+                        symbol=norm_sym,
+                        side=order.side.value,
+                        lots=order.lots,
+                        price=exec_price,
+                        stop_loss=order.stop_loss,
+                        take_profit=order.take_profit,
+                        venue="CTRADER",
+                        status="FILLED",
+                        details=f"Order {req.clientOrderId[:8]} | Sent [{mesh_topology}]",
+                    )
+                )
                 return ExecutionReceipt(
                     order_id=req.clientOrderId,
                     symbol=norm_sym,
@@ -510,6 +632,20 @@ class DualBrokerExecutionRouter:
                 if res is not None and int(getattr(res, "retcode", 0)) == int(mt5.TRADE_RETCODE_DONE):
                     fill_px = float(getattr(res, "price", 0.0) or live_px)
                     slip = (fill_px - order.entry_price) if order.side == Side.BUY else (order.entry_price - fill_px)
+                    self.record_broker_event(
+                        BrokerExecutionEvent(
+                            timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
+                            symbol=norm_sym,
+                            side=order.side.value,
+                            lots=order.lots,
+                            price=fill_px,
+                            stop_loss=order.stop_loss,
+                            take_profit=order.take_profit,
+                            venue="MT5",
+                            status="FILLED",
+                            details=f"Ticket #{res.order} | Done",
+                        )
+                    )
                     return ExecutionReceipt(
                         order_id=str(getattr(res, "order", uuid.uuid4().hex[:10])),
                         symbol=norm_sym,
@@ -531,6 +667,41 @@ class DualBrokerExecutionRouter:
                         sor_pips_saved=sor_pips_saved,
                         sor_usd_saved=sor_usd_saved,
                     )
+                else:
+                    rc = int(getattr(res, "retcode", -1)) if res is not None else -1
+                    cmt = str(getattr(res, "comment", "Error")) if res is not None else "No terminal response"
+                    logger.warning("MT5 order_send rejected for %s: retcode=%s comment=%s", norm_sym, rc, cmt)
+                    self.record_broker_event(
+                        BrokerExecutionEvent(
+                            timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
+                            symbol=norm_sym,
+                            side=order.side.value,
+                            lots=order.lots,
+                            price=live_px,
+                            stop_loss=order.stop_loss,
+                            take_profit=order.take_profit,
+                            venue="MT5",
+                            status="REJECTED",
+                            details=f"Retcode {rc}: {cmt}",
+                        )
+                    )
+            else:
+                reason = "AutoTrading Disabled" if not trade_allowed else f"Unresolved '{norm_sym}'"
+                logger.warning("MT5 execution skipped: %s", reason)
+                self.record_broker_event(
+                    BrokerExecutionEvent(
+                        timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
+                        symbol=norm_sym,
+                        side=order.side.value,
+                        lots=order.lots,
+                        price=float(order.entry_price),
+                        stop_loss=order.stop_loss,
+                        take_profit=order.take_profit,
+                        venue="MT5",
+                        status="BLOCKED",
+                        details=reason,
+                    )
+                )
         return None
 
     def _record_sor_savings(
@@ -596,6 +767,21 @@ class DualBrokerExecutionRouter:
         topology = nbbo.topology
 
         if not report.all_passed:
+            fail_detail = report.failed_reasons[0] if report.failed_reasons else "Circuit breaker block"
+            self.record_broker_event(
+                BrokerExecutionEvent(
+                    timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
+                    symbol=order.symbol.upper(),
+                    side=order.side.value,
+                    lots=order.lots,
+                    price=order.entry_price,
+                    stop_loss=order.stop_loss,
+                    take_profit=order.take_profit,
+                    venue="CIRCUIT",
+                    status="REJECTED",
+                    details=fail_detail[:60],
+                )
+            )
             return ExecutionReceipt(
                 order_id="",
                 symbol=order.symbol.upper(),
@@ -863,6 +1049,20 @@ class DualBrokerExecutionRouter:
                 "sor_pips_saved": sor_pips_saved,
                 "sor_usd_saved": sor_usd_saved,
             }
+        )
+        self.record_broker_event(
+            BrokerExecutionEvent(
+                timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
+                symbol=order.symbol.upper(),
+                side=order.side.value,
+                lots=order.lots,
+                price=exec_price,
+                stop_loss=order.stop_loss,
+                take_profit=order.take_profit,
+                venue="SHADOW",
+                status="PAPER_SHADOW_FILLED",
+                details=reason_note[:50],
+            )
         )
         return ExecutionReceipt(
             order_id=oid,

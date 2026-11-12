@@ -140,7 +140,9 @@ def run_live_waterfall_test(committee: AIVetoCommittee) -> int:
     console.print(
         Panel(
             f"[bold]Decision:[/bold] `{decision.decision}` (Confidence: `{decision.confidence:.2f}`)\n"
-            f"[bold]Provider Used:[/bold] `{decision.provider_used}`\n"
+            f"[bold]Provider Used:[/bold] `{decision.provider_used}`"
+            + (f" (`{decision.model_used}`)" if decision.model_used else "")
+            + "\n"
             f"[bold]Cascade Path:[/bold] `{' -> '.join(decision.cascade_path)}`\n"
             f"[bold]Latency:[/bold] `{decision.latency_ms:.1f} ms`\n"
             f"[bold]Reason:[/bold] {decision.reason}",
@@ -151,6 +153,54 @@ def run_live_waterfall_test(committee: AIVetoCommittee) -> int:
     return 0
 
 
+def inspect_discovered_models(committee: AIVetoCommittee) -> None:
+    """Display all dynamically discovered Gemini models, quota health, and rolling EWMA latency."""
+    import time
+
+    committee.hot_reload_if_needed(force=True)
+    if committee.api_key:
+        committee.model_selector.discover_studio_models(committee.api_key, force=True)
+    if committee._cached_agy_path:
+        committee.model_selector.discover_agy_models(committee._cached_agy_path, probe_cli=False, force=True)
+
+    models = committee.model_selector.get_models()
+    table = Table(
+        title="Discovered Gemini Models — Quota Health & Rolling Latency",
+        header_style="bold cyan",
+        expand=True,
+    )
+    table.add_column("Provider", style="bold white")
+    table.add_column("Model ID", style="cyan")
+    table.add_column("Tier")
+    table.add_column("Daily Calls / RPD", justify="right")
+    table.add_column("Avg Latency", justify="right")
+    table.add_column("Status")
+
+    now_utc = time.time()
+    if not models:
+        table.add_row("--", "No models discovered yet", "--", "0/0", "--", "[yellow]UNCONFIGURED[/yellow]")
+    else:
+        for m in models:
+            if now_utc < m.cooldown_until_utc:
+                rem = int(m.cooldown_until_utc - now_utc)
+                st_str = f"[red]COOLDOWN ({rem}s)[/red]"
+            elif m.daily_calls >= m.rpd_limit:
+                st_str = "[red]RPD EXHAUSTED[/red]"
+            else:
+                st_str = "[bold green]READY[/bold green]"
+            table.add_row(
+                m.provider,
+                m.model_id,
+                m.tier.value,
+                f"{m.daily_calls}/{m.rpd_limit}",
+                f"{m.ewma_latency_ms / 1000.0:.2f}s",
+                st_str,
+            )
+    console.print(table)
+    status = committee.get_router_status()
+    console.print(f"[bold magenta]{status.model_quota_badge}[/bold magenta]")
+
+
 def apply_menu_choice(
     choice: str,
     committee: AIVetoCommittee,
@@ -158,7 +208,7 @@ def apply_menu_choice(
     env_path: Path,
     new_key_input: str | None = None,
 ) -> bool:
-    """Apply menu option [1]..[5]. Returns False if user chose to exit."""
+    """Apply menu option [1]..[6]. Returns False if user chose to exit."""
     c = choice.strip().lower()
     if c in ("q", "0", "exit"):
         return False
@@ -198,6 +248,8 @@ def apply_menu_choice(
         console.print(f"[bold green]✓ {action_lbl} GEMINI_API_KEY in {env_path}[/bold green]")
     elif c == "5":
         run_live_waterfall_test(committee)
+    elif c == "6":
+        inspect_discovered_models(committee)
     else:
         console.print(f"[red]Unknown option: {choice}[/red]")
 
@@ -209,7 +261,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PocketBot Apex — Interactive Zero-Code AI Mode Switcher")
     parser.add_argument("--config", default=str(ROOT_DIR / "config" / "apex_config.json"))
     parser.add_argument("--env", default=str(ROOT_DIR / ".env"))
-    parser.add_argument("--choice", choices=["1", "2", "3", "4", "5"], help="Non-interactive menu selection")
+    parser.add_argument("--choice", choices=["1", "2", "3", "4", "5", "6"], help="Non-interactive menu selection")
     parser.add_argument("--api-key", default=None, help="API key value when using --choice 4")
     parser.add_argument("--status-only", action="store_true", help="Print live discovery status and exit")
     args = parser.parse_args(argv)
@@ -237,9 +289,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "  [bold][3][/bold] Force Pure Math Only (Disable AI Veto completely)\n"
             "  [bold][4][/bold] Add / Update / Clear Google AI Studio API Key in .env\n"
             "  [bold][5][/bold] Run Live Test of Current AI Waterfall Right Now\n"
+            "  [bold][6][/bold] Inspect Discovered Gemini Models, Quota Health & Latency\n"
             "  [bold][0][/bold] Exit\n"
         )
-        ans = console.input("[bold green]Enter choice [0-5]:[/bold green] ").strip()
+        ans = console.input("[bold green]Enter choice [0-6]:[/bold green] ").strip()
         if not apply_menu_choice(ans, committee, config_path, env_path):
             break
     return 0

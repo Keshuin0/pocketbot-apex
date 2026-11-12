@@ -5,13 +5,12 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Sequence
+from typing import Any, Sequence
 
 import MetaTrader5 as mt5
 
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.models import (
-    AssetClass,
     Candle,
     ContractSpec,
     DiscoveredSymbol,
@@ -366,3 +365,106 @@ class MT5Feed:
             )
         candles.sort(key=lambda c: c.timestamp_utc)
         return candles
+
+    def get_account_info(self) -> dict[str, Any]:
+        """Fetch MT5 account status, balance, equity, and currency."""
+        if not self._initialized:
+            return {}
+        info = mt5.account_info()
+        if info is None:
+            return {}
+        return {
+            "login": int(getattr(info, "login", 0)),
+            "server": str(getattr(info, "server", "")),
+            "currency": str(getattr(info, "currency", "USD")),
+            "balance": float(getattr(info, "balance", 0.0)),
+            "equity": float(getattr(info, "equity", 0.0)),
+            "margin": float(getattr(info, "margin", 0.0)),
+            "margin_free": float(getattr(info, "margin_free", 0.0)),
+            "trade_allowed": bool(getattr(info, "trade_allowed", False)),
+            "trade_mode": int(getattr(info, "trade_mode", 0)),
+        }
+
+    def get_account_currency(self) -> str:
+        """Return the MT5 account base currency (e.g., 'CAD', 'USD')."""
+        info = self.get_account_info()
+        return info.get("currency", "USD")
+
+    def get_open_positions(self) -> list[dict[str, Any]]:
+        """Return list of open MT5 positions."""
+        if not self._initialized:
+            return []
+        positions = mt5.positions_get()
+        if not positions:
+            return []
+        res: list[dict[str, Any]] = []
+        for p in positions:
+            res.append(
+                {
+                    "ticket": int(getattr(p, "ticket", 0)),
+                    "symbol": str(getattr(p, "symbol", "")),
+                    "type": int(getattr(p, "type", 0)),
+                    "volume": float(getattr(p, "volume", 0.0)),
+                    "price_open": float(getattr(p, "price_open", 0.0)),
+                    "sl": float(getattr(p, "sl", 0.0)),
+                    "tp": float(getattr(p, "tp", 0.0)),
+                    "price_current": float(getattr(p, "price_current", 0.0)),
+                    "profit": float(getattr(p, "profit", 0.0)),
+                    "comment": str(getattr(p, "comment", "")),
+                }
+            )
+        return res
+
+    def compute_compliant_lot_size(
+        self,
+        symbol: str,
+        entry_price: float,
+        stop_loss: float,
+        risk_amount: float,
+    ) -> float:
+        """Compute broker-compliant lot size based on stop loss distance, tick value, and volume constraints.
+
+        Uses the exact broker tick value (reported in account currency) and snaps to
+        volume_min, volume_max, and volume_step.
+        """
+        resolved = self.resolve_symbol(symbol)
+        if not resolved or not self._initialized:
+            return 0.01
+
+        info = mt5.symbol_info(resolved)
+        if info is None:
+            return 0.01
+
+        vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
+        vol_max = float(getattr(info, "volume_max", 100.0) or 100.0)
+        vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
+
+        sl_dist = abs(float(entry_price) - float(stop_loss))
+        if sl_dist <= 1e-12:
+            return vol_min
+
+        tick_size = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0) or 1e-5)
+        tick_val = float(getattr(info, "trade_tick_value", 0.0) or 0.0)
+
+        # In MT5, trade_tick_value is expressed in account currency per 1.0 lot per tick_size
+        if tick_size > 0.0 and tick_val > 0.0:
+            loss_per_lot = (sl_dist / tick_size) * tick_val
+        else:
+            contract_sz = float(getattr(info, "trade_contract_size", 100_000.0) or 100_000.0)
+            loss_per_lot = sl_dist * contract_sz
+
+        if loss_per_lot <= 1e-9:
+            return vol_min
+
+        lots_raw = float(risk_amount) / loss_per_lot
+
+        if vol_step > 0.0:
+            steps = round(lots_raw / vol_step)
+            lots_snapped = steps * vol_step
+        else:
+            lots_snapped = lots_raw
+
+        lots_final = max(vol_min, min(vol_max, lots_snapped))
+        decimals = max(0, -int(math.floor(math.log10(vol_step)))) if vol_step < 1.0 else 0
+        return round(lots_final, decimals)
+

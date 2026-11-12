@@ -43,6 +43,7 @@ from typing import Any, Callable, Sequence
 import aiohttp
 from dotenv import dotenv_values
 
+from apex.ai.model_selector import AdaptiveModelSelector, compute_setup_stakes
 from apex.feeds.models import Side
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,7 @@ class HybridAIRouterStatus:
     studio_status: AIProviderStatus
     agy_pro_status: AIProviderStatus
     pure_math_status: AIProviderStatus
+    model_quota_summary: dict[str, Any] = field(default_factory=dict)
 
     @property
     def dashboard_badge(self) -> str:
@@ -117,6 +119,19 @@ class HybridAIRouterStatus:
         fb_str = " -> ".join(fallbacks) if fallbacks else "Pure Math"
         prefix = "Auto" if self.mode.startswith("auto_") else "Forced"
         return f"AI Brain: {primary_upper} [{prefix} -> {fb_str} fallback]"
+
+    @property
+    def model_quota_badge(self) -> str:
+        """Format live selected model, quota health, and rolling latency for the TUI cockpit."""
+        primary_upper = self.active_primary.upper()
+        if not self.enabled or self.active_primary == AIProviderName.PURE_MATH.value:
+            return "AI Brain: PURE_MATH [0ms Deterministic Quant Only]"
+        q = self.model_quota_summary or {}
+        sel = q.get("selected_model", "auto")
+        health = q.get("health", "HEALTHY")
+        calls = int(q.get("calls_today", 0))
+        avg_s = float(q.get("avg_latency_s", 0.0))
+        return f"AI Brain: {primary_upper} [Model: {sel} | Quota: {health} ({calls} calls today) | Avg {avg_s:.1f}s]"
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +155,7 @@ class CandidateSetupAuditContext:
     cvar_95_R: float
     recommended_risk_pct: float
     session_utc_iso: str = ""
+    bar_timestamp: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +169,7 @@ class AIVetoDecision:
     bypassed: bool = False
     provider_used: str = "pure_math"
     cascade_path: tuple[str, ...] = field(default_factory=lambda: ("pure_math",))
+    model_used: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +180,7 @@ class AIVetoDecision:
             "bypassed": self.bypassed,
             "provider_used": self.provider_used,
             "cascade_path": list(self.cascade_path),
+            "model_used": self.model_used,
         }
 
 
@@ -216,9 +234,28 @@ class AIVetoCommittee:
 
         self._cached_agy_path: str | None = None
         self._cached_agy_auth_ok: bool | None = None
+        self._verdict_cache: dict[tuple[str, str, str, int], AIVetoDecision] = {}
+        self._agy_consecutive_failures: int = 0
+        self._agy_cooldown_until_utc: float = 0.0
+        self.min_net_avg_R: float = 0.10
+        self.model_selector: AdaptiveModelSelector = AdaptiveModelSelector()
+        self._recent_ai_events: list[dict[str, Any]] = []
 
         # Perform initial load of .env and config/apex_config.json
         self.hot_reload_if_needed(force=True, probe_agy_auth=probe_agy_auth)
+
+    @classmethod
+    def get_isolated_temp_dir(cls) -> str:
+        """Return an isolated directory with zero .agents folder or repo configs to avoid MCP timeouts."""
+        iso_dir = Path(tempfile.gettempdir()) / "pocketbot_agy_isolated"
+        iso_dir.mkdir(parents=True, exist_ok=True)
+        agents_sub = iso_dir / ".agents"
+        if agents_sub.exists():
+            try:
+                shutil.rmtree(agents_sub, ignore_errors=True)
+            except Exception:
+                pass
+        return str(iso_dir)
 
     @staticmethod
     def _resolve_priority_tuple(
@@ -286,6 +323,7 @@ class AIVetoCommittee:
             try:
                 proc = subprocess.run(
                     [str(exe_file), "models"],
+                    cwd=cls.get_isolated_temp_dir(),
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
@@ -361,11 +399,16 @@ class AIVetoCommittee:
                 self.mode = self._explicit_mode
                 self._priority_order = self._resolve_priority_tuple(self.mode, self._explicit_priority)
 
-        # Refresh agy.exe discovery
+        # Refresh agy.exe discovery & adaptive model catalog
         self._cached_agy_path = self.locate_agy_executable(self._agy_executable_override)
         if probe_agy_auth or self._cached_agy_auth_ok is None:
             ok, _ = self.check_agy_pro_authenticated(self._cached_agy_path, probe_cli=probe_agy_auth)
             self._cached_agy_auth_ok = ok
+
+        if self.api_key:
+            self.model_selector.discover_studio_models(self.api_key, timeout=self.timeout_seconds)
+        if self._cached_agy_path and self._cached_agy_auth_ok:
+            self.model_selector.discover_agy_models(self._cached_agy_path, probe_cli=False)
 
         return reloaded
 
@@ -382,10 +425,17 @@ class AIVetoCommittee:
             executable_or_endpoint="generativelanguage.googleapis.com",
         )
 
+        now_utc = time.time()
+        in_cooldown = now_utc < self._agy_cooldown_until_utc
         agy_ok, agy_detail = self.check_agy_pro_authenticated(
             self._cached_agy_path,
             probe_cli=probe_agy_auth,
         )
+        if in_cooldown:
+            rem_s = int(self._agy_cooldown_until_utc - now_utc)
+            agy_ok = False
+            agy_detail = f"In 10-min cooldown ({rem_s}s remaining after timeouts); pure_math active"
+
         agy_status = AIProviderStatus(
             provider=AIProviderName.AGY_PRO.value,
             ready=agy_ok,
@@ -424,6 +474,7 @@ class AIVetoCommittee:
 
         active_primary = ready_chain[0]
         fallback_chain = tuple(ready_chain[1:])
+        q_summary = self.model_selector.get_quota_health_summary(active_primary)
 
         return HybridAIRouterStatus(
             enabled=self.enabled,
@@ -434,6 +485,7 @@ class AIVetoCommittee:
             studio_status=studio_status,
             agy_pro_status=agy_status,
             pure_math_status=math_status,
+            model_quota_summary=q_summary,
         )
 
     @staticmethod
@@ -534,6 +586,7 @@ class AIVetoCommittee:
         latency_ms: float,
         provider_used: str = AIProviderName.STUDIO_API.value,
         cascade_path: Sequence[str] = (),
+        model_used: str = "",
     ) -> AIVetoDecision:
         """Parse and validate `{ "decision": "APPROVE" | "VETO", "confidence": 0.0-1.0, "reason": "..." }`."""
         data = cls.clean_and_extract_json_payload(raw_text)
@@ -551,21 +604,33 @@ class AIVetoCommittee:
             bypassed=False,
             provider_used=provider_used,
             cascade_path=path_tuple,
+            model_used=model_used,
         )
+
+    def _get_ranked_model_ids(self, provider: str, ctx: CandidateSetupAuditContext, fallback_id: str) -> list[str]:
+        """Score & rank available models for `provider` using stakes, quota, and latency."""
+        stakes = compute_setup_stakes(
+            volatility_percentile=ctx.volatility_percentile,
+            net_avg_R=ctx.net_avg_R,
+            recommended_risk_pct=ctx.recommended_risk_pct,
+            timeframe=ctx.timeframe,
+        )
+        ranked = self.model_selector.rank_models(provider, stakes)
+        if ranked:
+            return [r.model.model_id for r in ranked[:2]]
+        return [fallback_id]
 
     def _call_studio_api_sync(
         self,
         ctx: CandidateSetupAuditContext,
         cascade_path: Sequence[str],
     ) -> AIVetoDecision:
-        """Call Google AI Studio REST API (`generateContent`) with a strict 4.0s timeout."""
-        t0 = time.perf_counter()
+        """Call Google AI Studio REST API with adaptive model selection & intra-provider cascade."""
         if not self.api_key:
             raise RuntimeError("studio_api not ready: GEMINI_API_KEY is empty")
 
-        url = self.GEMINI_ENDPOINT_TEMPLATE.format(model=self.model, api_key=self.api_key)
         prompt = self.build_adversarial_prompt(ctx)
-        data_bytes = json.dumps(
+        payload_bytes = json.dumps(
             {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
@@ -576,36 +641,54 @@ class AIVetoCommittee:
             }
         ).encode("utf-8")
 
-        req = urllib.request.Request(
-            url,
-            data=data_bytes,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-            latency_ms = (time.perf_counter() - t0) * 1000.0
-            if resp.status != 200:
-                raise RuntimeError(f"studio_api HTTP {resp.status}")
-            resp_json = json.loads(resp.read().decode("utf-8"))
-            raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-            return self.parse_structured_decision(
-                raw_text=raw_text,
-                latency_ms=latency_ms,
-                provider_used=AIProviderName.STUDIO_API.value,
-                cascade_path=cascade_path,
+        candidate_models = self._get_ranked_model_ids("studio_api", ctx, self.model)
+        last_exc: Exception | None = None
+        for model_id in candidate_models:
+            t0 = time.perf_counter()
+            url = self.GEMINI_ENDPOINT_TEMPLATE.format(model=model_id, api_key=self.api_key)
+            req = urllib.request.Request(
+                url,
+                data=payload_bytes,
+                headers={"Content-Type": "application/json"},
+                method="POST",
             )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                    latency_ms = (time.perf_counter() - t0) * 1000.0
+                    if resp.status != 200:
+                        raise RuntimeError(f"studio_api HTTP {resp.status}")
+                    resp_json = json.loads(resp.read().decode("utf-8"))
+                    raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+                    dec = self.parse_structured_decision(
+                        raw_text=raw_text,
+                        latency_ms=latency_ms,
+                        provider_used=AIProviderName.STUDIO_API.value,
+                        cascade_path=cascade_path,
+                        model_used=model_id,
+                    )
+                    self.model_selector.record_success("studio_api", model_id, latency_ms)
+                    return dec
+            except Exception as exc:
+                last_exc = exc
+                err_s = str(exc)
+                self.model_selector.record_failure(
+                    "studio_api",
+                    model_id,
+                    err_s,
+                    is_quota_or_429=("429" in err_s or "quota" in err_s.lower()),
+                )
+                logger.warning("studio_api model %s failed (%s); cascading...", model_id, err_s)
+        raise last_exc or RuntimeError("All studio_api candidate models failed")
 
     async def _call_studio_api_async(
         self,
         ctx: CandidateSetupAuditContext,
         cascade_path: Sequence[str],
     ) -> AIVetoDecision:
-        """Async call to Google AI Studio REST API with a strict 4.0s timeout."""
-        t0 = time.perf_counter()
+        """Async call to Google AI Studio REST API with adaptive model selection & cascade."""
         if not self.api_key:
             raise RuntimeError("studio_api not ready: GEMINI_API_KEY is empty")
 
-        url = self.GEMINI_ENDPOINT_TEMPLATE.format(model=self.model, api_key=self.api_key)
         prompt = self.build_adversarial_prompt(ctx)
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
@@ -615,71 +698,125 @@ class AIVetoCommittee:
                 "responseMimeType": "application/json",
             },
         }
+        candidate_models = self._get_ranked_model_ids("studio_api", ctx, self.model)
+        last_exc: Exception | None = None
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=body) as resp:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
-                if resp.status != 200:
-                    err_txt = await resp.text()
-                    raise RuntimeError(f"studio_api HTTP {resp.status}: {err_txt[:120]}")
-                resp_json = await resp.json()
-                raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-                return self.parse_structured_decision(
-                    raw_text=raw_text,
-                    latency_ms=latency_ms,
-                    provider_used=AIProviderName.STUDIO_API.value,
-                    cascade_path=cascade_path,
-                )
+            for model_id in candidate_models:
+                t0 = time.perf_counter()
+                url = self.GEMINI_ENDPOINT_TEMPLATE.format(model=model_id, api_key=self.api_key)
+                try:
+                    async with session.post(url, json=body) as resp:
+                        latency_ms = (time.perf_counter() - t0) * 1000.0
+                        if resp.status != 200:
+                            err_txt = await resp.text()
+                            raise RuntimeError(f"studio_api HTTP {resp.status}: {err_txt[:120]}")
+                        resp_json = await resp.json()
+                        raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+                        dec = self.parse_structured_decision(
+                            raw_text=raw_text,
+                            latency_ms=latency_ms,
+                            provider_used=AIProviderName.STUDIO_API.value,
+                            cascade_path=cascade_path,
+                            model_used=model_id,
+                        )
+                        self.model_selector.record_success("studio_api", model_id, latency_ms)
+                        return dec
+                except Exception as exc:
+                    last_exc = exc
+                    err_s = str(exc)
+                    self.model_selector.record_failure(
+                        "studio_api",
+                        model_id,
+                        err_s,
+                        is_quota_or_429=("429" in err_s or "quota" in err_s.lower()),
+                    )
+                    logger.warning("studio_api async model %s failed (%s); cascading...", model_id, err_s)
+        raise last_exc or RuntimeError("All studio_api async candidate models failed")
 
     def _call_agy_pro_sync(
         self,
         ctx: CandidateSetupAuditContext,
         cascade_path: Sequence[str],
     ) -> AIVetoDecision:
-        """Call headless `agy -p "<prompt>" --output-format json --print-timeout 15s`."""
-        t0 = time.perf_counter()
+        """Call headless `agy -p "<prompt>" --output-format json --effort low` in isolated temp dir."""
+        now_utc = time.time()
+        if now_utc < self._agy_cooldown_until_utc:
+            rem_s = int(self._agy_cooldown_until_utc - now_utc)
+            raise RuntimeError(f"agy_pro in cooldown ({rem_s}s remaining); skipping to fallback")
+
         agy_exe = self._cached_agy_path
         if not agy_exe or not self._cached_agy_auth_ok:
             raise RuntimeError("agy_pro not ready or not found")
 
         prompt = self.build_adversarial_prompt(ctx)
         timeout_int = max(5, int(round(self.agy_timeout_seconds)))
-        cmd = [
-            agy_exe,
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--print-timeout",
-            f"{timeout_int}s",
-            "--disable-slash-commands",
-            "--effort",
-            "low",
-            "--model",
-            "gemini-3.8-flash-low",
-        ]
-        # Run in temp directory so workspace MCP servers are not spawned during headless print
-        proc = subprocess.run(
-            cmd,
-            cwd=tempfile.gettempdir(),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout_int + 3.0,
-            encoding="utf-8",
-            errors="replace",
-        )
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-        stdout_txt = (proc.stdout or "").strip()
-        if not stdout_txt:
-            raise RuntimeError(f"agy_pro exited {proc.returncode} with empty stdout: {(proc.stderr or '')[:160]}")
+        iso_dir = self.get_isolated_temp_dir()
+        candidate_models = self._get_ranked_model_ids("agy_pro", ctx, "default")
+        last_exc: Exception | None = None
 
-        return self.parse_structured_decision(
-            raw_text=stdout_txt,
-            latency_ms=latency_ms,
-            provider_used=AIProviderName.AGY_PRO.value,
-            cascade_path=cascade_path,
-        )
+        for model_id in candidate_models:
+            t0 = time.perf_counter()
+            cmd = [
+                agy_exe,
+                "-p",
+                prompt,
+                "--output-format",
+                "json",
+                "--print-timeout",
+                f"{timeout_int}s",
+                "--disable-slash-commands",
+            ]
+            if model_id != "default":
+                cmd.extend(["--model", model_id])
+            else:
+                cmd.extend(["--effort", "low"])
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    cwd=iso_dir,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=float(timeout_int) + 4.0,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                stdout_txt = (proc.stdout or "").strip()
+                if not stdout_txt:
+                    raise RuntimeError(f"agy_pro exited {proc.returncode} with empty stdout: {(proc.stderr or '')[:160]}")
+
+                decision = self.parse_structured_decision(
+                    raw_text=stdout_txt,
+                    latency_ms=latency_ms,
+                    provider_used=AIProviderName.AGY_PRO.value,
+                    cascade_path=cascade_path,
+                    model_used=model_id,
+                )
+                self._agy_consecutive_failures = 0
+                self.model_selector.record_success("agy_pro", model_id, latency_ms)
+                return decision
+            except Exception as exc:
+                last_exc = exc
+                err_s = str(exc)
+                self.model_selector.record_failure(
+                    "agy_pro",
+                    model_id,
+                    err_s,
+                    is_quota_or_429=("quota" in err_s.lower() or "429" in err_s or "exhaust" in err_s.lower()),
+                )
+                logger.warning("agy_pro model %s failed (%s); cascading...", model_id, err_s)
+
+        self._agy_consecutive_failures += 1
+        if self._agy_consecutive_failures >= 2:
+            self._agy_cooldown_until_utc = time.time() + 600.0
+            logger.warning(
+                "agy_pro failed %d times in a row (%s). Entering 10-minute cooldown to pure_math.",
+                self._agy_consecutive_failures,
+                last_exc,
+            )
+        raise last_exc or RuntimeError("agy_pro failed")
 
     async def _call_agy_pro_async(
         self,
@@ -689,8 +826,8 @@ class AIVetoCommittee:
         """Run `_call_agy_pro_sync` in a worker thread so the async event loop never blocks."""
         return await asyncio.to_thread(self._call_agy_pro_sync, ctx, cascade_path)
 
-    @staticmethod
     def _evaluate_pure_math_fallback(
+        self,
         ctx: CandidateSetupAuditContext,
         start_perf: float,
         cascade_path: Sequence[str],
@@ -698,10 +835,11 @@ class AIVetoCommittee:
     ) -> AIVetoDecision:
         """Deterministic 0ms $0 Pure Math pass-through relying on Regime + DOM + TimeMachine + 6 Breakers."""
         latency_ms = (time.perf_counter() - start_perf) * 1000.0
-        # Pure math check: if net_avg_R <= 0 or spread_pct_of_sl > 0.15, VETO; otherwise APPROVE
-        if ctx.net_avg_R <= 0.0:
+        min_net_r = float(getattr(self, "min_net_avg_R", 0.10))
+        # Pure math check: if net_avg_R < min_net_avg_R or spread_pct_of_sl > 0.15, VETO; otherwise APPROVE
+        if ctx.net_avg_R < min_net_r:
             dec = "VETO"
-            reason = f"Pure Math Gate: net_avg_R ({ctx.net_avg_R:+.3f}R) <= 0.0R"
+            reason = f"Pure Math Gate: net_avg_R ({ctx.net_avg_R:+.3f}R) < {min_net_r:.2f}R"
         elif ctx.spread_pct_of_sl > 0.15 + 1e-9:
             dec = "VETO"
             reason = f"Pure Math Gate: spread is {ctx.spread_pct_of_sl * 100:.1f}% of SL (> 15.0%)"
@@ -727,6 +865,18 @@ class AIVetoCommittee:
 
     def evaluate_sync(self, ctx: CandidateSetupAuditContext) -> AIVetoDecision:
         """Hot-reload `.env` & `config/apex_config.json`, then execute the configured 3-tier waterfall."""
+        bar_ts = int(ctx.bar_timestamp)
+        side_str = ctx.side.value if hasattr(ctx.side, "value") else str(ctx.side).upper()
+        cache_key = (ctx.symbol.upper(), side_str, ctx.timeframe.upper(), bar_ts)
+        if bar_ts > 0 and cache_key in self._verdict_cache:
+            return self._verdict_cache[cache_key]
+
+        decision = self._evaluate_sync_impl(ctx)
+        if bar_ts > 0:
+            self._verdict_cache[cache_key] = decision
+        return decision
+
+    def _evaluate_sync_impl(self, ctx: CandidateSetupAuditContext) -> AIVetoDecision:
         t0 = time.perf_counter()
         status = self.get_router_status()
 
@@ -783,6 +933,18 @@ class AIVetoCommittee:
 
     async def evaluate_async(self, ctx: CandidateSetupAuditContext) -> AIVetoDecision:
         """Asynchronous 3-tier waterfall evaluation with hot-reload and zero-crash Pure Math fallback."""
+        bar_ts = int(ctx.bar_timestamp)
+        side_str = ctx.side.value if hasattr(ctx.side, "value") else str(ctx.side).upper()
+        cache_key = (ctx.symbol.upper(), side_str, ctx.timeframe.upper(), bar_ts)
+        if bar_ts > 0 and cache_key in self._verdict_cache:
+            return self._verdict_cache[cache_key]
+
+        decision = await self._evaluate_async_impl(ctx)
+        if bar_ts > 0:
+            self._verdict_cache[cache_key] = decision
+        return decision
+
+    async def _evaluate_async_impl(self, ctx: CandidateSetupAuditContext) -> AIVetoDecision:
         t0 = time.perf_counter()
         status = self.get_router_status()
 

@@ -162,7 +162,7 @@ You do **not** need any coding experience to use PocketBot Apex.
 1. **Download the Release:**
    Download `PocketBot_Apex_v2_Portable_Windows.zip` from [GitHub Releases](https://github.com/Keshuin0/pocketbot-apex/releases) and extract it anywhere on your computer (or USB pendrive).
 2. **Run First-Time Setup:**
-   Open the folder and double-click `0_FIRST_TIME_SETUP.bat`. It automatically verifies your system, installs 64-bit Python 3.12, creates a local `.venv`, installs all quantitative libraries, runs 32 automated verification tests, and checks your MT5 connection.
+   Open the folder and double-click `0_FIRST_TIME_SETUP.bat`. It automatically verifies your system, installs 64-bit Python 3.12, creates a local `.venv`, installs all quantitative libraries, runs 39 automated verification tests, and checks your MT5 connection.
 3. **Start Autonomous Trading:**
    Double-click `2_START_APEX_AUTO_DEMO.bat` for hands-free autonomous trading, or `4_APEX_LIVE_DASHBOARD.bat` to launch the full-screen live telemetry cockpit!
 
