@@ -178,3 +178,49 @@ def test_live_drill_demo_only_guard() -> None:
     login, currency = assert_demo_account(SimpleNamespace(trade_mode=0, login=568159, currency="CAD"))
     assert login == 568159
     assert currency == "CAD"
+
+
+def test_tui_no_wrap_v241_and_web_banner_no_scroll_spam() -> None:
+    from io import StringIO
+    from rich.console import Console
+    from apex.cockpit.tui_dashboard import ApexTUIDashboard
+    from apex.cockpit.web_cockpit import find_browser_executable
+    from apex_runner import format_web_cockpit_banner, format_single_line_heartbeat
+
+    buf = StringIO()
+    dash = ApexTUIDashboard(console=Console(file=buf, width=145, force_terminal=False))
+    group = dash.build_renderable(
+        run_mode="demo-auto",
+        active_feed="MT5",
+        ctrader_connected=False,
+        mt5_connected=True,
+        account_equity_usd=10000.0,
+        daily_pnl_usd=0.0,
+        open_positions_count=0,
+        rows=[],
+    )
+    dash.console.print(group)
+    rendered = buf.getvalue()
+    assert "POCKETBOT APEX v2.4.1" in rendered
+    for renderable in group.renderables:
+        if hasattr(renderable, "columns"):
+            assert all(col.no_wrap for col in renderable.columns)
+
+    banner = format_web_cockpit_banner("http://127.0.0.1:8765", "demo-auto")
+    assert "POCKETBOT APEX v2.4.1" in banner
+    assert "http://127.0.0.1:8765" in banner
+    assert len(banner.strip().splitlines()) <= 6
+
+    fake_orch = SimpleNamespace(
+        execution_router=SimpleNamespace(account_equity_usd=9999.64),
+        last_scan_summary=SimpleNamespace(open_scanned=18, total_scanned=251),
+        paused=False,
+    )
+    hb = format_single_line_heartbeat(fake_orch)  # type: ignore[arg-type]
+    assert "\n" not in hb
+    assert len(hb) < 100
+    assert "APEX v2.4.1" in hb
+
+    # Chrome or Edge should be discoverable on Windows
+    exe = find_browser_executable()
+    assert exe is None or exe.lower().endswith(".exe")

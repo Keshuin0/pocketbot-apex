@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.1] - 2026-11-13
+
+### Fixed
+- **`cmd.exe` Rich `Live` Height-Overflow Scroll-Spam (`apex_runner.py`, `apex/cockpit/tui_dashboard.py`):**
+  - Eliminated multi-line Rich table printing in default Web Cockpit mode (`--dashboard` used by `2_START_APEX_AUTO_DEMO.bat` and `4_APEX_LIVE_DASHBOARD.bat`). Prints a clean 5-line startup banner once with the `http://127.0.0.1:8765` URL and updates a single `<100`-char carriage-return heartbeat line throttled every 5s.
+  - Updated `--tui-only` fallback in `tui_dashboard.py` to `POCKETBOT APEX v2.4.1`, set `no_wrap=True` on all table cells (capped `<=22` lines), and passed `screen=True, vertical_overflow="crop"` to `rich.live.Live`.
+- **Reliable Windows Chrome/Edge App Window Auto-Launch (`apex/cockpit/web_cockpit.py`):**
+  - Expanded browser discovery across `%ProgramFiles%`, `%ProgramFiles(x86)%`, `%LocalAppData%`, and Windows Registry `App Paths\chrome.exe` / `msedge.exe`, launching detached via `--app=<url> --new-window` with `os.startfile(url)` fallback.
+- **Verification Suite:** **66/66** automated tests passing + live desktop verification (`chrome.exe --app=http://127.0.0.1:8765` launched, `/ws` streamed live `FusionMarkets-Demo` state, zero multi-line table spam).
+
+---
+
 ## [2.4.0] - 2026-11-12
 
 ### Added
