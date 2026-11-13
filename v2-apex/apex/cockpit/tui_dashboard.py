@@ -117,6 +117,7 @@ class ApexTUIDashboard:
         broker_events: Sequence[BrokerExecutionEvent] = (),
         aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught Hallucinations",
         contagion_shock_z: float = 0.0,
+        mind_state_badge: str = "Mind State: FRESH (Cycle #0 | Wisdom Checkpoints: 0 | Last Refresh: --:--)",
     ) -> Group:
         """Build the composite Rich Dashboard layout."""
         dd_pct = (daily_pnl_usd / account_equity_usd * 100.0) if account_equity_usd > 0 else 0.0
@@ -136,12 +137,13 @@ class ApexTUIDashboard:
             )
 
         header_text = (
-            f"[bold cyan]POCKETBOT APEX v2.2[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
+            f"[bold cyan]POCKETBOT APEX v2.3[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
             f"[bold bright_cyan]{mesh_badge}[/bold bright_cyan] (cTrader: {ct_badge} | MT5: {mt5_badge}) | "
             f"SOR Saved: [bold green]+{sor_saved_pips:.1f}p ({sor_saved_usd:,.2f} {account_currency})[/bold green]\n"
             f"[bold magenta]{ai_brain_badge}[/bold magenta] | "
             f"[bold green]{aegis_badge}[/bold green] | "
-            f"Contagion Shock Z: [bold]{contagion_shock_z:.2f}[/bold] | "
+            f"Contagion Shock Z: [bold]{contagion_shock_z:.2f}[/bold]\n"
+            f"[bold bright_green]{mind_state_badge}[/bold bright_green] | "
             f"Equity: [bold]{account_equity_usd:,.2f} {account_currency}[/bold] | "
             f"Daily P/L: [{pnl_style}]{daily_pnl_usd:+,.2f} {account_currency} ({dd_pct:+.2f}%)[/{pnl_style}] | "
             f"Open Positions: [bold]{open_positions_count}/2[/bold]"
@@ -263,6 +265,7 @@ class ApexTUIDashboard:
         broker_events: Sequence[BrokerExecutionEvent] = (),
         aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught Hallucinations",
         contagion_shock_z: float = 0.0,
+        mind_state_badge: str = "Mind State: FRESH (Cycle #0 | Wisdom Checkpoints: 0 | Last Refresh: --:--)",
     ) -> None:
         """Render a static Rich snapshot table to the terminal."""
         group = self.build_renderable(
@@ -285,5 +288,6 @@ class ApexTUIDashboard:
             broker_events=broker_events,
             aegis_badge=aegis_badge,
             contagion_shock_z=contagion_shock_z,
+            mind_state_badge=mind_state_badge,
         )
         self.console.print(group)

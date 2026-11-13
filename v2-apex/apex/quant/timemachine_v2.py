@@ -42,16 +42,19 @@ class TimeMachineCostModel:
     risk_per_lot_usd: float = 100.0
     spread_price: float = 0.00010
     vwap_slippage_price: float = 0.00004
+    slippage_calibration_multiplier: float = 1.0
 
     def compute_round_trip_cost_r(self, one_r_price_distance: float) -> float:
-        """Compute total round-trip friction (commission + spread + VWAP DOM slippage) in R-multiples."""
+        """Compute total round-trip friction (commission + spread + calibrated VWAP DOM slippage) in R-multiples."""
         if one_r_price_distance <= 1e-12:
             raise ValueError(f"one_r_price_distance must be > 0, got {one_r_price_distance}")
         if self.risk_per_lot_usd <= 1e-12:
             raise ValueError(f"risk_per_lot_usd must be > 0, got {self.risk_per_lot_usd}")
 
         commission_r = max(0.0, float(self.commission_per_lot_round_turn_usd)) / float(self.risk_per_lot_usd)
-        microstructure_price_cost = max(0.0, float(self.spread_price)) + max(0.0, float(self.vwap_slippage_price))
+        cal_mult = max(0.5, min(3.0, float(self.slippage_calibration_multiplier)))
+        calibrated_slip = max(0.0, float(self.vwap_slippage_price)) * cal_mult
+        microstructure_price_cost = max(0.0, float(self.spread_price)) + calibrated_slip
         microstructure_r = microstructure_price_cost / float(one_r_price_distance)
         return float(commission_r + microstructure_r)
 

@@ -187,6 +187,19 @@ class WalkForwardLedgerDB:
                     veto_value_added_r REAL,
                     is_graded INTEGER NOT NULL DEFAULT 0
                 );
+
+                CREATE TABLE IF NOT EXISTS consolidation_checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_number INTEGER NOT NULL,
+                    timestamp_utc REAL NOT NULL,
+                    trigger_reason TEXT NOT NULL,
+                    purged_cache_entries INTEGER NOT NULL DEFAULT 0,
+                    trades_consolidated INTEGER NOT NULL DEFAULT 0,
+                    audits_consolidated INTEGER NOT NULL DEFAULT 0,
+                    canary_passed INTEGER NOT NULL DEFAULT 1,
+                    semantic_memory_sha256 TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
             # Safe idempotent schema migrations for existing SQLite files
@@ -793,3 +806,159 @@ class WalkForwardLedgerDB:
             "avg_brier_score": stats.avg_brier_score,
             "badge": f"Aegis Z3: {stats.verified_proofs} Verified Proofs | {hall_pct:.0f}% Uncaught Hallucinations",
         }
+
+    # ------------------------------------------------------------------
+    # Phase 8: Circadian Sleep-Wake Consolidation Queries & Checkpoints
+    # ------------------------------------------------------------------
+
+    def record_consolidation_checkpoint(
+        self,
+        cycle_number: int,
+        trigger_reason: str,
+        purged_cache_entries: int,
+        trades_consolidated: int,
+        audits_consolidated: int,
+        canary_passed: bool,
+        semantic_memory_sha256: str,
+        summary: str,
+        timestamp_utc: float | None = None,
+    ) -> int:
+        """Persist a versioned Sleep-Wake consolidation checkpoint."""
+        ts = float(timestamp_utc if timestamp_utc is not None else time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO consolidation_checkpoints (
+                    cycle_number, timestamp_utc, trigger_reason, purged_cache_entries,
+                    trades_consolidated, audits_consolidated, canary_passed,
+                    semantic_memory_sha256, summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(cycle_number),
+                    ts,
+                    str(trigger_reason),
+                    int(purged_cache_entries),
+                    int(trades_consolidated),
+                    int(audits_consolidated),
+                    1 if canary_passed else 0,
+                    str(semantic_memory_sha256),
+                    str(summary)[:500],
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_latest_consolidation_checkpoint(self) -> dict[str, Any] | None:
+        """Return the latest Sleep-Wake consolidation checkpoint or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM consolidation_checkpoints ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def compute_slippage_calibration_multipliers(self) -> dict[str, dict[str, float]]:
+        """Compute realized-vs-baseline slippage multipliers per symbol and venue, clamped to [0.5, 3.0]."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, winning_venue, realized_slippage_r
+                FROM trade_ledger
+                ORDER BY id DESC
+                LIMIT 500
+                """
+            ).fetchall()
+
+        grouped: dict[tuple[str, str], list[float]] = {}
+        for r in rows:
+            sym = str(r["symbol"]).upper()
+            venue = str(r["winning_venue"] or "mt5").lower()
+            slip_r = abs(float(r["realized_slippage_r"] or 0.0))
+            grouped.setdefault((sym, venue), []).append(slip_r)
+
+        # Baseline expected slippage in R is ~0.04R; multiplier scales proportionally
+        baseline_slip_r = 0.04
+        result: dict[str, dict[str, float]] = {}
+        for (sym, venue), vals in grouped.items():
+            mean_slip = sum(vals) / len(vals)
+            raw_mult = mean_slip / baseline_slip_r if mean_slip > 0.0 else 1.0
+            clamped = max(0.5, min(3.0, round(raw_mult, 4)))
+            result.setdefault(sym, {})[venue] = clamped
+        return result
+
+    def compute_session_hour_priors(self) -> dict[str, dict[str, Any]]:
+        """Compute closed-trade expectancy priors grouped by UTC hour (`00`..`23`)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp_utc, realized_net_r
+                FROM trade_ledger
+                WHERE is_closed = 1 AND realized_net_r IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1000
+                """
+            ).fetchall()
+
+        import datetime
+
+        by_hour: dict[str, list[float]] = {}
+        for r in rows:
+            dt = datetime.datetime.fromtimestamp(float(r["timestamp_utc"]), tz=datetime.timezone.utc)
+            hr_key = f"{dt.hour:02d}"
+            by_hour.setdefault(hr_key, []).append(float(r["realized_net_r"]))
+
+        priors: dict[str, dict[str, Any]] = {}
+        for hr_key, vals in sorted(by_hour.items()):
+            mean_r = sum(vals) / len(vals)
+            priors[hr_key] = {
+                "count": len(vals),
+                "mean_r": round(mean_r, 4),
+                "regime_tag": "TOXIC_HOUR" if (len(vals) >= 5 and mean_r < -0.10) else ("HIGH_EDGE" if (len(vals) >= 5 and mean_r > 0.15) else "NEUTRAL"),
+            }
+        return priors
+
+    def compute_conformal_quantiles(self, alpha: float = 0.10) -> dict[str, dict[str, Any]]:
+        """Compute Split-Conformal non-conformity quantiles and Brier trust per provider/model."""
+        with self._connect() as conn:
+            pairs = conn.execute(
+                "SELECT DISTINCT provider, model_id FROM ai_epistemic_audit"
+            ).fetchall()
+
+        summary: dict[str, dict[str, Any]] = {}
+        for p in pairs:
+            prov = str(p["provider"])
+            mid = str(p["model_id"])
+            stats = self.get_model_epistemic_stats(provider=prov, model_id=mid, window=50)
+            with self._connect() as conn:
+                graded = conn.execute(
+                    """
+                    SELECT raw_decision, confidence, shadow_realized_r
+                    FROM ai_epistemic_audit
+                    WHERE provider = ? AND model_id = ? AND is_graded = 1 AND shadow_realized_r IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 50
+                    """,
+                    (prov, mid),
+                ).fetchall()
+
+            q_val = 0.50
+            if len(graded) >= 5:
+                alphas = sorted(
+                    abs(
+                        (1.0 if float(r["shadow_realized_r"]) > 0.0 else 0.0)
+                        - ((1.0 - float(r["confidence"])) if str(r["raw_decision"]).upper() == "VETO" else float(r["confidence"]))
+                    )
+                    for r in graded
+                )
+                idx = min(len(alphas) - 1, max(0, int(math.ceil((1.0 - alpha) * (len(alphas) + 1))) - 1))
+                q_val = round(float(alphas[idx]), 4)
+
+            summary[f"{prov}:{mid}"] = {
+                "provider": prov,
+                "model_id": mid,
+                "conformal_quantile": q_val,
+                "epistemic_trust_score": stats.epistemic_trust_score,
+                "hallucination_rate": stats.hallucination_rate,
+                "veto_value_added_r": stats.veto_value_added_r,
+                "quarantined": stats.should_demote_to_pure_math,
+            }
+        return summary

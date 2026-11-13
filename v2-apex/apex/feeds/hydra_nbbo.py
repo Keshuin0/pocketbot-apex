@@ -210,6 +210,14 @@ class HydraNBBOEngine:
             margin_and_autotrading_ok=True,
         )
         self.spike_rejector: SingleBrokerSpikeRejector = spike_rejector or SingleBrokerSpikeRejector()
+        self.symbol_slippage_multipliers: dict[str, dict[str, float]] = {}
+
+    def apply_slippage_calibration(self, multipliers: dict[str, dict[str, float]]) -> None:
+        """Apply Sleep-Wake consolidated realized slippage multipliers per symbol/venue."""
+        self.symbol_slippage_multipliers = {
+            sym.upper(): {v.lower(): max(0.5, min(3.0, float(m))) for v, m in venues.items()}
+            for sym, venues in multipliers.items()
+        }
 
     @staticmethod
     def resolve_topology(
