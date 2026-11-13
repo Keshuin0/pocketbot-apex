@@ -722,16 +722,19 @@ class AIVetoCommittee:
         )
 
     def _get_ranked_model_ids(self, provider: str, ctx: CandidateSetupAuditContext, fallback_id: str) -> list[str]:
-        """Score & rank available models for `provider` using stakes, quota, and latency."""
+        """Score & pick the top candidate from each distinct non-quarantined model family."""
         stakes = compute_setup_stakes(
             volatility_percentile=ctx.volatility_percentile,
             net_avg_R=ctx.net_avg_R,
             recommended_risk_pct=ctx.recommended_risk_pct,
             timeframe=ctx.timeframe,
         )
-        ranked = self.model_selector.rank_models(provider, stakes)
-        if ranked:
-            return [r.model.model_id for r in ranked[:2]]
+        cross_family = self.model_selector.rank_cross_family_candidates(provider, stakes)
+        if cross_family:
+            return [r.model.model_id for r in cross_family]
+        # Never fall back to bare `--model`-less default if named models exist or a family is quarantined
+        if self.model_selector.get_models(provider) or self.model_selector.has_any_quarantined_family(provider):
+            return []
         return [fallback_id]
 
     def _call_studio_api_sync(
@@ -872,6 +875,9 @@ class AIVetoCommittee:
         timeout_int = max(5, int(round(self.agy_timeout_seconds)))
         iso_dir = self.get_isolated_temp_dir()
         candidate_models = self._get_ranked_model_ids("agy_pro", ctx, "default")
+        if not candidate_models:
+            self._agy_cooldown_until_utc = time.time() + 600.0
+            raise RuntimeError("All agy_pro model families are quarantined/exhausted; falling back to pure_math + Z3")
         last_exc: Exception | None = None
 
         for model_id in candidate_models:
@@ -903,8 +909,15 @@ class AIVetoCommittee:
                 )
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 stdout_txt = (proc.stdout or "").strip()
+                stderr_txt = (proc.stderr or "").strip()
+                combined_low = (stdout_txt + "\n" + stderr_txt).lower()
+                if any(
+                    tok in combined_low
+                    for tok in ("credits", "balance is too low", "too low to continue", "quota", "resource_exhausted", "429")
+                ):
+                    raise RuntimeError(f"QUOTA_EXHAUSTED ({model_id}): {(stdout_txt or stderr_txt)[:180]}")
                 if not stdout_txt:
-                    raise RuntimeError(f"agy_pro exited {proc.returncode} with empty stdout: {(proc.stderr or '')[:160]}")
+                    raise RuntimeError(f"agy_pro exited {proc.returncode} with empty stdout: {stderr_txt[:160]}")
 
                 decision = self._verify_and_finalize_ai_response(
                     raw_text=stdout_txt,

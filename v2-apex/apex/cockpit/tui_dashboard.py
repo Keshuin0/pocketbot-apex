@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
@@ -266,8 +267,9 @@ class ApexTUIDashboard:
         aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught Hallucinations",
         contagion_shock_z: float = 0.0,
         mind_state_badge: str = "Mind State: FRESH (Cycle #0 | Wisdom Checkpoints: 0 | Last Refresh: --:--)",
+        live: Live | None = None,
     ) -> None:
-        """Render a static Rich snapshot table to the terminal."""
+        """Render a Rich snapshot table (in-place via `Live` if provided, else `console.print`)."""
         group = self.build_renderable(
             run_mode=run_mode,
             active_feed=active_feed,
@@ -290,4 +292,7 @@ class ApexTUIDashboard:
             contagion_shock_z=contagion_shock_z,
             mind_state_badge=mind_state_badge,
         )
-        self.console.print(group)
+        if live is not None:
+            live.update(group, refresh=True)
+        else:
+            self.console.print(group)

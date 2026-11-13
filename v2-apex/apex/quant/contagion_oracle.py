@@ -75,16 +75,22 @@ class ContagionOracle:
         sigma = float(np.std(hist, ddof=1)) if len(hist) > 1 else 0.0
         if sigma <= 1e-12 or math.isnan(sigma):
             return 0.0
-        z = abs(float(arr[-1]) - mu) / sigma
+        # Session-aware robust baseline floor so ultra-quiet rollover bars don't explode Z
+        med = float(np.median(hist))
+        mad = float(np.median(np.abs(hist - med)))
+        robust_sigma = max(sigma, 1.4826 * mad, 0.00035)
+        z = abs(float(arr[-1]) - mu) / robust_sigma
         return round(float(z), 4)
 
     def compute_cross_asset_shock_z(
         self,
         anchor_returns: dict[str, Sequence[float]] | None = None,
         feed_router: MarketFeedRouter | None = None,
+        now_utc: float | None = None,
     ) -> tuple[float, tuple[str, ...]]:
-        """Measure simultaneous >2.5-sigma 5m return shocks across USD, INDICES, METALS, CRYPTO."""
+        """Measure simultaneous >2.5-sigma 5m return shocks strictly on 7 liquid core benchmarks."""
         bucket_max_z: dict[str, float] = {}
+        cur_ts = float(now_utc) if now_utc is not None else datetime.datetime.now(datetime.timezone.utc).timestamp()
 
         for bucket, symbols in DEFAULT_ANCHOR_BUCKETS.items():
             max_z = 0.0
@@ -96,8 +102,11 @@ class ContagionOracle:
                     try:
                         candles = feed_router.get_candles(sym, "M5", count=40)
                         if len(candles) >= 15:
-                            closes = np.asarray([c.close for c in candles], dtype=float)
-                            rets = np.diff(closes) / np.maximum(closes[:-1], 1e-9)
+                            # Ignore frozen/maintenance bars older than 15m so shock Z never freezes
+                            last_ts = float(getattr(candles[-1], "timestamp_utc", 0.0) or 0.0)
+                            if last_ts <= 0.0 or (cur_ts - last_ts) <= 900.0:
+                                closes = np.asarray([c.close for c in candles], dtype=float)
+                                rets = np.diff(closes) / np.maximum(closes[:-1], 1e-9)
                     except Exception:
                         rets = None
                 if rets is not None:
@@ -132,9 +141,11 @@ class ContagionOracle:
             utc_dt=utc_dt,
             spread_ratio=spread_ratio,
         )
+        now_ts = utc_dt.timestamp() if utc_dt is not None else None
         shock_z, shocked_buckets = self.compute_cross_asset_shock_z(
             anchor_returns=anchor_returns,
             feed_router=feed_router,
+            now_utc=now_ts,
         )
         detail = (
             f"Rollover={rollover_flag} ({window_label}) | "
