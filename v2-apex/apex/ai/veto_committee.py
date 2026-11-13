@@ -43,6 +43,7 @@ from typing import Any, Callable, Sequence
 import aiohttp
 from dotenv import dotenv_values
 
+from apex.ai.aegis_verifier import AegisVerifier, BlindedTelemetry
 from apex.ai.model_selector import AdaptiveModelSelector, compute_setup_stakes
 from apex.feeds.models import Side
 
@@ -156,13 +157,15 @@ class CandidateSetupAuditContext:
     recommended_risk_pct: float
     session_utc_iso: str = ""
     bar_timestamp: float = 0.0
+    rollover_illiquidity_flag: bool = False
+    cross_asset_shock_z: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
 class AIVetoDecision:
-    """Structured JSON decision returned by the Hybrid 3-Tier AI Router."""
+    """Structured JSON decision returned by the Hybrid 3-Tier AI Router + Apex Aegis Firewall."""
 
-    decision: str  # "APPROVE" or "VETO"
+    decision: str  # "APPROVE", "VETO", or "ABSTAIN"
     confidence: float  # [0.0, 1.0]
     reason: str
     latency_ms: float
@@ -170,6 +173,11 @@ class AIVetoDecision:
     provider_used: str = "pure_math"
     cascade_path: tuple[str, ...] = field(default_factory=lambda: ("pure_math",))
     model_used: str = ""
+    risk_multiplier: float = 1.0
+    aegis_verified: bool = False
+    hallucination_detected: bool = False
+    input_sha256: str = ""
+    audit_id: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -181,6 +189,11 @@ class AIVetoDecision:
             "provider_used": self.provider_used,
             "cascade_path": list(self.cascade_path),
             "model_used": self.model_used,
+            "risk_multiplier": round(self.risk_multiplier, 4),
+            "aegis_verified": self.aegis_verified,
+            "hallucination_detected": self.hallucination_detected,
+            "input_sha256": self.input_sha256,
+            "audit_id": self.audit_id,
         }
 
 
@@ -210,6 +223,7 @@ class AIVetoCommittee:
         config_path: str | Path = "config/apex_config.json",
         agy_executable_override: str | None = None,
         probe_agy_auth: bool = False,
+        ledger_db: Any = None,
     ) -> None:
         self.env_path = Path(env_path)
         self.config_path = Path(config_path)
@@ -238,7 +252,12 @@ class AIVetoCommittee:
         self._agy_consecutive_failures: int = 0
         self._agy_cooldown_until_utc: float = 0.0
         self.min_net_avg_R: float = 0.10
+        self.ledger_db: Any = ledger_db
         self.model_selector: AdaptiveModelSelector = AdaptiveModelSelector()
+        self.aegis: AegisVerifier = AegisVerifier(
+            ledger_db=ledger_db,
+            model_selector=self.model_selector,
+        )
         self._recent_ai_events: list[dict[str, Any]] = []
 
         # Perform initial load of .env and config/apex_config.json
@@ -490,35 +509,9 @@ class AIVetoCommittee:
 
     @staticmethod
     def build_adversarial_prompt(ctx: CandidateSetupAuditContext) -> str:
-        """Build the compact adversarial prompt for the 2-role Risk Veto Committee."""
-        payload = {
-            "symbol": ctx.symbol,
-            "side": ctx.side.value,
-            "timeframe": ctx.timeframe,
-            "entry": ctx.entry_price,
-            "stop_loss": ctx.stop_loss,
-            "take_profit": ctx.take_profit,
-            "regime": ctx.regime,
-            "hurst": round(ctx.hurst_exponent, 3),
-            "kaufman_er": round(ctx.kaufman_er, 3),
-            "vol_pct": round(ctx.volatility_percentile, 1),
-            "dom_obi": round(ctx.dom_obi, 3) if ctx.dom_obi is not None else "N/A",
-            "spread_pct_of_sl": round(ctx.spread_pct_of_sl * 100.0, 2),
-            "timemachine_net_avg_R": round(ctx.net_avg_R, 3),
-            "timemachine_prob_profit": round(ctx.prob_profit, 3),
-            "timemachine_cvar_95_R": round(ctx.cvar_95_R, 3),
-            "recommended_risk_pct": round(ctx.recommended_risk_pct, 3),
-            "session_utc": ctx.session_utc_iso,
-        }
-        return (
-            "Do NOT call any tools or read any files. Respond immediately.\n"
-            "You are the PocketBot Apex Pre-Trade Risk Veto Committee consisting of two adversarial roles:\n"
-            "1. Macro/Session Trap Auditor: Checks for illiquid session handoffs, late-session exhaustion, or macro traps.\n"
-            "2. Structural Devil's Advocate: Checks if net_avg_R <= 0, excessive spread_pct_of_sl (>15%), or severe tail CVaR.\n"
-            f"Candidate Setup Telemetry: {json.dumps(payload)}\n"
-            "Respond ONLY with a valid single-line JSON object matching this exact schema:\n"
-            '{"decision": "APPROVE" or "VETO", "confidence": 0.85, "reason": "concise synthesis of both roles"}'
-        )
+        """Build the Shield 2 & 3 ticker-blinded, closed-world proof-carrying prompt."""
+        blinded = AegisVerifier.normalize_ticker_blinded_telemetry(ctx)
+        return AegisVerifier.build_aegis_prompt(blinded)
 
     @staticmethod
     def clean_and_extract_json_payload(raw_output: str) -> dict[str, Any]:
@@ -588,12 +581,14 @@ class AIVetoCommittee:
         cascade_path: Sequence[str] = (),
         model_used: str = "",
     ) -> AIVetoDecision:
-        """Parse and validate `{ "decision": "APPROVE" | "VETO", "confidence": 0.0-1.0, "reason": "..." }`."""
+        """Parse and validate `{ "decision": "APPROVE" | "VETO" | "ABSTAIN", "confidence": 0.0-1.0, "reason": "..." }`."""
         data = cls.clean_and_extract_json_payload(raw_text)
         raw_dec = str(data.get("decision", "APPROVE")).upper().strip()
-        if raw_dec not in ("APPROVE", "VETO"):
+        if raw_dec not in ("APPROVE", "VETO", "ABSTAIN"):
             raise ValueError(f"Invalid AI decision value: {raw_dec!r}")
         conf = float(max(0.0, min(1.0, float(data.get("confidence", 0.5)))))
+        default_mult = 0.0 if raw_dec == "VETO" else 1.0
+        mult = float(max(0.0, min(1.0, float(data.get("risk_multiplier", default_mult)))))
         reason = str(data.get("reason", f"Audited by {provider_used}")).strip()
         path_tuple = tuple(cascade_path) if cascade_path else (provider_used,)
         return AIVetoDecision(
@@ -605,6 +600,125 @@ class AIVetoCommittee:
             provider_used=provider_used,
             cascade_path=path_tuple,
             model_used=model_used,
+            risk_multiplier=mult,
+        )
+
+    def _verify_and_finalize_ai_response(
+        self,
+        raw_text: str,
+        ctx: CandidateSetupAuditContext,
+        blinded: BlindedTelemetry,
+        latency_ms: float,
+        provider_used: str,
+        cascade_path: Sequence[str],
+        model_used: str,
+        start_perf: float,
+    ) -> AIVetoDecision:
+        """Run Aegis Shields 1-4 & 6 on a raw LLM response; fall back to pure_math on hallucination/abstain."""
+        payload = self.clean_and_extract_json_payload(raw_text)
+        v_res = self.aegis.verify_response(
+            payload,
+            blinded,
+            provider=provider_used,
+            model_id=model_used,
+        )
+
+        audit_id = 0
+        if self.ledger_db is not None:
+            side_str = ctx.side.value if hasattr(ctx.side, "value") else str(ctx.side).upper()
+            audit_id = self.ledger_db.log_ai_epistemic_audit(
+                symbol=ctx.symbol,
+                side=side_str,
+                timeframe=ctx.timeframe,
+                provider=provider_used,
+                model_id=model_used,
+                input_sha256=blinded.input_sha256,
+                raw_decision=v_res.raw_decision,
+                final_decision=v_res.final_decision,
+                confidence=v_res.confidence,
+                risk_multiplier=v_res.risk_multiplier,
+                hallucination_detected=v_res.hallucination_detected,
+                violation_codes=",".join(v_res.violation_codes),
+                reason=v_res.reason,
+                is_canary=False,
+                predicted_net_r=ctx.net_avg_R,
+            )
+            stats = self.ledger_db.get_model_epistemic_stats(provider=provider_used, model_id=model_used, window=20)
+            self.model_selector.update_epistemic_trust(
+                provider_used,
+                model_used,
+                stats.epistemic_trust_score,
+                quarantined=stats.should_demote_to_pure_math,
+                reason=stats.demote_reason,
+            )
+
+        if v_res.hallucination_detected:
+            self.model_selector.record_failure(
+                provider_used,
+                model_used,
+                f"HALLUCINATION_DETECTED: {','.join(v_res.violation_codes)}",
+            )
+            fb = self._evaluate_pure_math_fallback(
+                ctx=ctx,
+                start_perf=start_perf,
+                cascade_path=list(cascade_path) + [AIProviderName.PURE_MATH.value],
+                fallback_reason_prefix=f"Aegis HALLUCINATION_DETECTED ({','.join(v_res.violation_codes)}) -> pure_math",
+            )
+            return AIVetoDecision(
+                decision=fb.decision,
+                confidence=fb.confidence,
+                reason=fb.reason,
+                latency_ms=fb.latency_ms,
+                bypassed=True,
+                provider_used=fb.provider_used,
+                cascade_path=fb.cascade_path,
+                model_used=model_used,
+                risk_multiplier=0.0 if fb.decision == "VETO" else 1.0,
+                aegis_verified=True,
+                hallucination_detected=True,
+                input_sha256=blinded.input_sha256,
+                audit_id=audit_id,
+            )
+
+        self.model_selector.record_success(provider_used, model_used, latency_ms)
+
+        if v_res.fallback_to_pure_math:
+            fb = self._evaluate_pure_math_fallback(
+                ctx=ctx,
+                start_perf=start_perf,
+                cascade_path=list(cascade_path) + [AIProviderName.PURE_MATH.value],
+                fallback_reason_prefix=f"Aegis {v_res.raw_decision} -> pure_math",
+            )
+            return AIVetoDecision(
+                decision=fb.decision,
+                confidence=fb.confidence,
+                reason=fb.reason,
+                latency_ms=fb.latency_ms,
+                bypassed=True,
+                provider_used=fb.provider_used,
+                cascade_path=fb.cascade_path,
+                model_used=model_used,
+                risk_multiplier=0.0 if fb.decision == "VETO" else 1.0,
+                aegis_verified=True,
+                hallucination_detected=False,
+                input_sha256=blinded.input_sha256,
+                audit_id=audit_id,
+            )
+
+        return AIVetoDecision(
+            decision=v_res.final_decision,
+            confidence=v_res.confidence,
+            reason=v_res.reason,
+            latency_ms=latency_ms,
+            bypassed=False,
+            provider_used=provider_used,
+            cascade_path=tuple(cascade_path),
+            model_used=model_used,
+            risk_multiplier=v_res.risk_multiplier,
+            aegis_verified=True,
+            hallucination_detected=False,
+            input_sha256=blinded.input_sha256,
+            audit_id=audit_id,
         )
 
     def _get_ranked_model_ids(self, provider: str, ctx: CandidateSetupAuditContext, fallback_id: str) -> list[str]:
@@ -629,13 +743,14 @@ class AIVetoCommittee:
         if not self.api_key:
             raise RuntimeError("studio_api not ready: GEMINI_API_KEY is empty")
 
-        prompt = self.build_adversarial_prompt(ctx)
+        blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
+        prompt = self.aegis.build_aegis_prompt(blinded)
         payload_bytes = json.dumps(
             {
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.1,
-                    "maxOutputTokens": 200,
+                    "maxOutputTokens": 450,
                     "responseMimeType": "application/json",
                 },
             }
@@ -659,15 +774,16 @@ class AIVetoCommittee:
                         raise RuntimeError(f"studio_api HTTP {resp.status}")
                     resp_json = json.loads(resp.read().decode("utf-8"))
                     raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-                    dec = self.parse_structured_decision(
+                    return self._verify_and_finalize_ai_response(
                         raw_text=raw_text,
+                        ctx=ctx,
+                        blinded=blinded,
                         latency_ms=latency_ms,
                         provider_used=AIProviderName.STUDIO_API.value,
                         cascade_path=cascade_path,
                         model_used=model_id,
+                        start_perf=t0,
                     )
-                    self.model_selector.record_success("studio_api", model_id, latency_ms)
-                    return dec
             except Exception as exc:
                 last_exc = exc
                 err_s = str(exc)
@@ -689,12 +805,13 @@ class AIVetoCommittee:
         if not self.api_key:
             raise RuntimeError("studio_api not ready: GEMINI_API_KEY is empty")
 
-        prompt = self.build_adversarial_prompt(ctx)
+        blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
+        prompt = self.aegis.build_aegis_prompt(blinded)
         body = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 200,
+                "maxOutputTokens": 450,
                 "responseMimeType": "application/json",
             },
         }
@@ -713,15 +830,16 @@ class AIVetoCommittee:
                             raise RuntimeError(f"studio_api HTTP {resp.status}: {err_txt[:120]}")
                         resp_json = await resp.json()
                         raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-                        dec = self.parse_structured_decision(
+                        return self._verify_and_finalize_ai_response(
                             raw_text=raw_text,
+                            ctx=ctx,
+                            blinded=blinded,
                             latency_ms=latency_ms,
                             provider_used=AIProviderName.STUDIO_API.value,
                             cascade_path=cascade_path,
                             model_used=model_id,
+                            start_perf=t0,
                         )
-                        self.model_selector.record_success("studio_api", model_id, latency_ms)
-                        return dec
                 except Exception as exc:
                     last_exc = exc
                     err_s = str(exc)
@@ -749,7 +867,8 @@ class AIVetoCommittee:
         if not agy_exe or not self._cached_agy_auth_ok:
             raise RuntimeError("agy_pro not ready or not found")
 
-        prompt = self.build_adversarial_prompt(ctx)
+        blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
+        prompt = self.aegis.build_aegis_prompt(blinded)
         timeout_int = max(5, int(round(self.agy_timeout_seconds)))
         iso_dir = self.get_isolated_temp_dir()
         candidate_models = self._get_ranked_model_ids("agy_pro", ctx, "default")
@@ -787,15 +906,17 @@ class AIVetoCommittee:
                 if not stdout_txt:
                     raise RuntimeError(f"agy_pro exited {proc.returncode} with empty stdout: {(proc.stderr or '')[:160]}")
 
-                decision = self.parse_structured_decision(
+                decision = self._verify_and_finalize_ai_response(
                     raw_text=stdout_txt,
+                    ctx=ctx,
+                    blinded=blinded,
                     latency_ms=latency_ms,
                     provider_used=AIProviderName.AGY_PRO.value,
                     cascade_path=cascade_path,
                     model_used=model_id,
+                    start_perf=t0,
                 )
                 self._agy_consecutive_failures = 0
-                self.model_selector.record_success("agy_pro", model_id, latency_ms)
                 return decision
             except Exception as exc:
                 last_exc = exc
@@ -804,7 +925,13 @@ class AIVetoCommittee:
                     "agy_pro",
                     model_id,
                     err_s,
-                    is_quota_or_429=("quota" in err_s.lower() or "429" in err_s or "exhaust" in err_s.lower()),
+                    is_quota_or_429=(
+                        "quota" in err_s.lower()
+                        or "429" in err_s
+                        or "exhaust" in err_s.lower()
+                        or "credits" in err_s.lower()
+                        or "balance" in err_s.lower()
+                    ),
                 )
                 logger.warning("agy_pro model %s failed (%s); cascading...", model_id, err_s)
 
@@ -833,21 +960,26 @@ class AIVetoCommittee:
         cascade_path: Sequence[str],
         fallback_reason_prefix: str = "",
     ) -> AIVetoDecision:
-        """Deterministic 0ms $0 Pure Math pass-through relying on Regime + DOM + TimeMachine + 6 Breakers."""
+        """Deterministic 0ms $0 Pure Math + Z3 Axiom Gate pass-through."""
         latency_ms = (time.perf_counter() - start_perf) * 1000.0
         min_net_r = float(getattr(self, "min_net_avg_R", 0.10))
-        # Pure math check: if net_avg_R < min_net_avg_R or spread_pct_of_sl > 0.15, VETO; otherwise APPROVE
+        blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
+        z3_dec, z3_note = self.aegis.z3_pure_math_axiom_gate(blinded.telemetry)
+
         if ctx.net_avg_R < min_net_r:
             dec = "VETO"
             reason = f"Pure Math Gate: net_avg_R ({ctx.net_avg_R:+.3f}R) < {min_net_r:.2f}R"
         elif ctx.spread_pct_of_sl > 0.15 + 1e-9:
             dec = "VETO"
             reason = f"Pure Math Gate: spread is {ctx.spread_pct_of_sl * 100:.1f}% of SL (> 15.0%)"
+        elif z3_dec == "VETO":
+            dec = "VETO"
+            reason = z3_note
         else:
             dec = "APPROVE"
             reason = (
-                f"Pure Math Deterministic Pass-Through: Regime={ctx.regime}, "
-                f"net_avg_R={ctx.net_avg_R:+.3f}R, ProbProfit={ctx.prob_profit * 100:.1f}%"
+                f"Pure Math + Z3 Pass-Through: Regime={ctx.regime}, "
+                f"net_avg_R={ctx.net_avg_R:+.3f}R, ProbProfit={ctx.prob_profit * 100:.1f}% ({z3_note})"
             )
 
         if fallback_reason_prefix:

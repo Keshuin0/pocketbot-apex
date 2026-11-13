@@ -607,28 +607,76 @@ class DualBrokerExecutionRouter:
             trade_allowed = bool(getattr(term_info, "trade_allowed", False)) if term_info is not None else False
             resolved = self.feed_router.mt5.resolve_symbol(norm_sym)
             if trade_allowed and resolved:
-                filling = self.detect_mt5_filling_mode(resolved)
+                info = mt5.symbol_info(resolved)
+                digits = int(getattr(info, "digits", 5) or 5) if info is not None else 5
+                detected_filling = self.detect_mt5_filling_mode(resolved)
+                candidate_fillings = list(
+                    dict.fromkeys(
+                        [
+                            detected_filling,
+                            int(mt5.ORDER_FILLING_IOC),
+                            int(mt5.ORDER_FILLING_FOK),
+                            int(mt5.ORDER_FILLING_RETURN),
+                        ]
+                    )
+                )
                 tick = mt5.symbol_info_tick(resolved)
                 live_px = (
                     float(tick.ask if order.side == Side.BUY else tick.bid)
                     if tick is not None
                     else float(order.entry_price)
                 )
+                req_price = live_px if order.order_type.upper() == "MARKET" else float(order.entry_price)
+
+                # Probe mt5.order_check across candidate filling modes so IOC/FOK/RETURN mismatches never drop silently
+                chosen_filling = detected_filling
+                order_check_fn = getattr(mt5, "order_check", None)
+                if callable(order_check_fn):
+                    for cand_fill in candidate_fillings:
+                        probe_req = {
+                            "action": mt5.TRADE_ACTION_DEAL if order.order_type.upper() == "MARKET" else mt5.TRADE_ACTION_PENDING,
+                            "symbol": resolved,
+                            "volume": float(order.lots),
+                            "type": mt5.ORDER_TYPE_BUY if order.side == Side.BUY else mt5.ORDER_TYPE_SELL,
+                            "price": round(req_price, digits),
+                            "sl": round(float(order.stop_loss), digits),
+                            "tp": round(float(order.take_profit), digits),
+                            "deviation": 20,
+                            "magic": 202611,
+                            "comment": order.comment,
+                            "type_time": mt5.ORDER_TIME_GTC,
+                            "type_filling": cand_fill,
+                        }
+                        chk = order_check_fn(probe_req)
+                        if chk is not None and int(getattr(chk, "retcode", -1)) == 0:
+                            chosen_filling = cand_fill
+                            break
+
                 mt5_req = {
                     "action": mt5.TRADE_ACTION_DEAL if order.order_type.upper() == "MARKET" else mt5.TRADE_ACTION_PENDING,
                     "symbol": resolved,
                     "volume": float(order.lots),
                     "type": mt5.ORDER_TYPE_BUY if order.side == Side.BUY else mt5.ORDER_TYPE_SELL,
-                    "price": live_px if order.order_type.upper() == "MARKET" else float(order.entry_price),
-                    "sl": float(order.stop_loss),
-                    "tp": float(order.take_profit),
+                    "price": round(req_price, digits),
+                    "sl": round(float(order.stop_loss), digits),
+                    "tp": round(float(order.take_profit), digits),
                     "deviation": 20,
                     "magic": 202611,
                     "comment": order.comment,
                     "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": filling,
+                    "type_filling": chosen_filling,
                 }
                 res = mt5.order_send(mt5_req)
+                # Retry alternate filling mode once if broker returns INVALID_FILL (10030)
+                if res is not None and int(getattr(res, "retcode", 0)) == 10030:
+                    for alt_fill in candidate_fillings:
+                        if alt_fill == chosen_filling:
+                            continue
+                        mt5_req["type_filling"] = alt_fill
+                        res = mt5.order_send(mt5_req)
+                        if res is not None and int(getattr(res, "retcode", 0)) == int(mt5.TRADE_RETCODE_DONE):
+                            break
+
                 if res is not None and int(getattr(res, "retcode", 0)) == int(mt5.TRADE_RETCODE_DONE):
                     fill_px = float(getattr(res, "price", 0.0) or live_px)
                     slip = (fill_px - order.entry_price) if order.side == Side.BUY else (order.entry_price - fill_px)
@@ -643,7 +691,7 @@ class DualBrokerExecutionRouter:
                             take_profit=order.take_profit,
                             venue="MT5",
                             status="FILLED",
-                            details=f"Ticket #{res.order} | Done",
+                            details=f"Ticket #{res.order} | Retcode {res.retcode} (Done)",
                         )
                     )
                     return ExecutionReceipt(

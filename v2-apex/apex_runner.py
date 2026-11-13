@@ -23,6 +23,8 @@ from typing import Sequence
 
 from rich.console import Console
 
+from apex.ai.aegis_verifier import AegisVerifier
+from apex.ai.sleep_consolidation import SleepWakeConsolidator
 from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
 from apex.cockpit.telegram_remote import TelegramRemoteController
 from apex.cockpit.tui_dashboard import ApexTUIDashboard, SymbolCockpitRow
@@ -97,6 +99,7 @@ class ApexOrchestrator:
             account_equity_usd=10_000.0,
             max_risk_pct=float(self.config.get("risk", {}).get("max_risk_per_trade_pct", 0.5)),
         )
+        self.ledger = WalkForwardLedgerDB(db_path=db_path)
         self.ai_committee = AIVetoCommittee(
             enabled=bool(ai_cfg.get("enabled", True)),
             timeout_seconds=min(float(ai_cfg.get("studio_timeout_seconds", ai_cfg.get("timeout_seconds", 4.0))), 4.0),
@@ -104,8 +107,8 @@ class ApexOrchestrator:
             mode=str(ai_cfg.get("mode", "auto_studio_first")),
             priority_order=ai_cfg.get("priority_order"),
             config_path=self.config_path,
+            ledger_db=self.ledger,
         )
-        self.ledger = WalkForwardLedgerDB(db_path=db_path)
         self.execution_router = DualBrokerExecutionRouter(
             feed_router=self.feed_router,
             account_equity_usd=10_000.0,
@@ -134,6 +137,23 @@ class ApexOrchestrator:
             config=self.config,
         )
         self.last_scan_summary: UniverseScanSummary | None = None
+        sleep_cfg = self.config.get("sleep_wake", {})
+        self.sleep_consolidator = SleepWakeConsolidator(
+            ledger_db=self.ledger,
+            memory_path=Path(db_path).parent / "semantic_memory.json",
+            rollover_utc_hour=int(sleep_cfg.get("rollover_utc_hour", 22)),
+            rollover_utc_minute=int(sleep_cfg.get("rollover_utc_minute", 5)),
+            stale_hours_threshold=float(sleep_cfg.get("stale_hours_threshold", 16.0)),
+        )
+        if bool(sleep_cfg.get("enabled", True)):
+            due, reason = self.sleep_consolidator.should_run_sleep_cycle(is_startup=True)
+            if due:
+                self.sleep_consolidator.run_full_cycle(
+                    trigger_reason=reason,
+                    ai_committee=self.ai_committee,
+                    feed_router=self.feed_router,
+                    hydra_nbbo=getattr(self.feed_router, "nbbo_engine", None),
+                )
 
     def run_cycle(self, symbols: Sequence[str] | None = None) -> list[SymbolCockpitRow]:
         """Run a full quantitative scan, regime classification, Time Machine v2, and ledger cycle."""
@@ -172,6 +192,17 @@ class ApexOrchestrator:
             open_positions = self.execution_router.get_open_positions()
 
         ai_status = self.ai_committee.get_router_status()
+        aegis_summary = self.ledger.get_aegis_integrity_summary()
+        sleep_due, sleep_reason = self.sleep_consolidator.should_run_sleep_cycle(is_startup=False)
+        if sleep_due and bool(self.config.get("sleep_wake", {}).get("enabled", True)):
+            self.sleep_consolidator.run_full_cycle(
+                trigger_reason=sleep_reason,
+                ai_committee=self.ai_committee,
+                feed_router=self.feed_router,
+                hydra_nbbo=getattr(self.feed_router, "nbbo_engine", None),
+            )
+        mind_badge = self.sleep_consolidator.get_mind_state_badge()
+        contagion_z = self.universe_scanner.last_contagion.cross_asset_shock_z if self.universe_scanner.last_contagion else 0.0
         sor_pips, sor_usd = self.execution_router.cumulative_sor_savings
         self.dashboard.print_snapshot(
             run_mode=self.mode,
@@ -190,6 +221,9 @@ class ApexOrchestrator:
             universe_total_count=self.last_scan_summary.total_scanned if self.last_scan_summary else 0,
             account_currency=account_currency,
             broker_events=self.execution_router.recent_broker_events,
+            aegis_badge=aegis_summary["badge"],
+            contagion_shock_z=contagion_z,
+            mind_state_badge=mind_badge,
         )
         return rows
 
@@ -217,24 +251,38 @@ class ApexOrchestrator:
 
             # Filter: must have AI approval and meet the min_net_avg_R floor
             is_approved = "APPROVE" in row.ai_verdict.upper()
-            if not is_approved:
-                continue
-            if row.net_avg_r < min_net_r:
+            quant_ok = is_approved and (row.net_avg_r >= min_net_r)
+            diode = AegisVerifier.apply_subtract_only_diode(
+                quant_approved=quant_ok,
+                ai_decision="APPROVE" if is_approved else "VETO",
+                requested_risk_multiplier=1.0,
+                recommended_risk_pct=row.rec_risk_pct if row.rec_risk_pct is not None else risk_pct,
+                sl_price=row.stop_loss,
+                tp_price=row.take_profit,
+                max_risk_pct=risk_pct,
+            )
+            if not diode.final_approved:
                 continue
 
             can_sym = self.feed_router.mt5.alias_mapper.canonicalize(row.symbol)
             if can_sym.upper() in open_symbols or row.symbol.upper() in open_symbols:
                 continue
 
-            if row.entry_price <= 0.0 or row.stop_loss <= 0.0 or row.take_profit <= 0.0:
+            if row.entry_price <= 0.0 or diode.stop_loss <= 0.0 or diode.take_profit <= 0.0:
                 continue
+
+            effective_risk_amount = (
+                (self.execution_router.account_equity_usd * (diode.final_risk_pct / 100.0))
+                if self.execution_router.account_equity_usd > 0
+                else risk_amount
+            )
 
             # Compute compliant lot size
             lots = self.execution_router.compute_compliant_lot_size(
                 symbol=row.symbol,
                 entry_price=row.entry_price,
-                stop_loss=row.stop_loss,
-                risk_usd=risk_amount,
+                stop_loss=diode.stop_loss,
+                risk_usd=effective_risk_amount,
             )
 
             side = row.side if row.side is not None else Side.BUY
@@ -243,10 +291,10 @@ class ApexOrchestrator:
                 side=side,
                 lots=lots,
                 entry_price=row.entry_price,
-                stop_loss=row.stop_loss,
-                take_profit=row.take_profit,
-                risk_pct=risk_pct,
-                risk_usd=risk_amount,
+                stop_loss=diode.stop_loss,
+                take_profit=diode.take_profit,
+                risk_pct=diode.final_risk_pct,
+                risk_usd=effective_risk_amount,
                 force_paper_shadow=(self.mode == "shadow-ab"),
                 comment="ApexAuto",
             )

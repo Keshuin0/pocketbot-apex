@@ -37,6 +37,24 @@ class SymbolExecutionMode(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class ModelEpistemicStats:
+    """Rolling Aegis Shield 6 epistemic integrity, Brier calibration, and veto value-added metrics."""
+
+    provider: str
+    model_id: str
+    total_audits: int
+    hallucination_count: int
+    hallucination_rate: float
+    verified_proofs: int
+    graded_vetoes: int
+    veto_value_added_r: float
+    avg_brier_score: float
+    epistemic_trust_score: float
+    should_demote_to_pure_math: bool
+    demote_reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class SymbolQuarantineState:
     """Current quarantine telemetry and rolling performance metrics for a symbol."""
 
@@ -144,6 +162,43 @@ class WalkForwardLedgerDB:
                     profit_factor REAL NOT NULL,
                     reason TEXT NOT NULL,
                     updated_at_utc REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_epistemic_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp_utc REAL NOT NULL,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    timeframe TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model_id TEXT NOT NULL,
+                    input_sha256 TEXT NOT NULL,
+                    raw_decision TEXT NOT NULL,
+                    final_decision TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    risk_multiplier REAL NOT NULL,
+                    hallucination_detected INTEGER NOT NULL DEFAULT 0,
+                    violation_codes TEXT NOT NULL DEFAULT '',
+                    reason TEXT NOT NULL DEFAULT '',
+                    is_canary INTEGER NOT NULL DEFAULT 0,
+                    predicted_net_r REAL NOT NULL DEFAULT 0.0,
+                    shadow_realized_r REAL,
+                    brier_score REAL,
+                    veto_value_added_r REAL,
+                    is_graded INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE TABLE IF NOT EXISTS consolidation_checkpoints (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cycle_number INTEGER NOT NULL,
+                    timestamp_utc REAL NOT NULL,
+                    trigger_reason TEXT NOT NULL,
+                    purged_cache_entries INTEGER NOT NULL DEFAULT 0,
+                    trades_consolidated INTEGER NOT NULL DEFAULT 0,
+                    audits_consolidated INTEGER NOT NULL DEFAULT 0,
+                    canary_passed INTEGER NOT NULL DEFAULT 1,
+                    semantic_memory_sha256 TEXT NOT NULL DEFAULT '',
+                    summary TEXT NOT NULL DEFAULT ''
                 );
                 """
             )
@@ -505,3 +560,405 @@ class WalkForwardLedgerDB:
         with self._connect() as conn:
             rows = conn.execute("SELECT symbol FROM symbol_quarantine ORDER BY symbol ASC").fetchall()
         return [self.get_quarantine_state(str(r["symbol"])) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Shield 6: Shadow Counterfactual Grading & Brier Calibration
+    # ------------------------------------------------------------------
+
+    def log_ai_epistemic_audit(
+        self,
+        symbol: str,
+        side: str,
+        timeframe: str,
+        provider: str,
+        model_id: str,
+        input_sha256: str,
+        raw_decision: str,
+        final_decision: str,
+        confidence: float,
+        risk_multiplier: float = 1.0,
+        hallucination_detected: bool = False,
+        violation_codes: str = "",
+        reason: str = "",
+        is_canary: bool = False,
+        predicted_net_r: float = 0.0,
+        timestamp_utc: float | None = None,
+    ) -> int:
+        """Log an AI Risk Veto & Aegis symbolic verification audit to `ai_epistemic_audit`."""
+        ts = float(timestamp_utc if timestamp_utc is not None else time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO ai_epistemic_audit (
+                    timestamp_utc, symbol, side, timeframe, provider, model_id,
+                    input_sha256, raw_decision, final_decision, confidence,
+                    risk_multiplier, hallucination_detected, violation_codes,
+                    reason, is_canary, predicted_net_r
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts,
+                    symbol.upper(),
+                    side.upper(),
+                    timeframe.upper(),
+                    str(provider),
+                    str(model_id or "unknown"),
+                    str(input_sha256),
+                    raw_decision.upper(),
+                    final_decision.upper(),
+                    float(max(0.0, min(1.0, confidence))),
+                    float(max(0.0, min(1.0, risk_multiplier))),
+                    1 if hallucination_detected else 0,
+                    str(violation_codes),
+                    str(reason)[:500],
+                    1 if is_canary else 0,
+                    float(predicted_net_r),
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def grade_ai_shadow_outcome(self, audit_id: int, realized_r: float) -> None:
+        """Grade a logged AI audit with realized (or virtual shadow) outcome R-multiple.
+
+        Computes Brier calibration score and counterfactual `veto_value_added_r`:
+          - For VETO: `veto_value_added_r = -realized_r` (positive = True Save, negative = False Veto).
+          - For APPROVE: `veto_value_added_r = 0.0`.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT raw_decision, final_decision, confidence FROM ai_epistemic_audit WHERE id = ?",
+                (int(audit_id),),
+            ).fetchone()
+            if row is None:
+                return
+            raw_dec = str(row["raw_decision"]).upper()
+            conf = float(row["confidence"])
+            actual_win = 1.0 if float(realized_r) > 0.0 else 0.0
+            # For VETO, AI predicted trade failure (prob_win = 1 - conf) unless calibrated as win prob
+            pred_win_prob = (1.0 - conf) if raw_dec == "VETO" else conf
+            brier = (pred_win_prob - actual_win) ** 2
+            vva_r = -float(realized_r) if raw_dec == "VETO" else 0.0
+
+            conn.execute(
+                """
+                UPDATE ai_epistemic_audit
+                SET shadow_realized_r = ?, brier_score = ?, veto_value_added_r = ?, is_graded = 1
+                WHERE id = ?
+                """,
+                (float(realized_r), round(brier, 6), round(vva_r, 6), int(audit_id)),
+            )
+
+    def get_model_epistemic_stats(
+        self,
+        provider: str | None = None,
+        model_id: str | None = None,
+        window: int = 20,
+    ) -> ModelEpistemicStats:
+        """Compute rolling epistemic trust, hallucination rate, Brier score, and demotion flag."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if provider is not None:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if model_id is not None:
+            clauses.append("model_id = ?")
+            params.append(model_id)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(max(1, window)))
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT hallucination_detected, is_canary, raw_decision, final_decision,
+                       is_graded, brier_score, veto_value_added_r
+                FROM ai_epistemic_audit
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+
+        total = len(rows)
+        if total == 0:
+            return ModelEpistemicStats(
+                provider=provider or "all",
+                model_id=model_id or "all",
+                total_audits=0,
+                hallucination_count=0,
+                hallucination_rate=0.0,
+                verified_proofs=0,
+                graded_vetoes=0,
+                veto_value_added_r=0.0,
+                avg_brier_score=0.0,
+                epistemic_trust_score=1.0,
+                should_demote_to_pure_math=False,
+                demote_reason="",
+            )
+
+        hall_count = sum(int(r["hallucination_detected"]) for r in rows)
+        hall_rate = hall_count / total
+        verified_proofs = total - hall_count
+
+        briers = [float(r["brier_score"]) for r in rows if int(r["is_graded"]) == 1 and r["brier_score"] is not None]
+        avg_brier = sum(briers) / len(briers) if briers else 0.0
+
+        veto_vals = [
+            float(r["veto_value_added_r"])
+            for r in rows
+            if int(r["is_graded"]) == 1 and str(r["raw_decision"]).upper() == "VETO" and r["veto_value_added_r"] is not None
+        ]
+        graded_vetoes = len(veto_vals)
+        avg_vva_r = (sum(veto_vals) / graded_vetoes) if graded_vetoes > 0 else 0.0
+
+        canary_failed = any(
+            int(r["is_canary"]) == 1 and str(r["raw_decision"]).upper() == "APPROVE"
+            for r in rows
+        )
+
+        should_demote = False
+        demote_reason = ""
+        if canary_failed:
+            should_demote = True
+            demote_reason = "EPISTEMICALLY_COMPROMISED: Failed Canary Trap audit"
+        elif total >= 20 and hall_rate > 0.08:
+            should_demote = True
+            demote_reason = f"Rolling hallucination_rate {hall_rate * 100:.1f}% > 8.0% over {total} audits"
+        elif graded_vetoes >= 20 and avg_vva_r < -0.15:
+            should_demote = True
+            demote_reason = f"Rolling veto_value_added_R {avg_vva_r:+.3f}R < -0.15R over {graded_vetoes} vetoes"
+
+        # Compute trust score in [0.0, 1.0]
+        trust = 1.0 - min(0.80, hall_rate * 2.5) - min(0.20, avg_brier * 0.4)
+        if avg_vva_r < 0.0 and graded_vetoes >= 5:
+            trust -= min(0.30, abs(avg_vva_r) * 0.5)
+        if should_demote:
+            trust = 0.0
+        trust = max(0.0, min(1.0, round(trust, 4)))
+
+        return ModelEpistemicStats(
+            provider=provider or "all",
+            model_id=model_id or "all",
+            total_audits=total,
+            hallucination_count=hall_count,
+            hallucination_rate=round(hall_rate, 4),
+            verified_proofs=verified_proofs,
+            graded_vetoes=graded_vetoes,
+            veto_value_added_r=round(avg_vva_r, 4),
+            avg_brier_score=round(avg_brier, 4),
+            epistemic_trust_score=trust,
+            should_demote_to_pure_math=should_demote,
+            demote_reason=demote_reason,
+        )
+
+    def get_conformal_p_value(
+        self,
+        provider: str,
+        model_id: str,
+        raw_confidence: float,
+        window: int = 50,
+    ) -> float:
+        """Compute Split Conformal Prediction p-value against rolling graded calibration scores.
+
+        Non-conformity score `alpha_i = |y_i - p_i|` where `y_i in {0, 1}` is realized win
+        and `p_i` is predicted win probability. Higher p-value means the candidate confidence
+        conforms well to historical calibrated accuracy.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT raw_decision, confidence, shadow_realized_r
+                FROM ai_epistemic_audit
+                WHERE provider = ? AND model_id = ? AND is_graded = 1 AND shadow_realized_r IS NOT NULL
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (provider, model_id, int(max(1, window))),
+            ).fetchall()
+
+        if len(rows) < 5:
+            # Insufficient calibration history -> conservative neutral conformal p-value
+            return round(min(0.65, max(0.20, float(raw_confidence) * 0.75)), 4)
+
+        alphas: list[float] = []
+        for r in rows:
+            y_i = 1.0 if float(r["shadow_realized_r"]) > 0.0 else 0.0
+            c_i = float(r["confidence"])
+            p_i = (1.0 - c_i) if str(r["raw_decision"]).upper() == "VETO" else c_i
+            alphas.append(abs(y_i - p_i))
+
+        cand_alpha = 1.0 - max(0.0, min(1.0, float(raw_confidence)))
+        ge_count = sum(1 for a in alphas if a >= cand_alpha - 1e-9)
+        p_val = (ge_count + 1) / (len(alphas) + 1)
+        return round(float(p_val), 4)
+
+    def get_aegis_integrity_summary(self, window: int = 100) -> dict[str, Any]:
+        """Return compact Aegis Z3 Epistemic Integrity summary for the TUI cockpit header."""
+        stats = self.get_model_epistemic_stats(window=window)
+        hall_pct = stats.hallucination_rate * 100.0
+        return {
+            "total_audits": stats.total_audits,
+            "hallucination_count": stats.hallucination_count,
+            "hallucination_rate": stats.hallucination_rate,
+            "verified_proofs": stats.verified_proofs,
+            "veto_value_added_r": stats.veto_value_added_r,
+            "avg_brier_score": stats.avg_brier_score,
+            "badge": f"Aegis Z3: {stats.verified_proofs} Verified Proofs | {hall_pct:.0f}% Uncaught Hallucinations",
+        }
+
+    # ------------------------------------------------------------------
+    # Phase 8: Circadian Sleep-Wake Consolidation Queries & Checkpoints
+    # ------------------------------------------------------------------
+
+    def record_consolidation_checkpoint(
+        self,
+        cycle_number: int,
+        trigger_reason: str,
+        purged_cache_entries: int,
+        trades_consolidated: int,
+        audits_consolidated: int,
+        canary_passed: bool,
+        semantic_memory_sha256: str,
+        summary: str,
+        timestamp_utc: float | None = None,
+    ) -> int:
+        """Persist a versioned Sleep-Wake consolidation checkpoint."""
+        ts = float(timestamp_utc if timestamp_utc is not None else time.time())
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO consolidation_checkpoints (
+                    cycle_number, timestamp_utc, trigger_reason, purged_cache_entries,
+                    trades_consolidated, audits_consolidated, canary_passed,
+                    semantic_memory_sha256, summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(cycle_number),
+                    ts,
+                    str(trigger_reason),
+                    int(purged_cache_entries),
+                    int(trades_consolidated),
+                    int(audits_consolidated),
+                    1 if canary_passed else 0,
+                    str(semantic_memory_sha256),
+                    str(summary)[:500],
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_latest_consolidation_checkpoint(self) -> dict[str, Any] | None:
+        """Return the latest Sleep-Wake consolidation checkpoint or None."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM consolidation_checkpoints ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def compute_slippage_calibration_multipliers(self) -> dict[str, dict[str, float]]:
+        """Compute realized-vs-baseline slippage multipliers per symbol and venue, clamped to [0.5, 3.0]."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, winning_venue, realized_slippage_r
+                FROM trade_ledger
+                ORDER BY id DESC
+                LIMIT 500
+                """
+            ).fetchall()
+
+        grouped: dict[tuple[str, str], list[float]] = {}
+        for r in rows:
+            sym = str(r["symbol"]).upper()
+            venue = str(r["winning_venue"] or "mt5").lower()
+            slip_r = abs(float(r["realized_slippage_r"] or 0.0))
+            grouped.setdefault((sym, venue), []).append(slip_r)
+
+        # Baseline expected slippage in R is ~0.04R; multiplier scales proportionally
+        baseline_slip_r = 0.04
+        result: dict[str, dict[str, float]] = {}
+        for (sym, venue), vals in grouped.items():
+            mean_slip = sum(vals) / len(vals)
+            raw_mult = mean_slip / baseline_slip_r if mean_slip > 0.0 else 1.0
+            clamped = max(0.5, min(3.0, round(raw_mult, 4)))
+            result.setdefault(sym, {})[venue] = clamped
+        return result
+
+    def compute_session_hour_priors(self) -> dict[str, dict[str, Any]]:
+        """Compute closed-trade expectancy priors grouped by UTC hour (`00`..`23`)."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp_utc, realized_net_r
+                FROM trade_ledger
+                WHERE is_closed = 1 AND realized_net_r IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 1000
+                """
+            ).fetchall()
+
+        import datetime
+
+        by_hour: dict[str, list[float]] = {}
+        for r in rows:
+            dt = datetime.datetime.fromtimestamp(float(r["timestamp_utc"]), tz=datetime.timezone.utc)
+            hr_key = f"{dt.hour:02d}"
+            by_hour.setdefault(hr_key, []).append(float(r["realized_net_r"]))
+
+        priors: dict[str, dict[str, Any]] = {}
+        for hr_key, vals in sorted(by_hour.items()):
+            mean_r = sum(vals) / len(vals)
+            priors[hr_key] = {
+                "count": len(vals),
+                "mean_r": round(mean_r, 4),
+                "regime_tag": "TOXIC_HOUR" if (len(vals) >= 5 and mean_r < -0.10) else ("HIGH_EDGE" if (len(vals) >= 5 and mean_r > 0.15) else "NEUTRAL"),
+            }
+        return priors
+
+    def compute_conformal_quantiles(self, alpha: float = 0.10) -> dict[str, dict[str, Any]]:
+        """Compute Split-Conformal non-conformity quantiles and Brier trust per provider/model."""
+        with self._connect() as conn:
+            pairs = conn.execute(
+                "SELECT DISTINCT provider, model_id FROM ai_epistemic_audit"
+            ).fetchall()
+
+        summary: dict[str, dict[str, Any]] = {}
+        for p in pairs:
+            prov = str(p["provider"])
+            mid = str(p["model_id"])
+            stats = self.get_model_epistemic_stats(provider=prov, model_id=mid, window=50)
+            with self._connect() as conn:
+                graded = conn.execute(
+                    """
+                    SELECT raw_decision, confidence, shadow_realized_r
+                    FROM ai_epistemic_audit
+                    WHERE provider = ? AND model_id = ? AND is_graded = 1 AND shadow_realized_r IS NOT NULL
+                    ORDER BY id DESC
+                    LIMIT 50
+                    """,
+                    (prov, mid),
+                ).fetchall()
+
+            q_val = 0.50
+            if len(graded) >= 5:
+                alphas = sorted(
+                    abs(
+                        (1.0 if float(r["shadow_realized_r"]) > 0.0 else 0.0)
+                        - ((1.0 - float(r["confidence"])) if str(r["raw_decision"]).upper() == "VETO" else float(r["confidence"]))
+                    )
+                    for r in graded
+                )
+                idx = min(len(alphas) - 1, max(0, int(math.ceil((1.0 - alpha) * (len(alphas) + 1))) - 1))
+                q_val = round(float(alphas[idx]), 4)
+
+            summary[f"{prov}:{mid}"] = {
+                "provider": prov,
+                "model_id": mid,
+                "conformal_quantile": q_val,
+                "epistemic_trust_score": stats.epistemic_trust_score,
+                "hallucination_rate": stats.hallucination_rate,
+                "veto_value_added_r": stats.veto_value_added_r,
+                "quarantined": stats.should_demote_to_pure_math,
+            }
+        return summary

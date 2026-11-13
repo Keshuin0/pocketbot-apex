@@ -20,6 +20,7 @@ from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import AssetClass, DiscoveredSymbol, Side, Tick
 from apex.ledger.walkforward_db import WalkForwardLedgerDB
+from apex.quant.contagion_oracle import ContagionOracle, ContagionTelemetry
 from apex.quant.momentum_dom import (
     InstrumentTier,
     MomentumDOMGate,
@@ -98,6 +99,8 @@ class UniverseScanner:
         self.min_net_avg_R: float = float(scanner_cfg.get("min_net_avg_R", 0.10))
 
         self.alias_mapper: SmartAliasMapper = SmartAliasMapper()
+        self.contagion_oracle: ContagionOracle = ContagionOracle()
+        self.last_contagion: ContagionTelemetry | None = None
         self._cached_catalog: list[DiscoveredSymbol] = []
         self._last_catalog_discovery_time: float = 0.0
 
@@ -438,6 +441,8 @@ class UniverseScanner:
 
         ai_label = "IDLE (Quant Filtered)"
         if passed_all_quant:
+            if self.last_contagion is None:
+                self.last_contagion = self.contagion_oracle.evaluate(feed_router=self.feed_router)
             latest_bar_ts = candles[-1].timestamp_utc if candles else 0.0
             ctx = CandidateSetupAuditContext(
                 symbol=sym,
@@ -458,6 +463,8 @@ class UniverseScanner:
                 recommended_risk_pct=tm_res.recommended_risk_pct,
                 session_utc_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 bar_timestamp=latest_bar_ts,
+                rollover_illiquidity_flag=self.last_contagion.rollover_illiquidity_flag,
+                cross_asset_shock_z=self.last_contagion.cross_asset_shock_z,
             )
             ai_decision = self.ai_committee.evaluate_sync(ctx)
             ai_label = f"{ai_decision.decision} ({ai_decision.confidence:.2f} via {ai_decision.provider_used})"
