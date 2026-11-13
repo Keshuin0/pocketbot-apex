@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.3.0] - 2026-11-12
+
+### Added
+- **Circadian Sleep-Wake Memory Consolidation & Context Hygiene Engine (`apex/ai/sleep_consolidation.py`):**
+  - **Phase A (Working Memory Purge):** Flushes per-candle AI verdict caches, recent AI event logs, expired model cooldowns, oversized `HydraNBBOEngine.spike_rejector` buffers (`>50`), and orphaned `%TEMP%\pocketbot_agy_isolated` temp files; runs `gc.collect()` and refreshes MT5 heartbeats.
+  - **Phase B (Episodic-to-Semantic Memory Consolidation):** Distills `trader/apex_ledger.db` into atomic SHA-256-verified `trader/semantic_memory.json` and SQLite `consolidation_checkpoints` (realized slippage calibration multipliers feeding `TimeMachineCostModel` & `HydraNBBOEngine`, UTC session-hour expectancy priors, Split-Conformal quantiles, and `<120`-token Aegis numeric priors).
+  - **Phase C (Morning Wake-Up Self-Audit):** Refreshes `AdaptiveModelSelector` discovery & daily quota budgets, syncs conformal trust scores, runs `run_canary_integrity_probe()`, and logs `[MORNING WAKE-UP READY]`.
+- **Automated & 1-Click Triggers (`apex_runner.py`, `config/apex_config.json`, `tools/run_sleep_cycle.py`, `8_REFRESH_AI_BRAIN.bat`):**
+  - Automatic daily trigger at `22:05 UTC` (`sleep_wake` config), startup trigger if `>16.0h` elapsed, and portable 1-click `8_REFRESH_AI_BRAIN.bat` launcher.
+- **TUI Cockpit (`apex/cockpit/tui_dashboard.py`):** Upgraded header to `POCKETBOT APEX v2.3` with `Mind State: FRESH (Cycle #<N> | Wisdom Checkpoints: <M> | Last Refresh: <HH:MM>)`.
+- **Verification Suite:** Added `tests/test_phase8_sleep_consolidation.py` (**56/56** total tests passing).
+
+---
+
+## [2.2.0] - 2026-11-12
+
+### Added
+- **Apex Aegis 7-Shield Formal Neuro-Symbolic Anti-Hallucination Firewall (`apex/ai/aegis_verifier.py` + `z3-solver`):**
+  - Subtract-Only Authority Diode, Ticker-Blinded Canonicalization + Closed-World Contract, Proof-Carrying Atomic Claim AST Grounding, `z3-solver` Formal SMT Consistency & Axiom Prover, Counter-Abductive Framing + `ABSTAIN`, Split-Conformal & Brier Epistemic Trust Calibration, and Canary Poison Probe.
+- **Live 251-Symbol Cross-Asset Contagion & Session Rollover Oracle (`apex/quant/contagion_oracle.py`):** Deterministic rollover illiquidity & cross-asset shock detection (`>2.5 sigma`).
+- **FusionMarkets-Demo Execution Reliability (`apex/feeds/mt5_feed.py`, `apex/execution/router.py`):** `mt5.order_check()` filling-mode probing (`IOC`/`FOK`/`RETURN`) + `10030` retry and `trade_tick_value_loss` CAD lot-sizing (**53/53** tests passing).
+
+---
+
 ## [2.1.1] - 2026-11-12
 
 ### Added
