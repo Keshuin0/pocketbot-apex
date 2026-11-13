@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Sequence
 
 from rich.console import Console
+from rich.live import Live
 
 from apex.ai.aegis_verifier import AegisVerifier
 from apex.ai.sleep_consolidation import SleepWakeConsolidator
@@ -155,7 +156,7 @@ class ApexOrchestrator:
                     hydra_nbbo=getattr(self.feed_router, "nbbo_engine", None),
                 )
 
-    def run_cycle(self, symbols: Sequence[str] | None = None) -> list[SymbolCockpitRow]:
+    def run_cycle(self, symbols: Sequence[str] | None = None, live: Live | None = None) -> list[SymbolCockpitRow]:
         """Run a full quantitative scan, regime classification, Time Machine v2, and ledger cycle."""
         active_src = self.feed_router.connect()
         use_funnel = symbols is None and self.config.get("scanner", {}).get("mode", "FULL_MARKET_FUNNEL") == "FULL_MARKET_FUNNEL"
@@ -204,6 +205,10 @@ class ApexOrchestrator:
         mind_badge = self.sleep_consolidator.get_mind_state_badge()
         contagion_z = self.universe_scanner.last_contagion.cross_asset_shock_z if self.universe_scanner.last_contagion else 0.0
         sor_pips, sor_usd = self.execution_router.cumulative_sor_savings
+        combined_events = sorted(
+            list(self.universe_scanner.recent_audit_events) + list(self.execution_router.recent_broker_events),
+            key=lambda e: e.timestamp_str,
+        )[-5:]
         self.dashboard.print_snapshot(
             run_mode=self.mode,
             active_feed=active_src,
@@ -220,10 +225,11 @@ class ApexOrchestrator:
             universe_scanned_count=self.last_scan_summary.open_scanned if self.last_scan_summary else 0,
             universe_total_count=self.last_scan_summary.total_scanned if self.last_scan_summary else 0,
             account_currency=account_currency,
-            broker_events=self.execution_router.recent_broker_events,
+            broker_events=combined_events,
             aegis_badge=aegis_summary["badge"],
             contagion_shock_z=contagion_z,
             mind_state_badge=mind_badge,
+            live=live,
         )
         return rows
 
@@ -338,9 +344,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.once or not args.dashboard:
             orchestrator.run_cycle()
             return 0
-        while True:
-            orchestrator.run_cycle()
-            time.sleep(max(1.0, args.interval))
+        with Live(console=console, refresh_per_second=4, screen=False) as live:
+            while True:
+                orchestrator.run_cycle(live=live)
+                time.sleep(max(1.0, args.interval))
     except KeyboardInterrupt:
         console.print("\n[yellow]PocketBot Apex stopped by user.[/yellow]")
         return 0

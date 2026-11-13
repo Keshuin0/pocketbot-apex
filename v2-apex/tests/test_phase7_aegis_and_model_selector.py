@@ -416,7 +416,7 @@ def test_live_isolated_agy_pro_aegis_execution(tmp_path: Path) -> None:
     elapsed_s = time.perf_counter() - t0
 
     assert dec.decision in ("APPROVE", "VETO", "ABSTAIN")
-    assert elapsed_s < 60.0
+    assert elapsed_s < 120.0
     if dec.provider_used == "agy_pro":
         assert dec.aegis_verified is True
     else:

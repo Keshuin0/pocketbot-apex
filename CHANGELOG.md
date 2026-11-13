@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.3.1] - 2026-11-12
+
+### Fixed
+- **Per-Model-Family Quota Quarantine & Cross-Family Cascade (`apex/ai/model_selector.py`, `apex/ai/veto_committee.py`):**
+  - Grouped discovered `agy_pro` and `studio_api` models into billing/quota families (`argon`, `hydrogen`, `flash`, etc.) via `classify_model_family()`.
+  - Quarantined the **entire model family** for 60 minutes whenever any variant returns credit/quota exhaustion (`"credits balance is too low"`, `"quota"`, `429`), preventing wasted retries on `-low`/`-medium` siblings or bare `--model`-less `agy -p` defaults.
+  - Added `rank_cross_family_candidates()` to cascade cleanly across distinct families (`argon` -> `hydrogen` -> `flash`) and updated `ApexTUIDashboard` to display the actual live-verified working model.
+- **Contagion Oracle Post-Rollover False Positives (`apex/quant/contagion_oracle.py`, `apex/quant/universe_scanner.py`):**
+  - Recomputed `ContagionOracle.evaluate()` fresh on every `scan_cycle()` instead of caching the first cycle's result, ignored stale maintenance bars (`>900s`), and applied a robust MAD/floor baseline on the 7 liquid core benchmarks (`EURUSD`, `GBPUSD`, `USDJPY`, `XAUUSD`, `US500`, `NAS100`, `BTCUSD`).
+- **Stage A Funnel Ranking (`apex/quant/universe_scanner.py`):**
+  - Penalized `MEAN_REVERTING_CHOP` (`H < 0.50` or `ER < 0.18`) and wide-spread/high-spread-to-ATR exotics so `TRENDING_EXPANSION` majors, indices, and equities rank into the Top 12.
+- **In-Place Rich Live TUI & Audit Event Logging (`apex/cockpit/tui_dashboard.py`, `apex_runner.py`):**
+  - Rendered the dashboard loop in-place via `rich.live.Live` and logged `VETO` events (with model used and Z3 status) into the bottom `Last 5 Execution & Aegis Audit Events` table.
+- **Verification Suite:** Added `tests/test_phase9_hotfixes.py` (**60/60** total tests passing).
+
+---
+
 ## [2.3.0] - 2026-11-12
 
 ### Added

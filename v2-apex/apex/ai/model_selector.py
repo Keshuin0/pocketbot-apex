@@ -51,6 +51,7 @@ class DiscoveredModel:
     model_id: str
     provider: str  # "studio_api" or "agy_pro"
     tier: ModelTier
+    family: str = ""
     display_name: str = ""
     rpm_limit: int = 15
     rpd_limit: int = 1500
@@ -97,6 +98,30 @@ class RankedModelChoice:
     model: DiscoveredModel
     score: float
     reason: str
+
+
+def classify_model_family(model_id: str) -> str:
+    """Group a model ID into its quota/billing family (e.g., argon, hydrogen, flash, pro)."""
+    low = model_id.lower().strip()
+    if low == "default":
+        return "default"
+    if "argon" in low or "orchestrator" in low:
+        return "argon"
+    if "hydrogen" in low:
+        return "hydrogen"
+    if "flash" in low:
+        return "flash"
+    if "claude-opus" in low:
+        return "claude-opus"
+    if "claude-sonnet" in low:
+        return "claude-sonnet"
+    if "gpt-oss" in low:
+        return "gpt-oss"
+    if "2.5-pro" in low:
+        return "gemini-2.5-pro"
+    if "pro" in low:
+        return "pro"
+    return low.split("-")[0] if "-" in low else low
 
 
 def classify_model_tier(model_id: str) -> ModelTier:
@@ -153,8 +178,59 @@ class AdaptiveModelSelector:
         self.soft_pro_threshold_pct: float = float(soft_pro_threshold_pct)
         self.discovery_ttl_seconds: float = float(discovery_ttl_seconds)
         self._models: dict[tuple[str, str], DiscoveredModel] = {}
+        self._family_cooldowns: dict[tuple[str, str], tuple[float, str]] = {}
+        self._last_verified_model: dict[str, str] = {}
         self._last_studio_discovery_utc: float = 0.0
         self._last_agy_discovery_utc: float = 0.0
+
+    def quarantine_family(
+        self,
+        provider: str,
+        family: str,
+        duration_seconds: float = 3600.0,
+        reason: str = "",
+        now_utc: float | None = None,
+    ) -> None:
+        """Quarantine an entire model family (e.g., all gemini-4-argon-* variants) on credit/quota exhaustion."""
+        ts = now_utc if now_utc is not None else time.time()
+        fam = (family or "").lower().strip()
+        if not fam or fam == "default":
+            return
+        until_ts = ts + float(duration_seconds)
+        prev_until, _ = self._family_cooldowns.get((provider, fam), (0.0, ""))
+        if until_ts > prev_until:
+            self._family_cooldowns[(provider, fam)] = (until_ts, reason[:120])
+        for m in self.get_models(provider):
+            m_fam = m.family or classify_model_family(m.model_id)
+            if m_fam == fam:
+                m.cooldown_until_utc = max(m.cooldown_until_utc, until_ts)
+                if reason:
+                    m.last_error = reason[:120]
+        if self._last_verified_model.get(provider):
+            if classify_model_family(self._last_verified_model[provider]) == fam:
+                self._last_verified_model.pop(provider, None)
+
+    def is_family_quarantined(
+        self,
+        provider: str,
+        family: str,
+        now_utc: float | None = None,
+    ) -> tuple[bool, int, str]:
+        """Return `(quarantined, remaining_seconds, reason)` for `(provider, family)`."""
+        ts = now_utc if now_utc is not None else time.time()
+        fam = (family or "").lower().strip()
+        until_ts, reason = self._family_cooldowns.get((provider, fam), (0.0, ""))
+        if ts < until_ts:
+            return True, max(1, int(until_ts - ts)), reason
+        return False, 0, ""
+
+    def has_any_quarantined_family(self, provider: str, now_utc: float | None = None) -> bool:
+        """Return True if at least one named family for `provider` is currently quarantined."""
+        ts = now_utc if now_utc is not None else time.time()
+        return any(
+            prov == provider and ts < until_ts
+            for (prov, _fam), (until_ts, _reason) in self._family_cooldowns.items()
+        )
 
     def register_model(
         self,
@@ -181,6 +257,7 @@ class AdaptiveModelSelector:
             model_id=model_id,
             provider=provider,
             tier=resolved_tier,
+            family=classify_model_family(model_id),
             display_name=display_name or model_id,
             rpm_limit=rpm_limit if rpm_limit is not None else def_rpm,
             rpd_limit=rpd_limit if rpd_limit is not None else def_rpd,
@@ -372,6 +449,11 @@ class AdaptiveModelSelector:
         model.reset_daily_if_needed()
         model.prune_minute_window(ts)
 
+        fam = model.family or classify_model_family(model.model_id)
+        fam_q, fam_rem, fam_reason = self.is_family_quarantined(model.provider, fam, now_utc=ts)
+        if fam_q:
+            return -1.0, f"family '{fam}' quarantined ({fam_rem}s: {fam_reason or 'quota'})"
+
         if ts < model.cooldown_until_utc:
             rem = int(model.cooldown_until_utc - ts)
             return -1.0, f"cooldown ({rem}s)"
@@ -461,6 +543,28 @@ class AdaptiveModelSelector:
         candidates.sort(key=lambda c: c.score, reverse=True)
         return candidates
 
+    def rank_cross_family_candidates(
+        self,
+        provider: str,
+        stakes: SetupStakes,
+        now_utc: float | None = None,
+    ) -> list[RankedModelChoice]:
+        """Pick the highest-scoring model from EACH distinct non-quarantined model family."""
+        ts = now_utc if now_utc is not None else time.time()
+        ranked = self.rank_models(provider, stakes, now_utc=ts)
+        seen_families: set[str] = set()
+        cross_family: list[RankedModelChoice] = []
+        has_named = any((c.model.family or classify_model_family(c.model.model_id)) != "default" for c in ranked)
+        for choice in ranked:
+            fam = choice.model.family or classify_model_family(choice.model.model_id)
+            if fam == "default" and (has_named or self.has_any_quarantined_family(provider, now_utc=ts)):
+                continue
+            if fam in seen_families:
+                continue
+            seen_families.add(fam)
+            cross_family.append(choice)
+        return cross_family
+
     def record_success(
         self,
         provider: str,
@@ -479,6 +583,7 @@ class AdaptiveModelSelector:
         model.consecutive_errors = 0
         model.cooldown_until_utc = 0.0
         model.last_error = ""
+        self._last_verified_model[provider] = model_id
 
         if model.sample_count == 0:
             model.ewma_latency_ms = float(latency_ms)
@@ -505,11 +610,13 @@ class AdaptiveModelSelector:
             # Model retired or unsupported -> quarantine 1 hour
             model.cooldown_until_utc = ts + 3600.0
         elif is_quota_or_429 or any(
-            tok in low_err for tok in ("429", "quota", "rate", "exhaust", "resource_exhausted", "credits", "balance")
+            tok in low_err
+            for tok in ("429", "quota", "rate", "exhaust", "resource_exhausted", "credits", "balance", "too low")
         ):
-            # Exponential backoff: 60s -> 120s -> 240s -> 480s -> 960s
-            backoff = 60.0 * (2 ** min(model.consecutive_errors - 1, 4))
-            model.cooldown_until_utc = ts + backoff
+            # Quarantine the entire model family for 60 minutes so we never waste retries on -low/-medium siblings
+            fam = model.family or classify_model_family(model_id)
+            self.quarantine_family(provider, fam, duration_seconds=3600.0, reason=error_msg[:120], now_utc=ts)
+            model.cooldown_until_utc = max(model.cooldown_until_utc, ts + 3600.0)
         elif model.consecutive_errors >= 2:
             # Repeated timeout/error -> 10 min cooldown
             model.cooldown_until_utc = ts + 600.0
@@ -568,16 +675,18 @@ class AdaptiveModelSelector:
                 "health": "COOLDOWN",
                 "calls_today": calls_today,
                 "avg_latency_s": 0.0,
-                "selected_model": models[0].model_id,
+                "selected_model": "all_families_exhausted",
             }
 
-        # Rank with neutral stakes for display
+        # Rank with neutral stakes for display, preferring the last live-verified working model if still active
         ranked = self.rank_models(
             provider,
             SetupStakes(stakes_score=0.3, is_high_stakes=False, is_urgent=False),
             now_utc=ts,
         )
-        best = ranked[0].model if ranked else active_models[0]
+        verified_id = self._last_verified_model.get(provider)
+        verified_model = next((c.model for c in ranked if c.model.model_id == verified_id), None)
+        best = verified_model or (ranked[0].model if ranked else active_models[0])
         avg_lat_s = best.ewma_latency_ms / 1000.0
         health = "CONSERVING" if conserving else "HEALTHY"
         return {

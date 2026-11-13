@@ -15,7 +15,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
-from apex.cockpit.tui_dashboard import SymbolCockpitRow
+from apex.cockpit.tui_dashboard import BrokerExecutionEvent, SymbolCockpitRow
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import AssetClass, DiscoveredSymbol, Side, Tick
@@ -101,6 +101,7 @@ class UniverseScanner:
         self.alias_mapper: SmartAliasMapper = SmartAliasMapper()
         self.contagion_oracle: ContagionOracle = ContagionOracle()
         self.last_contagion: ContagionTelemetry | None = None
+        self.recent_audit_events: list[BrokerExecutionEvent] = []
         self._cached_catalog: list[DiscoveredSymbol] = []
         self._last_catalog_discovery_time: float = 0.0
 
@@ -222,18 +223,31 @@ class UniverseScanner:
         else:
             hurst = 0.50
 
-        # Spread penalty: tighter spread = higher score
-        spread_factor = 1.0 / (1.0 + max(0.0, spread_pips - 2.0) * 0.1)
+        # Spread penalty: tighter spread & lower spread/ATR = higher score (penalize wide-spread exotics)
+        spread_to_atr = tick.spread / max(safe_atr, 1e-9)
+        spread_factor = 1.0 / (
+            1.0 + max(0.0, spread_pips - 2.0) * 0.18 + max(0.0, spread_to_atr - 0.12) * 8.0
+        )
+        if spread_pips > 12.0:
+            spread_factor *= 0.35
+
+        # Penalize MEAN_REVERTING_CHOP (H < 0.50 or ER < 0.18) so TRENDING_EXPANSION majors/indices rank Top 12
+        if hurst < 0.50 or er < 0.18:
+            regime_multiplier = 0.20
+        elif hurst >= 0.55 and er >= 0.25:
+            regime_multiplier = 1.35
+        else:
+            regime_multiplier = 1.0
 
         # Composite Mover Score:
-        # 40% Kaufman ER + 30% Impulse Body Ratio + 30% Volatility/Return * Spread Quality
+        # 40% Kaufman ER + 30% Impulse Body Ratio + 30% Volatility/Return * Spread Quality * Regime Quality
         pct_return_score = min(abs(closes[-1] - closes[0]) / max(closes[0], 1e-6) * 1000.0, 50.0)
         mover_score = (
             (er * 40.0)
             + (min(body_ratio, 3.0) * 10.0)
             + (pct_return_score * 0.4)
             + (max(0.0, hurst - 0.50) * 40.0)
-        ) * spread_factor
+        ) * spread_factor * regime_multiplier
 
         return CandidatePreScore(
             symbol=sym,
@@ -468,6 +482,24 @@ class UniverseScanner:
             )
             ai_decision = self.ai_committee.evaluate_sync(ctx)
             ai_label = f"{ai_decision.decision} ({ai_decision.confidence:.2f} via {ai_decision.provider_used})"
+            if ai_decision.decision == "VETO":
+                z3_tag = "Z3:PASS" if ai_decision.aegis_verified else "Z3:BYPASS"
+                self.recent_audit_events.append(
+                    BrokerExecutionEvent(
+                        timestamp_str=time.strftime("%H:%M:%S", time.gmtime()),
+                        symbol=sym,
+                        side="BUY",
+                        lots=0.0,
+                        price=entry_px,
+                        stop_loss=stop_px,
+                        take_profit=target_px,
+                        venue=f"AI/{ai_decision.provider_used.upper()}",
+                        status="VETO",
+                        details=f"model={ai_decision.model_used} | {z3_tag} | {ai_decision.reason[:80]}",
+                    )
+                )
+                if len(self.recent_audit_events) > 20:
+                    self.recent_audit_events = self.recent_audit_events[-20:]
 
         return SymbolCockpitRow(
             symbol=sym,
@@ -498,6 +530,8 @@ class UniverseScanner:
         now_utc: float | None = None,
     ) -> tuple[list[SymbolCockpitRow], UniverseScanSummary]:
         """Execute a full two-stage funnel scan cycle."""
+        # Recompute fresh ground-truth contagion & rollover telemetry on every cycle
+        self.last_contagion = self.contagion_oracle.evaluate(feed_router=self.feed_router)
         candidates, summary = self.sweep_universe(target_symbols=target_symbols, now_utc=now_utc)
         top_candidates = candidates if target_symbols is not None else candidates[: self.max_candidates_per_cycle]
 
