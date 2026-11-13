@@ -21,12 +21,59 @@ logger = logging.getLogger("apex.cockpit.web")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 INDEX_HTML_PATH = STATIC_DIR / "index.html"
 
-CHROME_CANDIDATES = (
-    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-)
+def _query_windows_app_path(exe_name: str) -> Optional[str]:
+    """Query HKLM/HKCU App Paths registry for a browser executable on Windows."""
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    subkey = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(hive, subkey) as key:
+                val, _ = winreg.QueryValueEx(key, "")
+                if val and os.path.isfile(str(val)):
+                    return str(val)
+        except OSError:
+            continue
+    return None
+
+
+def find_browser_executable() -> Optional[str]:
+    """Locate Chrome (preferred) or Edge executable reliably across standard Windows paths & Registry."""
+    env_dirs = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.environ.get("LocalAppData", ""),
+    ]
+    chrome_candidates: list[str] = [
+        os.path.join(d, "Google", "Chrome", "Application", "chrome.exe")
+        for d in env_dirs
+        if d
+    ]
+    for path in chrome_candidates:
+        if os.path.isfile(path):
+            return path
+
+    reg_chrome = _query_windows_app_path("chrome.exe")
+    if reg_chrome:
+        return reg_chrome
+
+    edge_candidates: list[str] = [
+        os.path.join(d, "Microsoft", "Edge", "Application", "msedge.exe")
+        for d in env_dirs
+        if d
+    ]
+    for path in edge_candidates:
+        if os.path.isfile(path):
+            return path
+
+    reg_edge = _query_windows_app_path("msedge.exe")
+    if reg_edge:
+        return reg_edge
+
+    return shutil.which("chrome") or shutil.which("msedge")
 
 
 def launch_chrome_app(url: str, no_gui: bool = False) -> Optional[subprocess.Popen[bytes]]:
@@ -38,29 +85,35 @@ def launch_chrome_app(url: str, no_gui: bool = False) -> Optional[subprocess.Pop
     if os.environ.get("PYTEST_CURRENT_TEST"):
         return None
 
-    exe_path: Optional[str] = None
-    for candidate in CHROME_CANDIDATES:
-        if os.path.isfile(candidate):
-            exe_path = candidate
-            break
-    if exe_path is None:
-        exe_path = shutil.which("chrome") or shutil.which("msedge")
-    if exe_path is None:
-        logger.warning("Chrome/Edge executable not found; open %s manually.", url)
-        return None
+    exe_path = find_browser_executable()
+    if exe_path is not None:
+        try:
+            creationflags = 0
+            if os.name == "nt":
+                creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
+                    subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200
+                )
+            proc = subprocess.Popen(
+                [exe_path, f"--app={url}", "--new-window", "--window-size=1480,920"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            logger.info("Launched standalone cockpit app: %s --app=%s", exe_path, url)
+            return proc
+        except Exception as exc:
+            logger.warning("Failed to launch cockpit browser window: %s", exc)
 
-    try:
-        proc = subprocess.Popen(
-            [exe_path, f"--app={url}", "--window-size=1480,920"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-        )
-        logger.info("Launched standalone cockpit app: %s --app=%s", exe_path, url)
-        return proc
-    except Exception as exc:
-        logger.warning("Failed to launch cockpit browser window: %s", exc)
-        return None
+    if hasattr(os, "startfile"):
+        try:
+            os.startfile(url)  # type: ignore[attr-defined]
+            logger.info("Opened cockpit URL via os.startfile: %s", url)
+        except Exception as exc:
+            logger.warning("os.startfile(%s) failed: %s", url, exc)
+    else:
+        logger.warning("Chrome/Edge executable not found; open %s manually.", url)
+    return None
 
 
 def _default_state(csrf_token: str) -> dict[str, Any]:

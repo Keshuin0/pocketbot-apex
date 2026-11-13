@@ -138,7 +138,7 @@ class ApexTUIDashboard:
             )
 
         header_text = (
-            f"[bold cyan]POCKETBOT APEX v2.3[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
+            f"[bold cyan]POCKETBOT APEX v2.4.1[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
             f"[bold bright_cyan]{mesh_badge}[/bold bright_cyan] (cTrader: {ct_badge} | MT5: {mt5_badge}) | "
             f"SOR Saved: [bold green]+{sor_saved_pips:.1f}p ({sor_saved_usd:,.2f} {account_currency})[/bold green]\n"
             f"[bold magenta]{ai_brain_badge}[/bold magenta] | "
@@ -157,20 +157,20 @@ class ApexTUIDashboard:
             expand=True,
             header_style="bold cyan",
         )
-        table.add_column("Symbol", style="bold white")
-        table.add_column("Tier / TF")
-        table.add_column("Bid / Ask", justify="right")
-        table.add_column("Spread", justify="right")
-        table.add_column("Best Venue")
-        table.add_column("Market Regime")
-        table.add_column("Hurst / ER", justify="right")
-        table.add_column("L2 DOM OBI")
-        table.add_column("TM net_avg_R", justify="right")
-        table.add_column("Q-Kelly Risk", justify="right")
-        table.add_column("AI Veto")
-        table.add_column("Ledger State")
+        table.add_column("Symbol", style="bold white", no_wrap=True)
+        table.add_column("Tier / TF", no_wrap=True)
+        table.add_column("Bid / Ask", justify="right", no_wrap=True)
+        table.add_column("Spread", justify="right", no_wrap=True)
+        table.add_column("Best Venue", no_wrap=True)
+        table.add_column("Market Regime", no_wrap=True)
+        table.add_column("Hurst / ER", justify="right", no_wrap=True)
+        table.add_column("L2 DOM OBI", no_wrap=True)
+        table.add_column("TM net_avg_R", justify="right", no_wrap=True)
+        table.add_column("Q-Kelly Risk", justify="right", no_wrap=True)
+        table.add_column("AI Veto", no_wrap=True)
+        table.add_column("Ledger State", no_wrap=True)
 
-        for r in rows:
+        for r in list(rows)[:12]:
             price_fmt = f"{r.bid:.5f} / {r.ask:.5f}" if r.bid < 10.0 else f"{r.bid:.2f} / {r.ask:.2f}"
             net_r_str = (
                 f"[green]{r.net_avg_r:+.3f}R[/green]"
@@ -204,20 +204,20 @@ class ApexTUIDashboard:
             )
 
         events_table = Table(
-            title="Last 5 Execution & Aegis Audit Events",
+            title="Last 3 Execution & Aegis Audit Events",
             expand=True,
             header_style="bold yellow",
         )
-        events_table.add_column("Time UTC", style="dim", width=12)
-        events_table.add_column("Symbol", style="bold white", width=10)
-        events_table.add_column("Side", width=6)
-        events_table.add_column("Lots", justify="right", width=8)
-        events_table.add_column("Price / SL / TP", width=28)
-        events_table.add_column("Venue / Status", width=22)
-        events_table.add_column("AI Model / Aegis Proof / MT5 RetCode", style="dim")
+        events_table.add_column("Time UTC", style="dim", width=10, no_wrap=True)
+        events_table.add_column("Symbol", style="bold white", width=10, no_wrap=True)
+        events_table.add_column("Side", width=5, no_wrap=True)
+        events_table.add_column("Lots", justify="right", width=6, no_wrap=True)
+        events_table.add_column("Price / SL / TP", width=26, no_wrap=True)
+        events_table.add_column("Venue / Status", width=20, no_wrap=True)
+        events_table.add_column("AI Model / Aegis Proof / MT5 RetCode", style="dim", no_wrap=True)
 
         if broker_events:
-            for ev in broker_events[-5:]:
+            for ev in list(broker_events)[-3:]:
                 st_color = (
                     "bold green"
                     if ev.status == "FILLED"

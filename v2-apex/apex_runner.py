@@ -165,7 +165,12 @@ class ApexOrchestrator:
                     hydra_nbbo=getattr(self.feed_router, "nbbo_engine", None),
                 )
 
-    def run_cycle(self, symbols: Sequence[str] | None = None, live: Live | None = None) -> list[SymbolCockpitRow]:
+    def run_cycle(
+        self,
+        symbols: Sequence[str] | None = None,
+        live: Live | None = None,
+        render_console_tui: bool = True,
+    ) -> list[SymbolCockpitRow]:
         """Run a full quantitative scan, regime classification, Time Machine v2, and ledger cycle."""
         active_src = self.feed_router.connect()
         use_funnel = symbols is None and self.config.get("scanner", {}).get("mode", "FULL_MARKET_FUNNEL") == "FULL_MARKET_FUNNEL"
@@ -218,28 +223,29 @@ class ApexOrchestrator:
             list(self.universe_scanner.recent_audit_events) + list(self.execution_router.recent_broker_events),
             key=lambda e: e.timestamp_str,
         )[-5:]
-        self.dashboard.print_snapshot(
-            run_mode=self.mode,
-            active_feed=active_src,
-            ctrader_connected=self.feed_router.ctrader.is_connected,
-            mt5_connected=self.feed_router.mt5.is_connected,
-            account_equity_usd=self.execution_router.account_equity_usd,
-            daily_pnl_usd=daily_pnl,
-            open_positions_count=len(open_positions),
-            rows=rows,
-            ai_brain_badge=ai_status.model_quota_badge,
-            mesh_badge=self.feed_router.dashboard_mesh_badge,
-            sor_saved_pips=sor_pips,
-            sor_saved_usd=sor_usd,
-            universe_scanned_count=self.last_scan_summary.open_scanned if self.last_scan_summary else 0,
-            universe_total_count=self.last_scan_summary.total_scanned if self.last_scan_summary else 0,
-            account_currency=account_currency,
-            broker_events=combined_events,
-            aegis_badge=aegis_summary["badge"],
-            contagion_shock_z=contagion_z,
-            mind_state_badge=mind_badge,
-            live=live,
-        )
+        if render_console_tui:
+            self.dashboard.print_snapshot(
+                run_mode=self.mode,
+                active_feed=active_src,
+                ctrader_connected=self.feed_router.ctrader.is_connected,
+                mt5_connected=self.feed_router.mt5.is_connected,
+                account_equity_usd=self.execution_router.account_equity_usd,
+                daily_pnl_usd=daily_pnl,
+                open_positions_count=len(open_positions),
+                rows=rows,
+                ai_brain_badge=ai_status.model_quota_badge,
+                mesh_badge=self.feed_router.dashboard_mesh_badge,
+                sor_saved_pips=sor_pips,
+                sor_saved_usd=sor_usd,
+                universe_scanned_count=self.last_scan_summary.open_scanned if self.last_scan_summary else 0,
+                universe_total_count=self.last_scan_summary.total_scanned if self.last_scan_summary else 0,
+                account_currency=account_currency,
+                broker_events=combined_events,
+                aegis_badge=aegis_summary["badge"],
+                contagion_shock_z=contagion_z,
+                mind_state_badge=mind_badge,
+                live=live,
+            )
         if self.web_cockpit is not None:
             self._push_web_cockpit_snapshot(
                 account_currency=account_currency,
@@ -492,6 +498,29 @@ class ApexOrchestrator:
         self.feed_router.shutdown()
 
 
+def format_web_cockpit_banner(cockpit_url: str, mode: str) -> str:
+    """Return a compact 5-line startup banner for the Web Cockpit engine console."""
+    return (
+        "============================================================\n"
+        f"  POCKETBOT APEX v2.4.1  |  Mode: {mode.upper()}\n"
+        f"  Chrome Cockpit URL: {cockpit_url}\n"
+        "  Keep this engine window minimized;\n"
+        "  view & control everything in the Chrome Cockpit window.\n"
+        "============================================================\n"
+    )
+
+
+def format_single_line_heartbeat(orchestrator: ApexOrchestrator) -> str:
+    """Return a single <100-char carriage-return heartbeat line that never wraps or scrolls."""
+    eq = orchestrator.execution_router.account_equity_usd
+    scanned = orchestrator.last_scan_summary.open_scanned if orchestrator.last_scan_summary else 0
+    total = orchestrator.last_scan_summary.total_scanned if orchestrator.last_scan_summary else 0
+    state = "PAUSED" if orchestrator.paused else "SCANNING"
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] APEX v2.4.1 | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
+    return line[:96].ljust(96)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PocketBot Apex — Institutional Dual-Broker Runner")
     parser.add_argument(
@@ -502,8 +531,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--config", default="config/apex_config.json", help="Path to apex_config.json")
     parser.add_argument("--once", action="store_true", help="Run one complete cycle and exit")
-    parser.add_argument("--dashboard", action="store_true", help="Run live Rich TUI dashboard loop")
-    parser.add_argument("--interval", type=float, default=15.0, help="Refresh interval in seconds")
+    parser.add_argument("--dashboard", action="store_true", help="Run live WebSocket Chrome App Cockpit loop")
+    parser.add_argument("--tui-only", action="store_true", help="Fallback to Rich terminal TUI instead of Chrome Cockpit")
+    parser.add_argument("--interval", type=float, default=5.0, help="Refresh interval in seconds")
     parser.add_argument("--web-port", type=int, default=8765, help="Localhost port for WebSocket Chrome App Cockpit")
     parser.add_argument("--no-gui", action="store_true", help="Do not auto-launch the Chrome/Edge cockpit window")
     parser.add_argument("--unlock-live", action="store_true", help="Unlock live trading (requires env var too)")
@@ -517,21 +547,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     web_server: WebCockpitServer | None = None
     try:
-        if args.once or not args.dashboard:
+        if args.once or (not args.dashboard and not args.tui_only):
             orchestrator.run_cycle()
             return 0
+
+        if args.tui_only:
+            with Live(
+                console=console,
+                refresh_per_second=4,
+                screen=True,
+                vertical_overflow="crop",
+            ) as live:
+                while True:
+                    if not orchestrator.paused:
+                        orchestrator.run_cycle(live=live, render_console_tui=True)
+                    time.sleep(max(1.0, args.interval))
+
         web_server = WebCockpitServer(port=int(args.web_port))
         orchestrator.attach_web_cockpit(web_server)
         cockpit_url = web_server.start()
-        console.print(f"[bold cyan]WebSocket Chrome App Cockpit live at {cockpit_url}[/bold cyan]")
+        sys.stdout.write(format_web_cockpit_banner(cockpit_url, args.mode))
+        sys.stdout.flush()
         launch_chrome_app(cockpit_url, no_gui=bool(args.no_gui))
-        with Live(console=console, refresh_per_second=4, screen=False) as live:
-            while True:
-                if not orchestrator.paused:
-                    orchestrator.run_cycle(live=live)
-                time.sleep(max(1.0, args.interval))
+
+        last_heartbeat = 0.0
+        scan_interval = max(1.0, float(args.interval))
+        while True:
+            if not orchestrator.paused:
+                orchestrator.run_cycle(render_console_tui=False)
+            now = time.monotonic()
+            if now - last_heartbeat >= 5.0:
+                sys.stdout.write("\r" + format_single_line_heartbeat(orchestrator))
+                sys.stdout.flush()
+                last_heartbeat = now
+            # Sleep in 1s steps so pause/shutdown stays responsive
+            remaining = scan_interval
+            while remaining > 0.0:
+                step = min(1.0, remaining)
+                time.sleep(step)
+                remaining -= step
+                now_tick = time.monotonic()
+                if now_tick - last_heartbeat >= 5.0:
+                    sys.stdout.write("\r" + format_single_line_heartbeat(orchestrator))
+                    sys.stdout.flush()
+                    last_heartbeat = now_tick
     except KeyboardInterrupt:
-        console.print("\n[yellow]PocketBot Apex stopped by user.[/yellow]")
+        sys.stdout.write("\nPocketBot Apex stopped by user.\n")
+        sys.stdout.flush()
         return 0
     finally:
         if web_server is not None:
