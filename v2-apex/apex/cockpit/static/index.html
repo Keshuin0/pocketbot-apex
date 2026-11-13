@@ -210,11 +210,11 @@
       <thead>
         <tr>
           <th>Symbol</th><th>Side</th><th class="num">Lots</th><th class="num">Entry</th>
-          <th class="num">SL / TP</th><th class="num">Floating P/L</th><th style="width:220px;">Bracket Progress</th>
+          <th class="num">SL / TP</th><th class="num">Floating P/L</th><th>In-Flight Trajectory (Stage | Fwd P(TP) | MFE/MAE)</th><th style="width:190px;">Bracket Progress</th>
         </tr>
       </thead>
       <tbody id="positions-body">
-        <tr><td colspan="7" class="muted">No open DEMO positions.</td></tr>
+        <tr><td colspan="8" class="muted">No open DEMO positions.</td></tr>
       </tbody>
     </table>
   </section>
@@ -370,7 +370,7 @@
       document.getElementById('pos-count').textContent = `${posList.length} active`;
       const posBody = document.getElementById('positions-body');
       if (!posList.length) {
-        posBody.innerHTML = '<tr><td colspan="7" class="muted">No open DEMO positions.</td></tr>';
+        posBody.innerHTML = '<tr><td colspan="8" class="muted">No open DEMO positions.</td></tr>';
       } else {
         posBody.innerHTML = posList.map(p => {
           const fp = Number(p.profit_usd || 0);
@@ -379,6 +379,10 @@
           if (tp !== sl && sl > 0 && tp > 0) {
             pct = Math.max(0, Math.min(100, ((curPx - sl) / (tp - sl)) * 100));
           }
+          const stage = esc(p.ratchet_stage || (p.grace_locked ? 'GRACE_LOCK' : 'ACTIVE'));
+          const fwdProb = Number(p.forward_prob_tp || 50).toFixed(0);
+          const mfe = Number(p.mfe_r || 0).toFixed(2);
+          const mae = Number(p.mae_r || 0).toFixed(2);
           return `<tr>
             <td><strong>${esc(p.symbol)}</strong></td>
             <td>${esc(p.side)}</td>
@@ -386,6 +390,7 @@
             <td class="num">${Number(p.entry_price || 0).toFixed(5)}</td>
             <td class="num">${sl.toFixed(4)} / ${tp.toFixed(4)}</td>
             <td class="num ${fp >= 0 ? 'pos' : 'neg'}">${fp >= 0 ? '+' : ''}${fp.toFixed(2)} ${cur}</td>
+            <td><span class="badge">${stage}</span> P(TP): ${fwdProb}% | MFE/MAE: ${mfe}R / ${mae}R</td>
             <td><div class="progress-wrap"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div></td>
           </tr>`;
         }).join('');

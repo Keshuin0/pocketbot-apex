@@ -26,6 +26,7 @@ from apex.quant.momentum_dom import (
     MomentumDOMGate,
     classify_instrument_tier,
 )
+from apex.quant.mtf_confluence import MTFConfluenceFilter
 from apex.quant.regime import RegimeClassifier, compute_hurst_exponent
 from apex.quant.timemachine_v2 import BlockBootstrapTimeMachine, TimeMachineCostModel
 
@@ -100,6 +101,12 @@ class UniverseScanner:
 
         self.alias_mapper: SmartAliasMapper = SmartAliasMapper()
         self.contagion_oracle: ContagionOracle = ContagionOracle()
+        mtf_cfg = self.config.get("filters", {}).get("mtf_confluence", {})
+        self.mtf_filter: MTFConfluenceFilter = MTFConfluenceFilter(
+            enabled=bool(mtf_cfg.get("enabled", True)),
+            ceiling_atr_buffer=float(mtf_cfg.get("ceiling_atr_buffer", 0.30)),
+            max_chase_atr_multiple=float(mtf_cfg.get("max_chase_atr_multiple", 2.2)),
+        )
         self.last_contagion: ContagionTelemetry | None = None
         self.recent_audit_events: list[BrokerExecutionEvent] = []
         self._cached_catalog: list[DiscoveredSymbol] = []
@@ -434,9 +441,20 @@ class UniverseScanner:
             cost_model=eff_cost_model,
         )
 
+        h1_candles = self.feed_router.get_candles(sym, timeframe="H1", count=40)
+        mtf_verdict = self.mtf_filter.evaluate(
+            symbol=sym,
+            side=Side.BUY,
+            entry_price=entry_px,
+            atr_m5=atr_val,
+            m5_candles=candles,
+            h1_candles=h1_candles,
+        )
+
         passed_all_quant = (
             diag.allow_breakout_entries
             and gate_verdict.passed
+            and mtf_verdict.passed
             and tm_res.net_avg_R >= self.min_net_avg_R
         )
 

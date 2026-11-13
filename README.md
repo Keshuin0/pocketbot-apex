@@ -162,7 +162,7 @@ You do **not** need any coding experience to use PocketBot Apex.
 1. **Download the Release:**
    Download `PocketBot_Apex_v2_Portable_Windows.zip` from [GitHub Releases](https://github.com/Keshuin0/pocketbot-apex/releases) and extract it anywhere on your computer (or USB pendrive).
 2. **Run First-Time Setup:**
-   Open the folder and double-click `0_FIRST_TIME_SETUP.bat`. It automatically verifies your system, installs 64-bit Python 3.12, creates a local `.venv`, installs all quantitative libraries (including `z3-solver` and `aiohttp`), runs 65 automated verification tests, and checks your MT5 connection.
+   Open the folder and double-click `0_FIRST_TIME_SETUP.bat`. It automatically verifies your system, installs 64-bit Python 3.12, creates a local `.venv`, installs all quantitative libraries (including `z3-solver` and `aiohttp`), runs 72 automated verification tests, and checks your MT5 connection.
 3. **Start Autonomous Trading, Web Cockpit, or Live Drill:**
    Double-click `2_START_APEX_AUTO_DEMO.bat` for hands-free autonomous trading + Chrome App Cockpit, `4_APEX_LIVE_DASHBOARD.bat` to launch the live `v2.4` WebSocket Chrome App Cockpit + 100x Historical Replay, `8_REFRESH_AI_BRAIN.bat` for 1-click Circadian Sleep-Wake Consolidation, or `9_TEST_FULL_LIFECYCLE_NOW.bat` for a 60s live `0.01`-lot MT5 Demo lifecycle drill!
 

@@ -214,6 +214,10 @@ class WalkForwardLedgerDB:
                 ("sor_pips_saved", "REAL NOT NULL DEFAULT 0.0"),
                 ("sor_usd_saved", "REAL NOT NULL DEFAULT 0.0"),
                 ("is_drill", "INTEGER NOT NULL DEFAULT 0"),
+                ("exit_price", "REAL"),
+                ("realized_pnl", "REAL"),
+                ("mfe_r", "REAL NOT NULL DEFAULT 0.0"),
+                ("mae_r", "REAL NOT NULL DEFAULT 0.0"),
             ]
             for col_name, col_def in migrations:
                 if col_name not in existing_cols:
@@ -922,6 +926,104 @@ class WalkForwardLedgerDB:
                 "regime_tag": "TOXIC_HOUR" if (len(vals) >= 5 and mean_r < -0.10) else ("HIGH_EDGE" if (len(vals) >= 5 and mean_r > 0.15) else "NEUTRAL"),
             }
         return priors
+
+    def close_trade_with_autopsy(
+        self,
+        order_id: str,
+        exit_price: float,
+        realized_net_r: float,
+        realized_pnl: float,
+        mfe_r: float,
+        mae_r: float,
+        symbol: str | None = None,
+    ) -> SymbolQuarantineState | None:
+        """Reconcile a closed deal's exit price, realized CAD P/L, realized R, MFE_R, and MAE_R."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, symbol, is_drill FROM trade_ledger WHERE order_id = ? ORDER BY id DESC LIMIT 1",
+                (str(order_id),),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    """
+                    UPDATE trade_ledger
+                    SET exit_price = ?, realized_net_r = ?, realized_pnl = ?,
+                        mfe_r = ?, mae_r = ?, is_closed = 1
+                    WHERE id = ?
+                    """,
+                    (
+                        float(exit_price),
+                        float(realized_net_r),
+                        float(realized_pnl),
+                        float(mfe_r),
+                        float(mae_r),
+                        int(row["id"]),
+                    ),
+                )
+                sym = str(row["symbol"]).upper()
+                if int(row["is_drill"]) == 0:
+                    return self.evaluate_quarantine(sym)
+                return None
+
+            if symbol:
+                norm_sym = symbol.upper()
+                conn.execute(
+                    """
+                    INSERT INTO trade_ledger (
+                        order_id, timestamp_utc, symbol, side, execution_mode, regime,
+                        predicted_net_r, ai_decision, ai_confidence, ai_reason,
+                        entry_price, executed_price, stop_loss, take_profit,
+                        realized_slippage_r, realized_net_r, is_closed, is_drill,
+                        exit_price, realized_pnl, mfe_r, mae_r
+                    ) VALUES (?, ?, ?, 'BUY', 'ACTIVE', 'RECONCILED', 0.25, 'APPROVE', 1.0, 'MT5_DEAL_RECONCILE',
+                              ?, ?, ?, ?, 0.0, ?, 1, 0, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(order_id),
+                        time.time(),
+                        norm_sym,
+                        float(exit_price),
+                        float(exit_price),
+                        float(exit_price),
+                        float(exit_price),
+                        float(realized_net_r),
+                        float(exit_price),
+                        float(realized_pnl),
+                        float(mfe_r),
+                        float(mae_r),
+                    ),
+                )
+                return self.evaluate_quarantine(norm_sym)
+        return None
+
+    def compute_mfe_mae_stats(self) -> dict[str, Any]:
+        """Compute closed-trade MFE_R, MAE_R, and capture ratio across non-drill trades."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT mfe_r, mae_r, realized_net_r
+                FROM trade_ledger
+                WHERE is_closed = 1 AND is_drill = 0 AND realized_net_r IS NOT NULL
+                ORDER BY id DESC
+                LIMIT 500
+                """
+            ).fetchall()
+        if not rows:
+            return {"closed_count": 0, "avg_mfe_r": 0.0, "avg_mae_r": 0.0, "avg_realized_r": 0.0, "capture_ratio": 0.0}
+        mfes = [float(r["mfe_r"] or 0.0) for r in rows]
+        maes = [float(r["mae_r"] or 0.0) for r in rows]
+        reals = [float(r["realized_net_r"] or 0.0) for r in rows]
+        avg_mfe = sum(mfes) / len(mfes)
+        avg_mae = sum(maes) / len(maes)
+        avg_real = sum(reals) / len(reals)
+        capture = (avg_real / avg_mfe) if avg_mfe > 1e-6 else 0.0
+        return {
+            "closed_count": len(rows),
+            "avg_mfe_r": round(avg_mfe, 4),
+            "avg_mae_r": round(avg_mae, 4),
+            "avg_realized_r": round(avg_real, 4),
+            "capture_ratio": round(capture, 4),
+        }
 
     def compute_conformal_quantiles(self, alpha: float = 0.10) -> dict[str, dict[str, Any]]:
         """Compute Split-Conformal non-conformity quantiles and Brier trust per provider/model."""

@@ -50,6 +50,7 @@ class SemanticMemorySnapshot:
     session_hour_priors: dict[str, dict[str, Any]] = field(default_factory=dict)
     conformal_models: dict[str, dict[str, Any]] = field(default_factory=dict)
     symbol_quarantine_states: dict[str, str] = field(default_factory=dict)
+    mfe_mae_stats: dict[str, Any] = field(default_factory=dict)
     trades_consolidated: int = 0
     audits_consolidated: int = 0
     sha256: str = ""
@@ -73,6 +74,7 @@ class SemanticMemorySnapshot:
             session_hour_priors=dict(data.get("session_hour_priors", {})),
             conformal_models=dict(data.get("conformal_models", {})),
             symbol_quarantine_states=dict(data.get("symbol_quarantine_states", {})),
+            mfe_mae_stats=dict(data.get("mfe_mae_stats", {})),
             trades_consolidated=int(data.get("trades_consolidated", 0)),
             audits_consolidated=int(data.get("audits_consolidated", 0)),
             sha256=str(data.get("sha256", "")),
@@ -244,6 +246,7 @@ class SleepWakeConsolidator:
         slippage_mults = self.ledger_db.compute_slippage_calibration_multipliers()
         hour_priors = self.ledger_db.compute_session_hour_priors()
         conformal_models = self.ledger_db.compute_conformal_quantiles()
+        mfe_mae_stats = self.ledger_db.compute_mfe_mae_stats()
         quarantine_states = {
             q.symbol: q.mode.value for q in self.ledger_db.list_all_quarantine_states()
         }
@@ -261,6 +264,7 @@ class SleepWakeConsolidator:
             session_hour_priors=hour_priors,
             conformal_models=conformal_models,
             symbol_quarantine_states=quarantine_states,
+            mfe_mae_stats=mfe_mae_stats,
             trades_consolidated=trades_cnt,
             audits_consolidated=audits_cnt,
         )
