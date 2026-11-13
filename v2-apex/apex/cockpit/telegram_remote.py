@@ -15,13 +15,15 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import aiohttp
 from dotenv import load_dotenv
 
-from apex.execution.router import DualBrokerExecutionRouter
 from apex.ledger.walkforward_db import WalkForwardLedgerDB
+
+if TYPE_CHECKING:
+    from apex.execution.router import DualBrokerExecutionRouter
 
 logger = logging.getLogger(__name__)
 

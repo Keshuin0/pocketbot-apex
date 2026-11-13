@@ -33,6 +33,7 @@ from apex.cockpit.replay_engine import HistoricalReplayEngine
 from apex.cockpit.telegram_remote import TelegramRemoteController
 from apex.cockpit.tui_dashboard import ApexTUIDashboard, SymbolCockpitRow
 from apex.cockpit.web_cockpit import WebCockpitServer, launch_chrome_app
+from apex.execution.position_manager import AutonomousPositionOrchestrator
 from apex.execution.router import DualBrokerExecutionRouter, ExecutionOrderRequest
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import Side, verify_live_unlock
@@ -142,6 +143,11 @@ class ApexOrchestrator:
             config=self.config,
         )
         self.last_scan_summary: UniverseScanSummary | None = None
+        self.position_manager = AutonomousPositionOrchestrator(
+            regime_classifier=self.regime_classifier,
+            time_machine=self.time_machine,
+            ledger=self.ledger,
+        )
         self.web_cockpit: WebCockpitServer | None = None
         self.paused: bool = False
         self._bg_lock = threading.Lock()
@@ -200,6 +206,36 @@ class ApexOrchestrator:
             bal = float(acct_info.get("balance", 0.0))
             if eq > 0.0 and bal > 0.0:
                 daily_pnl = eq - bal
+
+        # In-Flight Multi-Agent Trajectory Orchestrator & Closed-Deal Autopsy
+        contagion_z_live = self.universe_scanner.last_contagion.cross_asset_shock_z if self.universe_scanner.last_contagion else 0.0
+        if self.feed_router.mt5.is_connected:
+            raw_mt5_positions = self.feed_router.mt5.get_open_positions()
+            open_tickets = {int(p.get("ticket", 0)) for p in raw_mt5_positions if int(p.get("ticket", 0)) > 0}
+            for p in raw_mt5_positions:
+                tkt = int(p.get("ticket", 0))
+                raw_sym = str(p.get("symbol", ""))
+                if tkt <= 0 or not raw_sym:
+                    continue
+                is_buy = int(p.get("type", 0)) == 0
+                pos_candles = self.feed_router.get_candles(raw_sym, timeframe="M5", count=60)
+                pos_tick = self.feed_router.mt5.get_tick(raw_sym)
+                self.position_manager.evaluate_position(
+                    ticket=tkt,
+                    symbol=raw_sym,
+                    side=Side.BUY if is_buy else Side.SELL,
+                    entry_price=float(p.get("price_open", 0.0)),
+                    current_sl=float(p.get("sl", 0.0)),
+                    current_tp=float(p.get("tp", 0.0)),
+                    mark_price=float(p.get("price_current", p.get("price_open", 0.0))),
+                    candles=pos_candles,
+                    spread_price=pos_tick.spread if pos_tick else 0.0,
+                    cross_asset_shock_z=contagion_z_live,
+                    opened_at_utc=float(p.get("time", time.time())),
+                    lots=float(p.get("volume", 0.01)),
+                    execute_broker_actions=(self.mode == "demo-auto"),
+                )
+            self.position_manager.reconcile_closed_deals(open_tickets)
 
         # In demo-auto or shadow-ab mode, automatically dispatch approved rows
         if self.mode in ("demo-auto", "shadow-ab"):
@@ -361,8 +397,11 @@ class ApexOrchestrator:
                 {f"{prov}:{fam}" for (prov, fam), (until_ts, _) in cooldowns.items() if until_ts > now}
             )
 
+        trajectories = self.position_manager.get_cockpit_trajectories()
         serialized_positions = []
         for pos in open_positions:
+            sym_key = str(getattr(pos, "symbol", "")).upper()
+            traj = trajectories.get(sym_key, {})
             entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
             curr_px = float(getattr(pos, "current_price", entry_px) or entry_px)
             sl_px = float(getattr(pos, "stop_loss", 0.0) or 0.0)
@@ -377,6 +416,12 @@ class ApexOrchestrator:
                     "stop_loss": sl_px,
                     "take_profit": tp_px,
                     "profit_usd": float(getattr(pos, "profit_usd", 0.0) or 0.0),
+                    "ratchet_stage": traj.get("ratchet_stage", "ACTIVE"),
+                    "forward_prob_tp": traj.get("forward_prob_tp", 50.0),
+                    "forward_ev_r": traj.get("forward_ev_r", 0.0),
+                    "mfe_r": traj.get("mfe_r", 0.0),
+                    "mae_r": traj.get("mae_r", 0.0),
+                    "grace_locked": traj.get("grace_locked", False),
                 }
             )
 

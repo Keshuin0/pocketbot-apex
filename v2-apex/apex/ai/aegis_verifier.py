@@ -500,6 +500,83 @@ class AegisVerifier:
             )
         return "APPROVE", f"Z3 Axiom Gate SAT ({lat_ms:.2f}ms)"
 
+    @staticmethod
+    def verify_z3_inflight_trajectory(
+        *,
+        proposed_action: str,
+        bars_held: int,
+        min_hold_bars: int,
+        abs_move_atr: float,
+        cross_asset_shock_z: float,
+        forward_ev_r: float,
+        current_r: float,
+        invalidation_signals: int,
+        is_zombie_decay: bool = False,
+        is_weekend_close: bool = False,
+    ) -> tuple[bool, float, str]:
+        """Shield 8: Formal Z3 SMT proof for in-flight position actions (HOLD vs EARLY_EXIT vs RATCHET)."""
+        t0 = time.perf_counter()
+        solver = z3.Solver()
+
+        action_norm = proposed_action.upper().strip()
+        is_early_exit = action_norm == "EARLY_EXIT"
+
+        z_exit = z3.Bool("is_early_exit")
+        z_bars = z3.Int("bars_held")
+        z_min_bars = z3.Int("min_hold_bars")
+        z_move_atr = z3.Real("abs_move_atr")
+        z_shock = z3.Real("cross_asset_shock_z")
+        z_fwd_ev = z3.Real("forward_ev_r")
+        z_curr_r = z3.Real("current_r")
+        z_signals = z3.Int("invalidation_signals")
+        z_zombie = z3.Bool("is_zombie_decay")
+        z_weekend = z3.Bool("is_weekend_close")
+
+        solver.add(z_exit == z3.BoolVal(is_early_exit))
+        solver.add(z_bars == int(bars_held))
+        solver.add(z_min_bars == int(min_hold_bars))
+        solver.add(z_move_atr == _z3_real(float(abs_move_atr)))
+        solver.add(z_shock == _z3_real(float(cross_asset_shock_z)))
+        solver.add(z_fwd_ev == _z3_real(float(forward_ev_r)))
+        solver.add(z_curr_r == _z3_real(float(current_r)))
+        solver.add(z_signals == int(invalidation_signals))
+        solver.add(z_zombie == z3.BoolVal(bool(is_zombie_decay)))
+        solver.add(z_weekend == z3.BoolVal(bool(is_weekend_close)))
+
+        # Grace lock invariant: cannot early-exit during grace window & noise cone unless extreme flash-crash (Z > 4.2) or weekend shield
+        grace_locked = z3.And(
+            z_bars < z_min_bars,
+            z_move_atr <= z3.RealVal("0.65"),
+            z_shock <= z3.RealVal("4.2"),
+            z3.Not(z_weekend),
+        )
+        solver.add(z3.Implies(grace_locked, z3.Not(z_exit)))
+
+        # Thesis-invalidation early exit invariant: EV_hold < EV_exit_now (-0.25R floor) & >=3 signals,
+        # OR flash-crash shock Z > 4.2, OR zombie time-decay, OR Friday weekend-gap shield
+        valid_exit_basis = z3.Or(
+            z_shock > z3.RealVal("4.2"),
+            z_weekend,
+            z3.And(z_zombie, z_fwd_ev <= z3.RealVal("0.0")),
+            z3.And(z_fwd_ev < z3.RealVal("-0.25"), z_signals >= 3),
+        )
+        solver.add(z3.Implies(z_exit, valid_exit_basis))
+
+        chk = solver.check()
+        lat_ms = (time.perf_counter() - t0) * 1000.0
+        if chk == z3.unsat:
+            return (
+                False,
+                round(lat_ms, 3),
+                f"Z3_SHIELD8_UNSAT: {action_norm} blocked (bars={bars_held}/{min_hold_bars}, "
+                f"move_atr={abs_move_atr:.2f}, fwd_ev={forward_ev_r:+.2f}R, sigs={invalidation_signals})",
+            )
+        return (
+            True,
+            round(lat_ms, 3),
+            f"Z3_SHIELD8_SAT ({lat_ms:.2f}ms): EV_hold={forward_ev_r:+.2f}R vs curr={current_r:+.2f}R",
+        )
+
     # ------------------------------------------------------------------
     # Shield 5: Borderline Order-Swap Semantic Invariance
     # ------------------------------------------------------------------

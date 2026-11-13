@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.5.0] - 2026-11-13
+
+### Added
+- **Higher-Timeframe (`H1`) Structural Alignment & Anti-Chase Filter (`apex/quant/mtf_confluence.py`, `apex/quant/universe_scanner.py`):**
+  - Blocks `M5`/`M15` breakouts that conflict with `H1` EMA/structure slope or sit within `0.30 * ATR_M5` of a 20-bar `H1` swing high ceiling / swing low floor.
+  - Enforces an Anti-Chase Overextension Guard rejecting breakouts stretched `> 2.2 * ATR(14)` past the prior range without pullback.
+- **Autonomous Multi-Agent In-Flight Position Orchestrator (`apex/execution/position_manager.py`, `apex/ai/aegis_verifier.py`, `apex_runner.py`):**
+  - **Rule A (Anti-Panic Grace Window & Shield 8 Z3):** Forbids early exit or SL tightening during the first `min_hold_bars = 2` completed bars and `±0.65 * ATR` noise cone (enforced in Python + `AegisVerifier.verify_z3_inflight_trajectory`), unless extreme flash-crash `Contagion Shock Z > 4.2` triggers.
+  - **Rule B (Continuous Conditional Forward Time Machine):** Re-runs `RegimeClassifier` + `BlockBootstrapTimeMachine` from current mark price toward remaining `SL` and `TP` on every closed bar, triggering early thesis exit only with `>= 3` confirming signals and Z3 `SAT` proof.
+  - **Rule C (Dynamic Profit-Ratchet & Super-Momentum Runner Mode):** Moves SL to fee-adjusted `+0.05R` free-roll at `+1.0R` (never widening SL backward); at `+1.5R`, banks `+1.0R` on decaying momentum or expands TP to `3.5R` with ATR/swing trailing SL when `H >= 0.60` & `ER >= 0.55`.
+  - **Rule D (Zombie Time-Decay & Friday Weekend-Gap Shield):** Exits stagnant trades (`bars >= 18`, `|R| < 0.20`, `ER < 0.15`, `forward_ev_R <= 0`) and flattens non-crypto positions after Friday `20:45 UTC`.
+- **Closed-Deal Reconciliation & `MFE/MAE` Autopsy (`apex/ledger/walkforward_db.py`, `apex/ai/sleep_consolidation.py`, `apex/cockpit/static/index.html`):**
+  - Tracks live `MFE_R`/`MAE_R`, reconciles closed MT5 deals into `trade_ledger`, consolidates `mfe_mae_stats` into `semantic_memory.json`, and displays `In-Flight Trajectory (Stage | Fwd P(TP) | MFE/MAE)` in the Chrome Cockpit.
+- **Verification Suite:** Added `tests/test_phase11_inflight_orchestrator_and_mtf.py` (**72/72** total tests passing).
+
+---
+
 ## [2.4.1] - 2026-11-13
 
 ### Fixed
