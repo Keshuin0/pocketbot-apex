@@ -134,7 +134,8 @@ class WalkForwardLedgerDB:
                     winning_venue TEXT NOT NULL DEFAULT 'mt5',
                     mesh_topology TEXT NOT NULL DEFAULT 'MT5_SOLO',
                     sor_pips_saved REAL NOT NULL DEFAULT 0.0,
-                    sor_usd_saved REAL NOT NULL DEFAULT 0.0
+                    sor_usd_saved REAL NOT NULL DEFAULT 0.0,
+                    is_drill INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS sor_savings_ledger (
@@ -212,6 +213,7 @@ class WalkForwardLedgerDB:
                 ("mesh_topology", "TEXT NOT NULL DEFAULT 'MT5_SOLO'"),
                 ("sor_pips_saved", "REAL NOT NULL DEFAULT 0.0"),
                 ("sor_usd_saved", "REAL NOT NULL DEFAULT 0.0"),
+                ("is_drill", "INTEGER NOT NULL DEFAULT 0"),
             ]
             for col_name, col_def in migrations:
                 if col_name not in existing_cols:
@@ -280,6 +282,7 @@ class WalkForwardLedgerDB:
         mesh_topology: str = "MT5_SOLO",
         sor_pips_saved: float = 0.0,
         sor_usd_saved: float = 0.0,
+        is_drill: bool = False,
     ) -> SymbolQuarantineState:
         """Log a trade execution (and optional closed realized_net_r) and update Auto-Quarantine state."""
         ts = float(timestamp_utc if timestamp_utc is not None else time.time())
@@ -295,8 +298,8 @@ class WalkForwardLedgerDB:
                     predicted_net_r, ai_decision, ai_confidence, ai_reason, entry_price,
                     executed_price, stop_loss, take_profit, realized_slippage_r,
                     realized_net_r, is_closed, winning_venue, mesh_topology,
-                    sor_pips_saved, sor_usd_saved
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sor_pips_saved, sor_usd_saved, is_drill
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     order_id,
@@ -321,9 +324,12 @@ class WalkForwardLedgerDB:
                     str(mesh_topology),
                     float(sor_pips_saved),
                     float(sor_usd_saved),
+                    1 if is_drill else 0,
                 ),
             )
 
+        if is_drill:
+            return self.get_quarantine_state(norm_sym)
         return self.evaluate_quarantine(norm_sym)
 
     def log_sor_execution_savings(
@@ -375,7 +381,7 @@ class WalkForwardLedgerDB:
             if p1 > 0.0 or u1 > 0.0:
                 return p1, u1
             r2 = conn.execute(
-                "SELECT COALESCE(SUM(sor_pips_saved), 0.0) AS p, COALESCE(SUM(sor_usd_saved), 0.0) AS u FROM trade_ledger"
+                "SELECT COALESCE(SUM(sor_pips_saved), 0.0) AS p, COALESCE(SUM(sor_usd_saved), 0.0) AS u FROM trade_ledger WHERE is_drill = 0"
             ).fetchone()
             return (float(r2["p"]) if r2 else 0.0, float(r2["u"]) if r2 else 0.0)
 
@@ -435,7 +441,7 @@ class WalkForwardLedgerDB:
                 """
                 SELECT predicted_net_r, realized_net_r, execution_mode
                 FROM trade_ledger
-                WHERE symbol = ? AND is_closed = 1 AND realized_net_r IS NOT NULL
+                WHERE symbol = ? AND is_closed = 1 AND realized_net_r IS NOT NULL AND is_drill = 0
                 ORDER BY id DESC
                 LIMIT ?
                 """,
@@ -863,6 +869,7 @@ class WalkForwardLedgerDB:
                 """
                 SELECT symbol, winning_venue, realized_slippage_r
                 FROM trade_ledger
+                WHERE is_drill = 0
                 ORDER BY id DESC
                 LIMIT 500
                 """
@@ -892,7 +899,7 @@ class WalkForwardLedgerDB:
                 """
                 SELECT timestamp_utc, realized_net_r
                 FROM trade_ledger
-                WHERE is_closed = 1 AND realized_net_r IS NOT NULL
+                WHERE is_closed = 1 AND realized_net_r IS NOT NULL AND is_drill = 0
                 ORDER BY id DESC
                 LIMIT 1000
                 """

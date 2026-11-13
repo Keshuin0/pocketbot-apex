@@ -1,0 +1,474 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PocketBot Apex v2.4 — Live Institutional Cockpit</title>
+  <style>
+    :root {
+      --bg: #070b14;
+      --panel: #0f172a;
+      --panel-alt: #111827;
+      --border: #1e293b;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --green: #10b981;
+      --red: #f43f5e;
+      --amber: #f59e0b;
+      --cyan: #06b6d4;
+      --blue: #3b82f6;
+      --purple: #a855f7;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      line-height: 1.4;
+      padding: 14px;
+    }
+    .header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      background: linear-gradient(135deg, #0f172a 0%, #172554 100%);
+      border: 1px solid #1d4ed8;
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 12px;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .brand h1 { font-size: 17px; font-weight: 700; letter-spacing: 0.4px; color: #f8fafc; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 3px 9px; border-radius: 999px; font-size: 11px; font-weight: 600;
+      background: rgba(15, 23, 42, 0.75); border: 1px solid var(--border);
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); }
+    .dot.live { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .dot.err { background: var(--red); }
+
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .kpi-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .kpi-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .kpi-val { font-size: 16px; font-weight: 700; margin-top: 3px; color: #f8fafc; word-break: break-word; }
+    .kpi-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    .controls {
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 12px; margin-bottom: 12px;
+    }
+    button {
+      cursor: pointer; border: 1px solid var(--border); border-radius: 6px;
+      padding: 7px 12px; font-size: 12px; font-weight: 600; color: #f8fafc;
+      background: #1e293b; transition: all 0.15s ease;
+    }
+    button:hover { filter: brightness(1.15); transform: translateY(-1px); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-cyan { background: #0e7490; border-color: #06b6d4; }
+    .btn-blue { background: #1d4ed8; border-color: #3b82f6; }
+    .btn-amber { background: #b45309; border-color: #f59e0b; }
+    .btn-purple { background: #6b21a8; border-color: #a855f7; }
+    .btn-danger { background: #9f1239; border-color: #f43f5e; margin-left: auto; }
+    .control-msg { font-size: 12px; color: var(--cyan); margin-left: 8px; }
+
+    .split-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 12px;
+    }
+    @media (max-width: 1050px) { .split-grid { grid-template-columns: 1fr; } }
+
+    .panel {
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 12px; margin-bottom: 12px;
+    }
+    .panel-title {
+      font-size: 13px; font-weight: 700; color: #f8fafc;
+      margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;
+    }
+
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid var(--border); text-align: left; }
+    th {
+      color: var(--muted); font-size: 11px; text-transform: uppercase;
+      cursor: pointer; user-select: none; background: rgba(15, 23, 42, 0.9);
+    }
+    th:hover { color: var(--cyan); }
+    tr:hover td { background: rgba(30, 41, 59, 0.45); }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    .pos { color: var(--green); font-weight: 600; }
+    .neg { color: var(--red); font-weight: 600; }
+    .warn { color: var(--amber); font-weight: 600; }
+    .muted { color: var(--muted); }
+
+    @keyframes flashGreen { 0% { background: rgba(16,185,129,0.35); } 100% { background: transparent; } }
+    @keyframes flashRed { 0% { background: rgba(244,63,94,0.35); } 100% { background: transparent; } }
+    .flash-up { animation: flashGreen 0.7s ease-out; }
+    .flash-down { animation: flashRed 0.7s ease-out; }
+
+    .progress-wrap {
+      width: 100%; height: 10px; background: #1e293b; border-radius: 999px; overflow: hidden; margin-top: 4px;
+    }
+    .progress-fill { height: 100%; background: linear-gradient(90deg, var(--red), var(--amber), var(--green)); transition: width 0.25s ease; }
+
+    .badge {
+      display: inline-block; padding: 2px 7px; border-radius: 5px; font-size: 11px; font-weight: 600;
+      background: #1e293b; color: var(--text);
+    }
+    .badge-approve { background: rgba(16,185,129,0.2); color: #34d399; border: 1px solid rgba(16,185,129,0.4); }
+    .badge-veto { background: rgba(244,63,94,0.2); color: #fb7185; border: 1px solid rgba(244,63,94,0.4); }
+    .badge-idle { background: rgba(148,163,184,0.15); color: #94a3b8; }
+
+    svg.equity-chart { width: 100%; height: 110px; background: #070b14; border: 1px solid var(--border); border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="brand">
+      <h1>POCKETBOT APEX v2.4</h1>
+      <span class="pill" id="mode-pill">DEMO LOCKED</span>
+      <span class="pill"><span class="dot" id="ws-dot"></span><span id="ws-status">Connecting...</span></span>
+    </div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <span class="pill" id="mind-pill">Mind State: FRESH</span>
+      <span class="pill" id="universe-pill">Universe: 0 / 0</span>
+    </div>
+  </header>
+
+  <section class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label">Account Equity</div>
+      <div class="kpi-val" id="kpi-equity">--</div>
+      <div class="kpi-sub" id="kpi-pnl">Daily P/L: --</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Open Positions &amp; Mesh</div>
+      <div class="kpi-val" id="kpi-open">0 Open</div>
+      <div class="kpi-sub" id="kpi-mesh">Mesh: --</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Verified AI Model &amp; Families</div>
+      <div class="kpi-val" id="kpi-ai-model">--</div>
+      <div class="kpi-sub" id="kpi-ai-quarantined">Quarantined: None</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">Contagion Shock Z &amp; Aegis Z3</div>
+      <div class="kpi-val" id="kpi-contagion">Z = 0.00</div>
+      <div class="kpi-sub" id="kpi-aegis">Aegis Z3: --</div>
+    </div>
+  </section>
+
+  <section class="controls">
+    <button class="btn-amber" id="btn-pause" onclick="sendControl('pause')">Pause Scan</button>
+    <button class="btn-cyan" id="btn-drill" onclick="sendControl('drill')">Run 60s Live 0.01-Lot MT5 Drill</button>
+    <button class="btn-blue" id="btn-replay" onclick="sendControl('replay')">Run 100x Historical Replay</button>
+    <button class="btn-purple" id="btn-refresh" onclick="sendControl('refresh_ai')">Refresh AI Brain</button>
+    <button class="btn-danger" id="btn-panic" onclick="panicFlatten()">PANIC FLATTEN ALL DEMO POSITIONS</button>
+    <span class="control-msg" id="control-msg"></span>
+  </section>
+
+  <section class="split-grid">
+    <div class="panel" id="drill-panel">
+      <div class="panel-title">
+        <span>Live 0.01-Lot MT5 Lifecycle Drill</span>
+        <span class="badge" id="drill-status">IDLE</span>
+      </div>
+      <div id="drill-body" class="muted">Click "Run 60s Live 0.01-Lot MT5 Drill" to execute a live DEMO bracket order, stream P/L, test SLTP tighten, and settle.</div>
+    </div>
+
+    <div class="panel" id="replay-panel">
+      <div class="panel-title">
+        <span>100x Historical Market Replay (Isolated)</span>
+        <span class="badge" id="replay-status">IDLE</span>
+      </div>
+      <div id="replay-stats" class="muted" style="margin-bottom:6px;">Ready to replay 5 trading days of FusionMarkets M5/M15 candles.</div>
+      <svg class="equity-chart" id="replay-svg" viewBox="0 0 400 100" preserveAspectRatio="none">
+        <polyline id="replay-line" fill="none" stroke="#06b6d4" stroke-width="2" points="0,50 400,50" />
+      </svg>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-title">
+      <span>Open Positions (SL &larr; Entry &rarr; TP Progress)</span>
+      <span class="muted" id="pos-count">0 active</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th><th>Side</th><th class="num">Lots</th><th class="num">Entry</th>
+          <th class="num">SL / TP</th><th class="num">Floating P/L</th><th style="width:220px;">Bracket Progress</th>
+        </tr>
+      </thead>
+      <tbody id="positions-body">
+        <tr><td colspan="7" class="muted">No open DEMO positions.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <div class="panel-title">
+      <span>Top-12 Quantitative Funnel Matrix (Click Headers to Sort)</span>
+      <span class="muted" id="last-update">Waiting for first cycle...</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th onclick="setSort('symbol')">Symbol</th>
+          <th onclick="setSort('tier')">Tier / TF</th>
+          <th class="num" onclick="setSort('bid')">Bid / Ask</th>
+          <th class="num" onclick="setSort('spread_pips')">Spread</th>
+          <th onclick="setSort('best_venue')">Venue</th>
+          <th onclick="setSort('regime')">Regime</th>
+          <th class="num" onclick="setSort('hurst')">Hurst / ER</th>
+          <th class="num" onclick="setSort('obi')">DOM OBI</th>
+          <th class="num" onclick="setSort('net_avg_r')">TM net_avg_R</th>
+          <th class="num" onclick="setSort('rec_risk_pct')">Q-Kelly</th>
+          <th onclick="setSort('ai_verdict')">AI Veto</th>
+          <th onclick="setSort('quarantine_mode')">Ledger</th>
+        </tr>
+      </thead>
+      <tbody id="matrix-body">
+        <tr><td colspan="12" class="muted">Scanning universe...</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <div class="panel-title">
+      <span>Live Execution, Veto &amp; Aegis Audit Feed</span>
+      <span class="muted">Newest at bottom</span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Time UTC</th><th>Symbol</th><th>Side</th><th class="num">Lots</th>
+          <th>Price | SL | TP</th><th>Venue / Status</th><th>AI Model / Aegis Proof / MT5 RetCode</th>
+        </tr>
+      </thead>
+      <tbody id="events-body">
+        <tr><td colspan="7" class="muted">No execution or veto events yet.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <script>
+    let csrfToken = '';
+    let lastState = null;
+    let prevPrices = {};
+    let sortKey = 'net_avg_r';
+    let sortAsc = false;
+
+    function esc(s) {
+      return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function setSort(key) {
+      if (sortKey === key) sortAsc = !sortAsc;
+      else { sortKey = key; sortAsc = (key === 'symbol'); }
+      if (lastState) renderState(lastState);
+    }
+
+    async function sendControl(action) {
+      const msgEl = document.getElementById('control-msg');
+      msgEl.textContent = 'Sending ' + action + '...';
+      try {
+        const res = await fetch('/api/control/' + action, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Apex-CSRF': csrfToken },
+          body: '{}'
+        });
+        const data = await res.json();
+        msgEl.textContent = data.message || ('Action ' + action + ': ' + (data.ok ? 'OK' : 'Failed'));
+      } catch (e) {
+        msgEl.textContent = 'Error: ' + e.message;
+      }
+    }
+
+    function panicFlatten() {
+      if (confirm('PANIC FLATTEN ALL OPEN DEMO POSITIONS immediately?')) {
+        sendControl('panic_flatten');
+      }
+    }
+
+    function renderState(s) {
+      lastState = s;
+      if (s.csrf_token) csrfToken = s.csrf_token;
+
+      document.getElementById('mode-pill').textContent = (s.run_mode || 'DEMO').toUpperCase();
+      document.getElementById('mind-pill').textContent = s.mind_state_badge || 'Mind State: FRESH';
+      document.getElementById('universe-pill').textContent = `Universe: ${s.universe_scanned_count || 0} / ${s.universe_total_count || 0}`;
+
+      const cur = s.account_currency || 'CAD';
+      document.getElementById('kpi-equity').textContent = `${Number(s.account_equity || 0).toFixed(2)} ${cur}`;
+      const pnl = Number(s.daily_pnl || 0);
+      const pnlEl = document.getElementById('kpi-pnl');
+      pnlEl.textContent = `Daily P/L: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} ${cur}`;
+      pnlEl.className = 'kpi-sub ' + (pnl >= 0 ? 'pos' : 'neg');
+
+      document.getElementById('kpi-open').textContent = `${s.open_positions_count || 0} Open`;
+      document.getElementById('kpi-mesh').textContent = s.mesh_badge || 'HYDRA_AUTO';
+
+      document.getElementById('kpi-ai-model').textContent = s.verified_ai_model || s.ai_brain_badge || '--';
+      const qFam = (s.quarantined_families && s.quarantined_families.length)
+        ? s.quarantined_families.join(', ')
+        : 'None';
+      document.getElementById('kpi-ai-quarantined').textContent = `Quarantined Families: ${qFam}`;
+
+      const cz = Number(s.contagion_shock_z || 0);
+      const czEl = document.getElementById('kpi-contagion');
+      czEl.textContent = `Z = ${cz.toFixed(2)}`;
+      czEl.className = 'kpi-val ' + (cz >= 2.5 ? 'neg' : (cz >= 1.5 ? 'warn' : 'pos'));
+      document.getElementById('kpi-aegis').textContent = s.aegis_badge || 'Aegis Z3 Ready';
+
+      const pauseBtn = document.getElementById('btn-pause');
+      pauseBtn.textContent = s.paused ? 'Resume Scan' : 'Pause Scan';
+
+      // Drill panel
+      const d = s.drill_state || {};
+      document.getElementById('drill-status').textContent = d.status || 'IDLE';
+      if (d.message) {
+        const dPnl = d.floating_pnl !== undefined ? ` | Floating: ${Number(d.floating_pnl).toFixed(2)} ${cur}` : '';
+        const dTicket = d.ticket ? ` | Ticket #${d.ticket}` : '';
+        document.getElementById('drill-body').innerHTML =
+          `<strong>${esc(d.symbol || '')}</strong>${esc(dTicket)}${esc(dPnl)}<br>${esc(d.message)}`;
+      }
+
+      // Replay panel
+      const rp = s.replay_state || {};
+      document.getElementById('replay-status').textContent = rp.status || 'IDLE';
+      if (rp.message) {
+        document.getElementById('replay-stats').textContent = rp.message;
+      }
+      if (rp.equity_curve && rp.equity_curve.length >= 2) {
+        const vals = rp.equity_curve;
+        const minV = Math.min(...vals), maxV = Math.max(...vals);
+        const span = Math.max(1e-6, maxV - minV);
+        const pts = vals.map((v, i) => {
+          const x = (i / (vals.length - 1)) * 400;
+          const y = 90 - ((v - minV) / span) * 80;
+          return `${x.toFixed(1)},${y.toFixed(1)}`;
+        }).join(' ');
+        document.getElementById('replay-line').setAttribute('points', pts);
+      }
+
+      // Open positions
+      const posList = s.open_positions || [];
+      document.getElementById('pos-count').textContent = `${posList.length} active`;
+      const posBody = document.getElementById('positions-body');
+      if (!posList.length) {
+        posBody.innerHTML = '<tr><td colspan="7" class="muted">No open DEMO positions.</td></tr>';
+      } else {
+        posBody.innerHTML = posList.map(p => {
+          const fp = Number(p.profit_usd || 0);
+          let pct = 50;
+          const sl = Number(p.stop_loss || 0), tp = Number(p.take_profit || 0), curPx = Number(p.current_price || p.entry_price || 0);
+          if (tp !== sl && sl > 0 && tp > 0) {
+            pct = Math.max(0, Math.min(100, ((curPx - sl) / (tp - sl)) * 100));
+          }
+          return `<tr>
+            <td><strong>${esc(p.symbol)}</strong></td>
+            <td>${esc(p.side)}</td>
+            <td class="num">${Number(p.lots || 0).toFixed(2)}</td>
+            <td class="num">${Number(p.entry_price || 0).toFixed(5)}</td>
+            <td class="num">${sl.toFixed(4)} / ${tp.toFixed(4)}</td>
+            <td class="num ${fp >= 0 ? 'pos' : 'neg'}">${fp >= 0 ? '+' : ''}${fp.toFixed(2)} ${cur}</td>
+            <td><div class="progress-wrap"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div></td>
+          </tr>`;
+        }).join('');
+      }
+
+      // Top-12 Matrix
+      const rows = [...(s.rows || [])];
+      rows.sort((a, b) => {
+        const va = a[sortKey] ?? -999, vb = b[sortKey] ?? -999;
+        if (typeof va === 'string') return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
+        return sortAsc ? (va - vb) : (vb - va);
+      });
+      const mBody = document.getElementById('matrix-body');
+      if (!rows.length) {
+        mBody.innerHTML = '<tr><td colspan="12" class="muted">No active candidates in current cycle.</td></tr>';
+      } else {
+        mBody.innerHTML = rows.map(r => {
+          const prev = prevPrices[r.symbol];
+          let cls = '';
+          if (prev !== undefined && r.bid !== prev) cls = r.bid > prev ? 'flash-up' : 'flash-down';
+          prevPrices[r.symbol] = r.bid;
+          const netR = r.net_avg_r !== null && r.net_avg_r !== undefined ? `${r.net_avg_r >= 0 ? '+' : ''}${Number(r.net_avg_r).toFixed(3)}R` : '-';
+          const netCls = (r.net_avg_r || 0) > 0 ? 'pos' : 'neg';
+          const vStr = String(r.ai_verdict || 'IDLE');
+          const vBadge = vStr.startsWith('APPROVE') ? 'badge-approve' : (vStr.startsWith('VETO') ? 'badge-veto' : 'badge-idle');
+          return `<tr class="${cls}">
+            <td><strong>${esc(r.symbol)}</strong></td>
+            <td class="muted">${esc(r.timeframe)}</td>
+            <td class="num">${Number(r.bid).toFixed(r.bid < 10 ? 5 : 2)} / ${Number(r.ask).toFixed(r.bid < 10 ? 5 : 2)}</td>
+            <td class="num">${Number(r.spread_pips).toFixed(1)}p</td>
+            <td>${esc(r.best_venue)}</td>
+            <td>${esc(r.regime)}</td>
+            <td class="num">${Number(r.hurst).toFixed(2)} / ${Number(r.kaufman_er).toFixed(2)}</td>
+            <td class="num">${r.obi !== null && r.obi !== undefined ? Number(r.obi).toFixed(2) : '-'}</td>
+            <td class="num ${netCls}">${netR}</td>
+            <td class="num">${r.rec_risk_pct !== null && r.rec_risk_pct !== undefined ? Number(r.rec_risk_pct).toFixed(2) + '%' : '-'}</td>
+            <td><span class="badge ${vBadge}">${esc(vStr)}</span></td>
+            <td>${esc(r.quarantine_mode)}</td>
+          </tr>`;
+        }).join('');
+      }
+
+      // Events feed
+      const evs = s.broker_events || [];
+      const evBody = document.getElementById('events-body');
+      if (!evs.length) {
+        evBody.innerHTML = '<tr><td colspan="7" class="muted">No execution or veto events yet.</td></tr>';
+      } else {
+        evBody.innerHTML = evs.slice(-10).map(e => {
+          const st = String(e.status || '');
+          const stCls = st.includes('FILLED') || st.includes('SETTLED') ? 'pos' : (st.includes('VETO') || st.includes('BLOCK') || st.includes('REJECT') ? 'neg' : 'warn');
+          return `<tr>
+            <td class="muted">${esc(e.timestamp_str)}</td>
+            <td><strong>${esc(e.symbol)}</strong></td>
+            <td>${esc(e.side)}</td>
+            <td class="num">${Number(e.lots || 0).toFixed(2)}</td>
+            <td>${Number(e.price || 0).toFixed(4)} | ${Number(e.stop_loss || 0).toFixed(4)} | ${Number(e.take_profit || 0).toFixed(4)}</td>
+            <td class="${stCls}">${esc(e.venue)} ${esc(st)}</td>
+            <td class="muted">${esc(e.details)}</td>
+          </tr>`;
+        }).join('');
+      }
+
+      document.getElementById('last-update').textContent = 'Updated: ' + new Date().toLocaleTimeString();
+    }
+
+    function connectWS() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const ws = new WebSocket(`${proto}//${location.host}/ws`);
+      const dot = document.getElementById('ws-dot');
+      const lbl = document.getElementById('ws-status');
+      ws.onopen = () => { dot.className = 'dot live'; lbl.textContent = 'Live WS'; };
+      ws.onmessage = (ev) => {
+        try { renderState(JSON.parse(ev.data)); } catch (_) {}
+      };
+      ws.onclose = () => {
+        dot.className = 'dot err'; lbl.textContent = 'Reconnecting...';
+        setTimeout(connectWS, 1500);
+      };
+    }
+
+    fetch('/api/state').then(r => r.json()).then(renderState).catch(() => {});
+    connectWS();
+  </script>
+</body>
+</html>

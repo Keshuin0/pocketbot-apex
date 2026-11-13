@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.4.0] - 2026-11-12
+
+### Added
+- **Real-Time WebSocket Chrome App Cockpit (`apex/cockpit/web_cockpit.py`, `apex/cockpit/static/index.html`, `apex_runner.py`):**
+  - Embedded async `aiohttp` HTTP + WebSocket server bound strictly to `127.0.0.1:8765` (auto-falling back across `8765..8785` if busy) with zero external CDN dependencies.
+  - Auto-launches a standalone frameless Chrome/Edge Desktop App (`chrome.exe --app=...` / `msedge.exe --app=...`, skipped automatically under `--no-gui`, `GITHUB_ACTIONS=true`, or `PYTEST_CURRENT_TEST`).
+  - Live `/ws` JSON pushes update KPI cards, sortable Top-12 Matrix with price flash highlights, Open Positions floating CAD P/L & `SL <-> Entry <-> TP` progress bars, Quarantined Model Families, Contagion Shock Z, and Execution/Veto/RetCode Feed in place without page reloads.
+  - Added localhost CSRF-protected (`X-Apex-CSRF`) interactive controls: `[Pause / Resume Scan]`, `[Run 60s Live 0.01-Lot MT5 Drill]`, `[Run 100x Historical Replay]`, `[Refresh AI Brain]`, and `[PANIC FLATTEN ALL DEMO POSITIONS]`.
+- **100x Speed Historical Market Replay (`apex/cockpit/replay_engine.py`):**
+  - Streams simulated entries, Aegis Z3 vetoes, SL/TP closes, Win Rate, Profit Factor, and live SVG equity curves over `/ws`, strictly isolated from live `trade_ledger` stats.
+- **60s Live 0.01-Lot MT5 Demo Lifecycle Drill (`tools/live_lifecycle_drill.py`, `9_TEST_FULL_LIFECYCLE_NOW.bat`, `apex/ledger/walkforward_db.py`):**
+  - Strictly enforces `ACCOUNT_TRADE_MODE_DEMO`, runs Aegis Z3 axiom check, submits one `0.01`-lot bracket order with mandatory SL/TP, streams floating CAD P/L, verifies `TRADE_ACTION_SLTP`, closes via opposite `TRADE_ACTION_DEAL`, reads settled deal history, and isolates rows via `is_drill=1` in SQLite.
+- **Verification Suite:** Added `tests/test_phase10_web_cockpit_drill_and_replay.py` (**65/65** total tests passing) and live-verified against `FusionMarkets-Demo` (`568159`).
+
+---
+
 ## [2.3.1] - 2026-11-12
 
 ### Fixed
