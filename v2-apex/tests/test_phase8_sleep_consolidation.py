@@ -9,6 +9,7 @@ import time
 from collections import deque
 from pathlib import Path
 
+from apex.ai.model_selector import DiscoveredModel, ModelTier
 from apex.ai.sleep_consolidation import SleepWakeConsolidator
 from apex.ai.veto_committee import (
     AIVetoCommittee,
@@ -63,6 +64,13 @@ def test_phase_a_purges_working_memory_and_zero_prompt_bloat(tmp_path: Path) -> 
     )
     committee._recent_ai_events.append({"symbol": "EURUSD", "decision": "APPROVE"})
     models = committee.model_selector.get_models()
+    if not models:
+        committee.model_selector._models["studio_api:gemini-2.5-flash"] = DiscoveredModel(
+            model_id="gemini-2.5-flash",
+            provider="studio_api",
+            tier=ModelTier.FLASH_FAST,
+        )
+        models = committee.model_selector.get_models()
     assert len(models) > 0
     models[0].cooldown_until_utc = time.time() - 10.0
     models[0].consecutive_errors = 3
