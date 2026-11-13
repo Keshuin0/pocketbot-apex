@@ -17,7 +17,9 @@ import datetime
 import json
 import logging
 import sys
+import threading
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
@@ -27,8 +29,10 @@ from rich.live import Live
 from apex.ai.aegis_verifier import AegisVerifier
 from apex.ai.sleep_consolidation import SleepWakeConsolidator
 from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
+from apex.cockpit.replay_engine import HistoricalReplayEngine
 from apex.cockpit.telegram_remote import TelegramRemoteController
 from apex.cockpit.tui_dashboard import ApexTUIDashboard, SymbolCockpitRow
+from apex.cockpit.web_cockpit import WebCockpitServer, launch_chrome_app
 from apex.execution.router import DualBrokerExecutionRouter, ExecutionOrderRequest
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import Side, verify_live_unlock
@@ -138,6 +142,11 @@ class ApexOrchestrator:
             config=self.config,
         )
         self.last_scan_summary: UniverseScanSummary | None = None
+        self.web_cockpit: WebCockpitServer | None = None
+        self.paused: bool = False
+        self._bg_lock = threading.Lock()
+        self._drill_running = False
+        self._replay_running = False
         sleep_cfg = self.config.get("sleep_wake", {})
         self.sleep_consolidator = SleepWakeConsolidator(
             ledger_db=self.ledger,
@@ -231,7 +240,171 @@ class ApexOrchestrator:
             mind_state_badge=mind_badge,
             live=live,
         )
+        if self.web_cockpit is not None:
+            self._push_web_cockpit_snapshot(
+                account_currency=account_currency,
+                daily_pnl=daily_pnl,
+                open_positions=open_positions,
+                rows=rows,
+                ai_status=ai_status,
+                aegis_badge=aegis_summary["badge"],
+                contagion_z=contagion_z,
+                mind_badge=mind_badge,
+                combined_events=combined_events,
+            )
         return rows
+
+    def attach_web_cockpit(self, server: WebCockpitServer) -> None:
+        """Attach WebCockpitServer and wire localhost control button handlers."""
+        self.web_cockpit = server
+        server.set_control_handler("pause", self._handle_web_pause)
+        server.set_control_handler("drill", self._handle_web_drill)
+        server.set_control_handler("replay", self._handle_web_replay)
+        server.set_control_handler("refresh_ai", self._handle_web_refresh_ai)
+        server.set_control_handler("panic_flatten", self._handle_web_panic_flatten)
+
+    def _handle_web_pause(self) -> dict[str, object]:
+        self.paused = not self.paused
+        if self.web_cockpit is not None:
+            self.web_cockpit.push_state({"paused": self.paused})
+        return {"paused": self.paused, "message": "Paused" if self.paused else "Resumed"}
+
+    def _handle_web_drill(self) -> dict[str, object]:
+        with self._bg_lock:
+            if self._drill_running:
+                return {"started": False, "message": "Live drill is already running."}
+            self._drill_running = True
+
+        def _worker() -> None:
+            try:
+                from tools.live_lifecycle_drill import run_live_lifecycle_drill
+
+                cb = self.web_cockpit.update_drill_state if self.web_cockpit is not None else None
+                run_live_lifecycle_drill(
+                    hold_seconds=15,
+                    db_path=self.ledger.db_path,
+                    on_update=cb,
+                )
+            except Exception as exc:
+                if self.web_cockpit is not None:
+                    self.web_cockpit.update_drill_state({"status": "ERROR", "message": str(exc)})
+            finally:
+                with self._bg_lock:
+                    self._drill_running = False
+
+        threading.Thread(target=_worker, name="ApexWebDrillThread", daemon=True).start()
+        return {"started": True, "message": "Started 60s Live 0.01-Lot MT5 Demo Drill."}
+
+    def _handle_web_replay(self) -> dict[str, object]:
+        with self._bg_lock:
+            if self._replay_running:
+                return {"started": False, "message": "100x Replay is already running."}
+            self._replay_running = True
+
+        def _worker() -> None:
+            try:
+                engine = HistoricalReplayEngine()
+                cb = self.web_cockpit.update_replay_state if self.web_cockpit is not None else None
+                engine.run_replay(feed_router=self.feed_router, on_update=cb)
+            except Exception as exc:
+                if self.web_cockpit is not None:
+                    self.web_cockpit.update_replay_state({"status": "ERROR", "message": str(exc)})
+            finally:
+                with self._bg_lock:
+                    self._replay_running = False
+
+        threading.Thread(target=_worker, name="ApexWebReplayThread", daemon=True).start()
+        return {"started": True, "message": "Started 100x Historical Market Replay."}
+
+    def _handle_web_refresh_ai(self) -> dict[str, object]:
+        report = self.sleep_consolidator.run_full_cycle(
+            trigger_reason="MANUAL_WEB_COCKPIT",
+            ai_committee=self.ai_committee,
+            feed_router=self.feed_router,
+            hydra_nbbo=getattr(self.feed_router, "nbbo_engine", None),
+        )
+        return {"message": f"Sleep-Wake consolidation complete (cycle #{report.cycle_number})."}
+
+    def _handle_web_panic_flatten(self) -> dict[str, object]:
+        res = self.execution_router.panic_flatten_all()
+        if self.web_cockpit is not None:
+            self.web_cockpit.push_state({"open_positions": [], "open_positions_count": 0})
+        return {"message": f"PANIC FLATTEN executed: {res}", **res}
+
+    def _push_web_cockpit_snapshot(
+        self,
+        *,
+        account_currency: str,
+        daily_pnl: float,
+        open_positions: Sequence[PositionRiskSpec],
+        rows: Sequence[SymbolCockpitRow],
+        ai_status: object,
+        aegis_badge: str,
+        contagion_z: float,
+        mind_badge: str,
+        combined_events: Sequence[object],
+    ) -> None:
+        if self.web_cockpit is None:
+            return
+        now = time.time()
+        selector = getattr(self.ai_committee, "model_selector", None)
+        quarantined: list[str] = []
+        if selector is not None:
+            cooldowns = getattr(selector, "_family_cooldowns", {})
+            quarantined = sorted(
+                {f"{prov}:{fam}" for (prov, fam), (until_ts, _) in cooldowns.items() if until_ts > now}
+            )
+
+        serialized_positions = []
+        for pos in open_positions:
+            entry_px = float(getattr(pos, "entry_price", 0.0) or 0.0)
+            curr_px = float(getattr(pos, "current_price", entry_px) or entry_px)
+            sl_px = float(getattr(pos, "stop_loss", 0.0) or 0.0)
+            tp_px = float(getattr(pos, "take_profit", 0.0) or 0.0)
+            serialized_positions.append(
+                {
+                    "symbol": str(getattr(pos, "symbol", "")),
+                    "side": str(getattr(getattr(pos, "side", ""), "value", getattr(pos, "side", ""))),
+                    "lots": float(getattr(pos, "lots", 0.0) or 0.0),
+                    "entry_price": entry_px,
+                    "current_price": curr_px,
+                    "stop_loss": sl_px,
+                    "take_profit": tp_px,
+                    "profit_usd": float(getattr(pos, "profit_usd", 0.0) or 0.0),
+                }
+            )
+
+        serialized_rows = []
+        for r in rows:
+            d = asdict(r)
+            if r.side is not None:
+                d["side"] = r.side.value
+            serialized_rows.append(d)
+
+        serialized_events = [asdict(ev) for ev in combined_events]
+
+        self.web_cockpit.push_state(
+            {
+                "run_mode": self.mode.upper(),
+                "mind_state_badge": mind_badge,
+                "universe_scanned_count": self.last_scan_summary.open_scanned if self.last_scan_summary else 0,
+                "universe_total_count": self.last_scan_summary.total_scanned if self.last_scan_summary else 0,
+                "account_currency": account_currency,
+                "account_equity": round(float(self.execution_router.account_equity_usd), 2),
+                "daily_pnl": round(float(daily_pnl), 2),
+                "open_positions_count": len(open_positions),
+                "mesh_badge": self.feed_router.dashboard_mesh_badge,
+                "verified_ai_model": str(getattr(ai_status, "active_model_label", "UNKNOWN")),
+                "ai_brain_badge": str(getattr(ai_status, "model_quota_badge", "READY")),
+                "quarantined_families": quarantined,
+                "contagion_shock_z": round(float(contagion_z), 2),
+                "aegis_badge": aegis_badge,
+                "paused": self.paused,
+                "open_positions": serialized_positions,
+                "rows": serialized_rows,
+                "broker_events": serialized_events,
+            }
+        )
 
     def _dispatch_approved_trades(
         self,
@@ -331,6 +504,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--once", action="store_true", help="Run one complete cycle and exit")
     parser.add_argument("--dashboard", action="store_true", help="Run live Rich TUI dashboard loop")
     parser.add_argument("--interval", type=float, default=15.0, help="Refresh interval in seconds")
+    parser.add_argument("--web-port", type=int, default=8765, help="Localhost port for WebSocket Chrome App Cockpit")
+    parser.add_argument("--no-gui", action="store_true", help="Do not auto-launch the Chrome/Edge cockpit window")
     parser.add_argument("--unlock-live", action="store_true", help="Unlock live trading (requires env var too)")
     args = parser.parse_args(argv)
 
@@ -340,18 +515,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         is_live=bool(args.unlock_live),
         cli_args=sys.argv if argv is None else argv,
     )
+    web_server: WebCockpitServer | None = None
     try:
         if args.once or not args.dashboard:
             orchestrator.run_cycle()
             return 0
+        web_server = WebCockpitServer(port=int(args.web_port))
+        orchestrator.attach_web_cockpit(web_server)
+        cockpit_url = web_server.start()
+        console.print(f"[bold cyan]WebSocket Chrome App Cockpit live at {cockpit_url}[/bold cyan]")
+        launch_chrome_app(cockpit_url, no_gui=bool(args.no_gui))
         with Live(console=console, refresh_per_second=4, screen=False) as live:
             while True:
-                orchestrator.run_cycle(live=live)
+                if not orchestrator.paused:
+                    orchestrator.run_cycle(live=live)
                 time.sleep(max(1.0, args.interval))
     except KeyboardInterrupt:
         console.print("\n[yellow]PocketBot Apex stopped by user.[/yellow]")
         return 0
     finally:
+        if web_server is not None:
+            web_server.stop()
         orchestrator.shutdown()
 
 
