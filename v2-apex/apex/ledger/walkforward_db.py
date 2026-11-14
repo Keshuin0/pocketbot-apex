@@ -165,6 +165,13 @@ class WalkForwardLedgerDB:
                     updated_at_utc REAL NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS model_family_cooldowns (
+                    family TEXT PRIMARY KEY,
+                    cooldown_until_utc REAL NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    updated_at_utc REAL NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS ai_epistemic_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp_utc REAL NOT NULL,
@@ -1071,3 +1078,36 @@ class WalkForwardLedgerDB:
                 "quarantined": stats.should_demote_to_pure_math,
             }
         return summary
+
+    def save_family_cooldown(
+        self,
+        family: str,
+        cooldown_until_utc: float,
+        reason: str = "",
+        updated_at_utc: float | None = None,
+    ) -> None:
+        """Persist an AI model-family quarantine cooldown across bot restarts."""
+        now_ts = updated_at_utc if updated_at_utc is not None else time.time()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO model_family_cooldowns (family, cooldown_until_utc, reason, updated_at_utc)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(family) DO UPDATE SET
+                    cooldown_until_utc = excluded.cooldown_until_utc,
+                    reason = excluded.reason,
+                    updated_at_utc = excluded.updated_at_utc
+                """,
+                (family.strip().lower(), float(cooldown_until_utc), str(reason)[:240], float(now_ts)),
+            )
+
+    def load_active_family_cooldowns(self, now_utc: float | None = None) -> dict[str, tuple[float, str]]:
+        """Load unexpired AI model-family quarantine cooldowns from SQLite."""
+        now_ts = now_utc if now_utc is not None else time.time()
+        with self._connect() as conn:
+            conn.execute("DELETE FROM model_family_cooldowns WHERE cooldown_until_utc <= ?", (float(now_ts),))
+            rows = conn.execute(
+                "SELECT family, cooldown_until_utc, reason FROM model_family_cooldowns WHERE cooldown_until_utc > ?",
+                (float(now_ts),),
+            ).fetchall()
+        return {str(r["family"]): (float(r["cooldown_until_utc"]), str(r["reason"])) for r in rows}

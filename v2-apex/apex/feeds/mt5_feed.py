@@ -288,7 +288,22 @@ class MT5Feed:
             max_volume_lots=float(info.volume_max),
             step_volume_lots=float(info.volume_step),
             source="mt5",
+            trade_tick_value=float(getattr(info, "trade_tick_value", 0.0) or 0.0),
+            trade_tick_size=float(getattr(info, "trade_tick_size", 0.0) or 0.0),
         )
+
+    def is_symbol_trade_mode_full(self, symbol: str) -> bool:
+        """Return True strictly if MT5 symbol_info.trade_mode == SYMBOL_TRADE_MODE_FULL (4)."""
+        if not self._initialized:
+            return False
+        resolved = self.resolve_symbol(symbol)
+        if not resolved:
+            return False
+        info = mt5.symbol_info(resolved)
+        if info is None:
+            return False
+        full_mode = int(getattr(mt5, "SYMBOL_TRADE_MODE_FULL", 4))
+        return int(getattr(info, "trade_mode", 0)) == full_mode
 
     def get_tick(self, symbol: str) -> Tick | None:
         """Fetch the latest live tick for ``symbol`` with UTC-normalized timestamp."""
@@ -312,9 +327,11 @@ class MT5Feed:
             server_ts = float(raw_tick.time)
 
         now_utc = time.time()
-        offset = self.compute_utc_offset_seconds(server_ts, now_utc)
-        if offset != 0:
-            self._server_utc_offset_seconds = offset
+        # Only update broker server UTC offset when not yet calibrated or on an active FX/crypto tick
+        if self._server_utc_offset_seconds == 0 or abs(server_ts - now_utc - self._server_utc_offset_seconds) <= 180.0:
+            offset = self.compute_utc_offset_seconds(server_ts, now_utc)
+            if offset != 0 and abs(offset) <= 43200:
+                self._server_utc_offset_seconds = offset
         utc_ts = server_ts - float(self._server_utc_offset_seconds)
 
         vol = float(getattr(raw_tick, "volume_real", 0.0) or getattr(raw_tick, "volume", 0.0))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -390,7 +391,20 @@ class WebCockpitServer:
             )
 
         try:
-            result = handler()
+            payload: dict[str, Any] = {}
+            if request.can_read_body:
+                try:
+                    raw_body = await request.json()
+                    if isinstance(raw_body, dict):
+                        payload = raw_body
+                except Exception:
+                    payload = {}
+
+            sig = inspect.signature(handler)
+            if len(sig.parameters) >= 1:
+                result = handler(payload)
+            else:
+                result = handler()
             if asyncio.iscoroutine(result):
                 result = await result
             if isinstance(result, dict):

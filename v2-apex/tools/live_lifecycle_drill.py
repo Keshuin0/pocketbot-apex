@@ -22,9 +22,13 @@ if str(PROJECT_ROOT) not in sys.path:
 import MetaTrader5 as mt5
 
 from apex.ai.aegis_verifier import AegisVerifier
+from apex.engine.canonical_pipeline import Canonical11AgentPipeline
+from apex.execution.position_manager import AutonomousPositionOrchestrator, PositionDecision
+from apex.feeds.models import Candle, Side
 from apex.ledger.walkforward_db import SymbolExecutionMode, WalkForwardLedgerDB
 
-DEFAULT_CANDIDATE_SYMBOLS = ("EURUSD", "USDJPY", "GBPUSD", "USDCAD", "AUDUSD", "USDCHF")
+DEFAULT_CANDIDATE_SYMBOLS = ("EURUSD", "USDJPY", "GBPUSD", "USDCAD", "AUDUSD", "USDCHF", "BTCUSD")
+MAX_DRILL_TICK_AGE_SECONDS = 120.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +52,8 @@ class DrillResult:
     realized_pnl: float
     z3_status: str
     message: str
+    drill_mode: str = "plumbing"
+    trace: Optional[dict[str, Any]] = None
 
 
 def assert_demo_account(account_info: Any) -> tuple[int, str]:
@@ -79,29 +85,91 @@ def detect_filling_mode(symbol: str) -> int:
     return int(mt5.ORDER_FILLING_RETURN)
 
 
+def _estimate_broker_now() -> float:
+    """Estimate current MT5 broker server epoch using live 24/7 or FX benchmark ticks."""
+    best_ts = 0.0
+    for ref in ("BTCUSD", "ETHUSD", "EURUSD", "USDJPY"):
+        t = mt5.symbol_info_tick(ref)
+        if t is not None and float(getattr(t, "time", 0) or 0) > best_ts:
+            best_ts = float(t.time)
+    return best_ts if best_ts > 0.0 else time.time()
+
+
+def _check_symbol_session_open(
+    symbol: str,
+    info: Any,
+    tick: Any,
+    broker_now: Optional[float] = None,
+) -> tuple[bool, str]:
+    """Verify MT5 symbol has trade_mode=FULL and a fresh live tick (<=120s)."""
+    if info is None or tick is None:
+        return False, f"CLOSED_MARKET: {symbol} has no MT5 symbol_info/tick."
+    trade_mode = int(getattr(info, "trade_mode", 0))
+    full_mode = int(getattr(mt5, "SYMBOL_TRADE_MODE_FULL", 4))
+    if trade_mode != full_mode:
+        return False, f"CLOSED_MARKET: {symbol} trade_mode={trade_mode} (market closed or read-only)."
+    bid = float(getattr(tick, "bid", 0.0) or 0.0)
+    ask = float(getattr(tick, "ask", 0.0) or 0.0)
+    if bid <= 0.0 or ask <= 0.0 or ask < bid:
+        return False, f"CLOSED_MARKET: {symbol} invalid quote bid={bid}, ask={ask}."
+    ref_now = broker_now if broker_now is not None else _estimate_broker_now()
+    tick_time = float(getattr(tick, "time", 0) or 0)
+    tick_age = abs(ref_now - tick_time)
+    if tick_time <= 0.0 or tick_age > MAX_DRILL_TICK_AGE_SECONDS:
+        return False, f"CLOSED_MARKET: {symbol} stale tick ({int(tick_age)}s old > {int(MAX_DRILL_TICK_AGE_SECONDS)}s)."
+    return True, "ACTIVE"
+
+
+def _fetch_mt5_candles(symbol: str, timeframe_attr: str, count: int) -> list[Candle]:
+    """Fetch MT5 bars and convert to canonical Candle models."""
+    tf = getattr(mt5, timeframe_attr, None)
+    if tf is None:
+        return []
+    rates = mt5.copy_rates_from_pos(symbol, tf, 0, count)
+    if rates is None or len(rates) == 0:
+        return []
+    tf_label = timeframe_attr.replace("TIMEFRAME_", "").upper() or "M5"
+    candles: list[Candle] = []
+    for bar in rates:
+        candles.append(
+            Candle(
+                symbol=symbol,
+                timeframe=tf_label,
+                timestamp_utc=float(bar["time"]),
+                open=float(bar["open"]),
+                high=float(bar["high"]),
+                low=float(bar["low"]),
+                close=float(bar["close"]),
+                volume=float(bar["tick_volume"]),
+                source="mt5",
+            )
+        )
+    return candles
+
+
 def pick_tightest_open_symbol(
     candidates: tuple[str, ...] = DEFAULT_CANDIDATE_SYMBOLS,
 ) -> tuple[str, Any, Any]:
-    """Pick the tradable open symbol with the tightest relative spread."""
+    """Pick the tradable open symbol with the tightest relative spread and fresh tick."""
+    broker_now = _estimate_broker_now()
     best: Optional[tuple[float, str, Any, Any]] = None
     for sym in candidates:
         mt5.symbol_select(sym, True)
         info = mt5.symbol_info(sym)
         tick = mt5.symbol_info_tick(sym)
-        if info is None or tick is None:
-            continue
-        if int(getattr(info, "trade_mode", 0)) != int(getattr(mt5, "SYMBOL_TRADE_MODE_FULL", 4)):
+        is_open, _ = _check_symbol_session_open(sym, info, tick, broker_now=broker_now)
+        if not is_open:
             continue
         bid = float(getattr(tick, "bid", 0.0) or 0.0)
         ask = float(getattr(tick, "ask", 0.0) or 0.0)
-        if bid <= 0.0 or ask <= 0.0 or ask < bid:
-            continue
         rel_spread = (ask - bid) / bid
         if best is None or rel_spread < best[0]:
             best = (rel_spread, sym, info, tick)
 
     if best is None:
-        raise RuntimeError("No open tradable FX symbol found on FusionMarkets-Demo right now.")
+        raise RuntimeError(
+            "CLOSED_MARKET: No open tradable symbol with fresh ticks (<=120s) found on FusionMarkets-Demo right now."
+        )
     return best[1], best[2], best[3]
 
 
@@ -110,29 +178,73 @@ def run_live_lifecycle_drill(
     symbol_override: Optional[str] = None,
     db_path: str | Path = "trader/apex_ledger.db",
     on_update: Optional[Callable[[dict[str, Any]], None]] = None,
+    drill_mode: str = "plumbing",
 ) -> DrillResult:
     """Execute the full end-to-end 0.01-lot DEMO lifecycle drill on MT5."""
+    mode_norm = (drill_mode or "plumbing").strip().lower()
+    if mode_norm not in {"strict", "plumbing"}:
+        mode_norm = "plumbing"
 
-    def _emit(status: str, message: str, symbol: str = "", ticket: int = 0, floating_pnl: float = 0.0) -> None:
+    def _emit(
+        status: str,
+        message: str,
+        symbol: str = "",
+        ticket: int = 0,
+        floating_pnl: float = 0.0,
+        trace: Optional[dict[str, Any]] = None,
+    ) -> None:
         if on_update is not None:
-            on_update(
-                {
-                    "status": status,
-                    "symbol": symbol,
-                    "ticket": ticket,
-                    "floating_pnl": round(float(floating_pnl), 2),
-                    "message": message,
-                }
-            )
+            payload: dict[str, Any] = {
+                "status": status,
+                "symbol": symbol,
+                "ticket": ticket,
+                "floating_pnl": round(float(floating_pnl), 2),
+                "drill_mode": mode_norm,
+                "message": message,
+            }
+            if trace is not None:
+                payload["trace"] = trace
+            on_update(payload)
 
-    _emit("STARTING", "Initializing MT5 connection & verifying DEMO mode...")
+    _emit("STARTING", f"Initializing MT5 connection & verifying DEMO mode ({mode_norm.upper()})...")
     if not mt5.initialize():
         raise RuntimeError(f"mt5.initialize() failed: {mt5.last_error()}")
 
     login, currency = assert_demo_account(mt5.account_info())
 
-    candidates = (symbol_override,) if symbol_override else DEFAULT_CANDIDATE_SYMBOLS
-    symbol, info, tick = pick_tightest_open_symbol(candidates)
+    if symbol_override and symbol_override.upper() not in {"AUTO_BEST_MOVER", "AUTO_TOP12"}:
+        sym = symbol_override.upper()
+        mt5.symbol_select(sym, True)
+        info = mt5.symbol_info(sym)
+        tick = mt5.symbol_info_tick(sym)
+        is_open, session_msg = _check_symbol_session_open(sym, info, tick)
+        if not is_open:
+            _emit("CLOSED_MARKET", session_msg, symbol=sym)
+            return DrillResult(
+                ok=False,
+                account_login=login,
+                account_currency=currency,
+                symbol=sym,
+                side="BUY",
+                lots=0.0,
+                entry_price=0.0,
+                stop_loss=0.0,
+                take_profit=0.0,
+                order_ticket=0,
+                position_id=0,
+                sltp_retcode=0,
+                close_retcode=0,
+                close_deal_id=0,
+                realized_pnl=0.0,
+                z3_status="SKIPPED",
+                message=session_msg,
+                drill_mode=mode_norm,
+                trace=None,
+            )
+        symbol = sym
+    else:
+        symbol, info, tick = pick_tightest_open_symbol(DEFAULT_CANDIDATE_SYMBOLS)
+
     digits = int(getattr(info, "digits", 5))
     point = float(getattr(info, "point", 0.00001))
     stops_level_pts = int(getattr(info, "trade_stops_level", 0) or 0)
@@ -142,6 +254,57 @@ def run_live_lifecycle_drill(
     ask = float(tick.ask)
     bid = float(tick.bid)
     spread_px = max(ask - bid, point)
+    pip_size = point * 10.0 if digits in (3, 5) else point
+
+    # Run Canonical 11-Agent Pipeline scorecard on live MT5 M5 & H1 candles
+    m5_candles = _fetch_mt5_candles(symbol, "TIMEFRAME_M5", 120)
+    h1_candles = _fetch_mt5_candles(symbol, "TIMEFRAME_H1", 80)
+    trace_dict: Optional[dict[str, Any]] = None
+    if len(m5_candles) >= 30:
+        pipeline = Canonical11AgentPipeline()
+        trace = pipeline.evaluate(
+            symbol=symbol,
+            side=Side.BUY,
+            timeframe="M5",
+            entry_price=ask,
+            candles=m5_candles,
+            h1_candles=h1_candles or None,
+            spread_price=spread_px,
+            pip_size=pip_size,
+            run_ai_committee=False,
+            in_flight_ready=True,
+        )
+        trace_dict = trace.to_dict()
+        _emit(
+            "SCORECARD",
+            f"11-Agent Scorecard {symbol}: {'ALL PASS' if trace.passed_all else f'Blocked at Stage {trace.blocked_stage}: {trace.blocked_reason}'}",
+            symbol=symbol,
+            trace=trace_dict,
+        )
+        if mode_norm == "strict" and not trace.passed_all:
+            msg = f"STRICT 11-AGENT GATE REFUSAL on {symbol}: Stage {trace.blocked_stage} ({trace.blocked_reason})"
+            _emit("REJECTED", msg, symbol=symbol, trace=trace_dict)
+            return DrillResult(
+                ok=False,
+                account_login=login,
+                account_currency=currency,
+                symbol=symbol,
+                side="BUY",
+                lots=0.0,
+                entry_price=round(ask, digits),
+                stop_loss=0.0,
+                take_profit=0.0,
+                order_ticket=0,
+                position_id=0,
+                sltp_retcode=0,
+                close_retcode=0,
+                close_deal_id=0,
+                realized_pnl=0.0,
+                z3_status=f"BLOCKED_STAGE_{trace.blocked_stage}",
+                message=msg,
+                drill_mode=mode_norm,
+                trace=trace_dict,
+            )
 
     # Ensure SL & TP sit safely beyond broker stop level and spread
     min_dist = max(stops_level_pts * point * 2.0, spread_px * 12.0, 120.0 * point)
@@ -165,7 +328,7 @@ def run_live_lifecycle_drill(
     if z3_decision != "APPROVE":
         raise RuntimeError(f"Aegis Z3 gate refused drill setup on {symbol}: {z3_msg}")
 
-    _emit("SENDING", f"Sending 0.01 BUY {symbol} @ {entry_price} (SL={stop_loss}, TP={take_profit})...", symbol=symbol)
+    _emit("SENDING", f"Sending 0.01 BUY {symbol} @ {entry_price} (SL={stop_loss}, TP={take_profit})...", symbol=symbol, trace=trace_dict)
     filling = detect_filling_mode(symbol)
     open_req = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -206,16 +369,38 @@ def run_live_lifecycle_drill(
 
     hold_secs = max(1, int(hold_seconds))
     last_floating = 0.0
+    orchestrator = AutonomousPositionOrchestrator()
+    open_ts = time.time()
     for sec in range(hold_secs):
         positions = mt5.positions_get(ticket=pos_ticket) or []
+        cur_px = fill_price
         if positions:
             last_floating = float(positions[0].profit)
+            cur_px = float(getattr(positions[0], "price_current", fill_price) or fill_price)
+        pos_decision: PositionDecision = orchestrator.evaluate_position(
+            ticket=pos_ticket,
+            symbol=symbol,
+            side=Side.BUY,
+            entry_price=fill_price,
+            current_price=cur_px,
+            current_sl=stop_loss,
+            current_tp=take_profit,
+            lots=lots,
+            atr_value=max(min_dist, point * 10.0),
+            opened_at_utc=open_ts,
+            now_utc=time.time(),
+            candles=m5_candles[-30:] if len(m5_candles) >= 30 else None,
+        )
         _emit(
             "HOLDING",
-            f"Holding {symbol} #{pos_ticket} ({sec + 1}/{hold_secs}s) | Floating: {last_floating:+.2f} {currency}",
+            (
+                f"Holding {symbol} #{pos_ticket} ({sec + 1}/{hold_secs}s) | "
+                f"Floating: {last_floating:+.2f} {currency} | InFlight: {pos_decision.action.value}"
+            ),
             symbol=symbol,
             ticket=pos_ticket,
             floating_pnl=last_floating,
+            trace=trace_dict,
         )
         time.sleep(1.0)
 
@@ -296,7 +481,7 @@ def run_live_lifecycle_drill(
         f"Drill COMPLETE on {symbol}: Ticket #{pos_ticket} | SLTP={sltp_retcode} | "
         f"Close={close_retcode} (Deal #{close_deal_id}) | Realized={realized_pnl:+.2f} {currency}"
     )
-    _emit("COMPLETE", summary_msg, symbol=symbol, ticket=pos_ticket, floating_pnl=realized_pnl)
+    _emit("COMPLETE", summary_msg, symbol=symbol, ticket=pos_ticket, floating_pnl=realized_pnl, trace=trace_dict)
 
     return DrillResult(
         ok=(close_retcode == done_code),
@@ -316,6 +501,8 @@ def run_live_lifecycle_drill(
         realized_pnl=round(realized_pnl, 2),
         z3_status=z3_msg,
         message=summary_msg,
+        drill_mode=mode_norm,
+        trace=trace_dict,
     )
 
 
@@ -323,6 +510,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="PocketBot Apex 60s Live 0.01-Lot MT5 Demo Lifecycle Drill")
     parser.add_argument("--hold-seconds", type=int, default=15, help="Seconds to hold and stream live P/L")
     parser.add_argument("--symbol", type=str, default=None, help="Optional symbol override")
+    parser.add_argument("--drill-mode", type=str, default="plumbing", choices=["strict", "plumbing"], help="strict=11-agent gate, plumbing=scorecard+0.01 lot test")
     parser.add_argument("--db", type=str, default="trader/apex_ledger.db", help="Ledger DB path")
     args = parser.parse_args(argv)
 
@@ -334,6 +522,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         symbol_override=args.symbol,
         db_path=args.db,
         on_update=_printer,
+        drill_mode=args.drill_mode,
     )
     print("\n=== DRILL SUMMARY ===")
     print(f"Account     : {result.account_login} ({result.account_currency})")
