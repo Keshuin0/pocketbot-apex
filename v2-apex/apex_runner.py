@@ -469,13 +469,9 @@ class ApexOrchestrator:
 
         catalog_grouped: dict[str, list[str]] = {}
         try:
-            catalog_items = self.universe_scanner.get_catalog()
-            for item in catalog_items:
-                ac = item.asset_class.value
-                catalog_grouped.setdefault(ac, []).append(item.canonical_name or item.name)
-            for ac in catalog_grouped:
-                catalog_grouped[ac] = sorted(set(catalog_grouped[ac]))
-        except Exception:
+            catalog_grouped = self.universe_scanner.get_grouped_catalog()
+        except Exception as exc:
+            logger.warning("Failed to build grouped catalog for cockpit: %s", exc)
             catalog_grouped = {}
 
         self.web_cockpit.push_state(
@@ -592,7 +588,7 @@ def format_web_cockpit_banner(cockpit_url: str, mode: str) -> str:
     """Return a compact 5-line startup banner for the Web Cockpit engine console."""
     return (
         "============================================================\n"
-        f"  POCKETBOT APEX v2.4.1  |  Mode: {mode.upper()}\n"
+        f"  POCKETBOT APEX v2.6.0  |  Mode: {mode.upper()}\n"
         f"  Chrome Cockpit URL: {cockpit_url}\n"
         "  Keep this engine window minimized;\n"
         "  view & control everything in the Chrome Cockpit window.\n"
@@ -607,7 +603,7 @@ def format_single_line_heartbeat(orchestrator: ApexOrchestrator) -> str:
     total = orchestrator.last_scan_summary.total_scanned if orchestrator.last_scan_summary else 0
     state = "PAUSED" if orchestrator.paused else "SCANNING"
     ts = datetime.datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] APEX v2.4.1 | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
+    line = f"[{ts}] APEX v2.6.0 | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
     return line[:96].ljust(96)
 
 

@@ -14,9 +14,14 @@ from typing import Any, Sequence
 
 import numpy as np
 
+from apex.ai.aegis_verifier import AegisVerifier
 from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
 from apex.cockpit.tui_dashboard import BrokerExecutionEvent, SymbolCockpitRow
-from apex.engine.canonical_pipeline import compute_asset_class_commission_usd
+from apex.engine.canonical_pipeline import (
+    AgentPipelineTrace,
+    PipelineStageResult,
+    compute_asset_class_commission_usd,
+)
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import AssetClass, DiscoveredSymbol, Side, Tick
@@ -112,6 +117,75 @@ class UniverseScanner:
         self.recent_audit_events: list[BrokerExecutionEvent] = []
         self._cached_catalog: list[DiscoveredSymbol] = []
         self._last_catalog_discovery_time: float = 0.0
+
+    def discover_catalog(self, force: bool = False) -> list[DiscoveredSymbol]:
+        """Fetch or refresh the full broker catalog across active feeds."""
+        return self.discover_or_get_catalog(force=force)
+
+    def get_grouped_catalog(self, force: bool = False) -> dict[str, list[str]]:
+        """Return the broker catalog grouped by AssetClass for the Chrome Cockpit picker."""
+        catalog_items = self.discover_catalog(force=force)
+        grouped: dict[str, list[str]] = {}
+        for item in catalog_items:
+            ac = item.asset_class.value
+            grouped.setdefault(ac, []).append(item.canonical_name or item.name)
+        for ac in grouped:
+            grouped[ac] = sorted(set(grouped[ac]))
+        return grouped
+
+    @staticmethod
+    def infer_candidate_side(
+        candles: Sequence[Any],
+        h1_candles: Sequence[Any] | None = None,
+    ) -> Side:
+        """Dynamically infer Side.BUY vs Side.SELL from M5/M15 breakout, bar polarity, and H1 EMA slope."""
+        if not candles or len(candles) < 3:
+            return Side.BUY
+
+        latest_c = candles[-1]
+        is_bearish_bar = float(latest_c.close) < float(latest_c.open)
+        is_bullish_bar = float(latest_c.close) > float(latest_c.open)
+
+        closes = np.asarray([float(c.close) for c in candles], dtype=np.float64)
+        alpha = 2.0 / 21.0
+        ema20 = float(closes[0])
+        ema_hist: list[float] = [ema20]
+        for px in closes[1:]:
+            ema20 = alpha * float(px) + (1.0 - alpha) * ema20
+            ema_hist.append(ema20)
+        m5_slope_down = ema_hist[-1] < ema_hist[-min(5, len(ema_hist))]
+        m5_bearish = (float(closes[-1]) < ema_hist[-1]) and m5_slope_down
+
+        h1_bearish = False
+        h1_bullish = False
+        if h1_candles and len(h1_candles) >= 10:
+            h1_closes = np.asarray([float(c.close) for c in h1_candles], dtype=np.float64)
+            h1_ema = float(h1_closes[0])
+            h1_hist: list[float] = [h1_ema]
+            for px in h1_closes[1:]:
+                h1_ema = alpha * float(px) + (1.0 - alpha) * h1_ema
+                h1_hist.append(h1_ema)
+            h1_slope = h1_hist[-1] - h1_hist[-min(5, len(h1_hist))]
+            h1_bearish = (float(h1_closes[-1]) < h1_hist[-1]) and (h1_slope < 0.0)
+            h1_bullish = (float(h1_closes[-1]) > h1_hist[-1]) and (h1_slope > 0.0)
+
+        prior = candles[-13:-1] if len(candles) >= 14 else candles[:-1]
+        prior_hi = max(float(c.high) for c in prior)
+        prior_lo = min(float(c.low) for c in prior)
+        broke_down = float(latest_c.close) < prior_lo
+        broke_up = float(latest_c.close) > prior_hi
+
+        if broke_down and not broke_up:
+            return Side.SELL
+        if broke_up and not broke_down:
+            return Side.BUY
+        if is_bearish_bar and (m5_bearish or h1_bearish):
+            return Side.SELL
+        if is_bullish_bar and (not m5_bearish or h1_bullish):
+            return Side.BUY
+        if h1_bearish or m5_bearish:
+            return Side.SELL
+        return Side.BUY
 
     def discover_or_get_catalog(self, force: bool = False) -> list[DiscoveredSymbol]:
         """Fetch or refresh the full broker catalog across active feeds."""
@@ -404,17 +478,20 @@ class UniverseScanner:
             current_spread=spread_px,
         )
 
-        # Standard 1.5x ATR stop and 2.0R target
+        h1_candles = self.feed_router.get_candles(sym, timeframe="H1", count=40)
+        side = self.infer_candidate_side(candles, h1_candles)
+
+        # Symmetric 1.5x ATR stop and 2.0R target
         atr_val = max(diag.current_atr, pip_size * 5.0)
         sl_dist = 1.5 * atr_val
-        entry_px = tick.ask
-        stop_px = entry_px - sl_dist
-        target_px = entry_px + 2.0 * sl_dist
+        entry_px = tick.ask if side == Side.BUY else tick.bid
+        stop_px = (entry_px - sl_dist) if side == Side.BUY else (entry_px + sl_dist)
+        target_px = (entry_px + 2.0 * sl_dist) if side == Side.BUY else (entry_px - 2.0 * sl_dist)
 
         nbbo = self.feed_router.evaluate_nbbo(
             symbol=sym,
             one_r_price_distance=sl_dist,
-            side=Side.BUY,
+            side=side,
         )
         effective_cost_pips = max(float(nbbo.winning_cost_pips), spread_pips_atomic)
         if nbbo.pips_saved > 0.0:
@@ -424,7 +501,7 @@ class UniverseScanner:
 
         gate_verdict = self.momentum_dom_gate.evaluate(
             symbol=sym,
-            side=Side.BUY,
+            side=side,
             entry_price=entry_px,
             stop_price=stop_px,
             candles=candles,
@@ -452,7 +529,7 @@ class UniverseScanner:
         )
         tm_res = self.time_machine.simulate_candles(
             symbol=sym,
-            side=Side.BUY,
+            side=side,
             entry_price=entry_px,
             stop_price=stop_px,
             target_price=target_px,
@@ -461,10 +538,9 @@ class UniverseScanner:
             cost_model=eff_cost_model,
         )
 
-        h1_candles = self.feed_router.get_candles(sym, timeframe="H1", count=40)
         mtf_verdict = self.mtf_filter.evaluate(
             symbol=sym,
-            side=Side.BUY,
+            side=side,
             entry_price=entry_px,
             atr_m5=atr_val,
             m5_candles=candles,
@@ -488,17 +564,34 @@ class UniverseScanner:
             dom_obi=dom.obi if dom else None,
             spread_pct_of_sl=gate_verdict.spread_pct_of_sl,
             passed_quant=passed_all_quant,
-            detail=diag.reason,
+            detail=f"{side.value} | {diag.reason}",
         )
 
+        if self.last_contagion is None:
+            self.last_contagion = self.contagion_oracle.evaluate(feed_router=self.feed_router)
+        shock_z = float(self.last_contagion.cross_asset_shock_z)
+        rollover_flag = bool(self.last_contagion.rollover_illiquidity_flag)
+
+        z3_telemetry = {
+            "symbol": sym,
+            "side": side.value,
+            "timemachine_net_avg_R": tm_res.net_avg_R,
+            "spread_pct_of_sl": gate_verdict.spread_pct_of_sl,
+            "vol_pct": diag.volatility_percentile,
+            "cross_asset_shock_z": shock_z,
+            "rollover_illiquidity_flag": rollover_flag,
+        }
+        z3_dec, z3_msg = AegisVerifier.z3_pure_math_axiom_gate(z3_telemetry)
+        z3_ok = z3_dec == "APPROVE"
+
         ai_label = "IDLE (Quant Filtered)"
+        ai_ok = z3_ok
+        ai_detail = z3_msg
         if passed_all_quant:
-            if self.last_contagion is None:
-                self.last_contagion = self.contagion_oracle.evaluate(feed_router=self.feed_router)
             latest_bar_ts = candles[-1].timestamp_utc if candles else 0.0
             ctx = CandidateSetupAuditContext(
                 symbol=sym,
-                side=Side.BUY,
+                side=side,
                 timeframe=tf,
                 entry_price=entry_px,
                 stop_loss=stop_px,
@@ -515,18 +608,20 @@ class UniverseScanner:
                 recommended_risk_pct=tm_res.recommended_risk_pct,
                 session_utc_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 bar_timestamp=latest_bar_ts,
-                rollover_illiquidity_flag=self.last_contagion.rollover_illiquidity_flag,
-                cross_asset_shock_z=self.last_contagion.cross_asset_shock_z,
+                rollover_illiquidity_flag=rollover_flag,
+                cross_asset_shock_z=shock_z,
             )
             ai_decision = self.ai_committee.evaluate_sync(ctx)
             ai_label = f"{ai_decision.decision} ({ai_decision.confidence:.2f} via {ai_decision.provider_used})"
+            ai_ok = ai_decision.decision == "APPROVE"
+            ai_detail = f"{ai_decision.decision} ({ai_decision.model_used}) | {z3_msg}"
             if ai_decision.decision == "VETO":
                 z3_tag = "Z3:PASS" if ai_decision.aegis_verified else "Z3:BYPASS"
                 self.recent_audit_events.append(
                     BrokerExecutionEvent(
                         timestamp_str=time.strftime("%H:%M:%S", time.gmtime()),
                         symbol=sym,
-                        side="BUY",
+                        side=side.value,
                         lots=0.0,
                         price=entry_px,
                         stop_loss=stop_px,
@@ -538,6 +633,42 @@ class UniverseScanner:
                 )
                 if len(self.recent_audit_events) > 20:
                     self.recent_audit_events = self.recent_audit_events[-20:]
+
+        rec_risk = float(tm_res.recommended_risk_pct) if passed_all_quant else 0.0
+        contagion_ok = (shock_z <= 3.5) and not (rollover_flag and diag.volatility_percentile > 85.0)
+        bracket_ok = (entry_px > 0.0) and (sl_dist > 0.0)
+        tm_ok = tm_res.net_avg_R >= self.min_net_avg_R
+        exec_ready = passed_all_quant and contagion_ok and ai_ok and bracket_ok
+
+        trace_stages = [
+            PipelineStageResult(1, "trader-scanner + H1 MTF", mtf_verdict.passed, mtf_verdict.reason, f"{side.value} slope={mtf_verdict.h1_ema_slope:+.2f}"),
+            PipelineStageResult(2, "RegimeClassifier", diag.allow_breakout_entries, f"{diag.regime.value}: {diag.reason}", f"H={diag.hurst_exponent:.2f} ER={diag.kaufman_er:.2f}"),
+            PipelineStageResult(3, "trader-entry + MomentumDOM", gate_verdict.passed, ("; ".join(gate_verdict.reasons) if gate_verdict.reasons else ("OK" if gate_verdict.passed else "Blocked")), f"spread%SL={gate_verdict.spread_pct_of_sl:.1f}%"),
+            PipelineStageResult(4, "trader-exit", bracket_ok, f"{side.value} SL={stop_px:.5f} | TP={target_px:.5f} (2.0R)", f"1R={sl_dist:.5f}"),
+            PipelineStageResult(5, "TimeMachine v2 (Bootstrap)", tm_ok, f"net_avg_R={tm_res.net_avg_R:+.3f}R (floor={self.min_net_avg_r if hasattr(self, 'min_net_avg_r') else self.min_net_avg_R:.2f}R, comm=${commission_usd:.2f})", f"P(Win)={tm_res.prob_profit * 100:.0f}%"),
+            PipelineStageResult(6, "Contagion / News / Analyst", contagion_ok, f"shock_z={shock_z:.2f}, rollover={rollover_flag}", f"Z={shock_z:.2f}"),
+            PipelineStageResult(7, "trader-budget", (rec_risk > 0.0) if passed_all_quant else False, f"Q-Kelly={rec_risk:.2f}%" if passed_all_quant else "Q-Kelly forced 0.00% (filtered)", f"{rec_risk:.2f}%"),
+            PipelineStageResult(8, "trader-risk + CorrelationShield", q_state.mode.value == "ACTIVE", f"Quarantine={q_state.mode.value} PF={q_state.profit_factor:.2f}", "CAP<=1.0%"),
+            PipelineStageResult(9, "Aegis Z3 + AI Waterfall", ai_ok, ai_detail, z3_dec),
+            PipelineStageResult(10, "ExecutionRouter (DEMO)", exec_ready, "DEMO-locked + Server-side SL/TP armed" if exec_ready else "Blocked upstream prior to wire", "DEMO_SAFE"),
+            PipelineStageResult(11, "InFlightPositionManager", True, "2-Bar Grace Lock + Forward TM + 1R/1.5R Runner armed", "SHIELD8_Z3"),
+        ]
+        blocked_stage = next((st.stage_num for st in trace_stages if not st.passed), None)
+        trace_dict = AgentPipelineTrace(
+            symbol=sym,
+            timeframe=tf,
+            side=side.value,
+            entry_price=entry_px,
+            stop_loss=stop_px,
+            take_profit=target_px,
+            passed_all=exec_ready,
+            final_decision="APPROVE" if exec_ready else ("VETO" if (passed_all_quant and not ai_ok) else "FILTERED"),
+            net_avg_r=round(tm_res.net_avg_R, 4),
+            recommended_risk_pct=round(rec_risk, 4),
+            z3_status=z3_msg,
+            stages=trace_stages,
+        ).to_dict()
+        trace_dict["blocked_stage"] = blocked_stage
 
         return SymbolCockpitRow(
             symbol=sym,
@@ -551,15 +682,16 @@ class UniverseScanner:
             kaufman_er=diag.kaufman_er,
             obi=dom.obi if dom else None,
             net_avg_r=tm_res.net_avg_R,
-            rec_risk_pct=(tm_res.recommended_risk_pct if passed_all_quant else 0.0),
+            rec_risk_pct=rec_risk,
             ai_verdict=ai_label,
             quarantine_mode=q_state.mode.value,
             profit_factor=q_state.profit_factor,
             best_venue=best_venue_str,
-            side=Side.BUY,
+            side=side,
             entry_price=entry_px,
             stop_loss=stop_px,
             take_profit=target_px,
+            pipeline_trace=trace_dict,
         )
 
     def scan_cycle(

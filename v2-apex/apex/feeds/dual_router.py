@@ -471,8 +471,8 @@ class MarketFeedRouter:
                 try:
                     vwap_est = engine.compute_vwap_fill(side=side, target_volume_units=target_volume_units)
                     ct_slip_pips = max(0.0, vwap_est.slippage_pips)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("VWAP slippage estimate skipped for %s: %s", norm_sym, exc)
 
         return self.nbbo_engine.evaluate_symbol(
             symbol=norm_sym,
