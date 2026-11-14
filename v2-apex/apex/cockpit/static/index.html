@@ -385,8 +385,9 @@
     function openXrayModal(source) {
       const trace = latestTraces[source];
       if (!trace || !trace.stages) return;
+      const blk = trace.blocked_stage || ((trace.stages.find(s => !s.passed) || {}).stage_num) || '?';
       document.getElementById('xray-title').textContent =
-        `11-Agent X-Ray: ${trace.symbol || ''} (${trace.timeframe || 'M5'}) — ${trace.passed_all ? 'ALL PASS' : 'BLOCKED AT STAGE ' + trace.blocked_stage}`;
+        `11-Agent X-Ray: ${trace.symbol || ''} [${trace.side || 'BUY'}] (${trace.timeframe || 'M5'}) — ${trace.passed_all ? 'ALL PASS' : 'BLOCKED AT STAGE ' + blk}`;
       document.getElementById('xray-body').innerHTML = trace.stages.map(st => {
         const cls = st.passed ? 'pos' : 'neg';
         return `<tr>
@@ -564,6 +565,9 @@
         mBody.innerHTML = '<tr><td colspan="12" class="muted">No active candidates in current cycle.</td></tr>';
       } else {
         mBody.innerHTML = rows.map(r => {
+          if (r.pipeline_trace) {
+            latestTraces['row_' + r.symbol] = r.pipeline_trace;
+          }
           const prev = prevPrices[r.symbol];
           let cls = '';
           if (prev !== undefined && r.bid !== prev) cls = r.bid > prev ? 'flash-up' : 'flash-down';
@@ -572,8 +576,10 @@
           const netCls = (r.net_avg_r || 0) > 0 ? 'pos' : 'neg';
           const vStr = String(r.ai_verdict || 'IDLE');
           const vBadge = vStr.startsWith('APPROVE') ? 'badge-approve' : (vStr.startsWith('VETO') ? 'badge-veto' : 'badge-idle');
-          return `<tr class="${cls}">
-            <td><strong>${esc(r.symbol)}</strong></td>
+          const sideTag = r.side ? ` <span class="muted">(${esc(r.side)})</span>` : '';
+          const rowClick = r.pipeline_trace ? ` style="cursor:pointer" title="Click for 11-Agent X-Ray Scorecard" onclick="openXrayModal('row_${esc(r.symbol)}')"` : '';
+          return `<tr class="${cls}"${rowClick}>
+            <td><strong>${esc(r.symbol)}</strong>${sideTag}</td>
             <td class="muted">${esc(r.timeframe)}</td>
             <td class="num">${Number(r.bid).toFixed(r.bid < 10 ? 5 : 2)} / ${Number(r.ask).toFixed(r.bid < 10 ? 5 : 2)}</td>
             <td class="num">${Number(r.spread_pips).toFixed(1)}p</td>

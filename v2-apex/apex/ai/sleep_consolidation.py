@@ -196,8 +196,8 @@ class SleepWakeConsolidator:
                     if child.is_file():
                         child.unlink(missing_ok=True)
                         purged_temp_files += 1
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Skipped orphaned temp file cleanup %s: %s", child, exc)
 
         # Refresh broker heartbeats & trim spike rejector buffers
         if feed_router is not None:
@@ -212,8 +212,8 @@ class SleepWakeConsolidator:
                                 trimmed_buffers += 1
                 if feed_router.mt5.is_connected:
                     feed_router.mt5.get_account_info()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Phase A feed heartbeat/buffer trim skipped: %s", exc)
 
         gc_count = gc.collect()
         return {

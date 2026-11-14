@@ -716,7 +716,11 @@ class AdaptiveModelSelector:
         )
         verified_id = self._last_verified_model.get(provider)
         verified_model = next((c.model for c in ranked if c.model.model_id == verified_id), None)
-        best = verified_model or (ranked[0].model if ranked else active_models[0])
+        non_argon_default = next(
+            (c.model for c in ranked if (c.model.family or classify_model_family(c.model.model_id)) != "argon"),
+            None,
+        )
+        best = verified_model or non_argon_default or (ranked[0].model if ranked else active_models[0])
         avg_lat_s = best.ewma_latency_ms / 1000.0
         health = "CONSERVING" if conserving else "HEALTHY"
         return {

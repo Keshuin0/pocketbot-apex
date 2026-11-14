@@ -401,12 +401,18 @@ class WebCockpitServer:
                     payload = {}
 
             sig = inspect.signature(handler)
-            if len(sig.parameters) >= 1:
-                result = handler(payload)
+            if asyncio.iscoroutinefunction(handler):
+                if len(sig.parameters) >= 1:
+                    result = await handler(payload)
+                else:
+                    result = await handler()
             else:
-                result = handler()
-            if asyncio.iscoroutine(result):
-                result = await result
+                if len(sig.parameters) >= 1:
+                    result = await asyncio.to_thread(handler, payload)
+                else:
+                    result = await asyncio.to_thread(handler)
+                if asyncio.iscoroutine(result):
+                    result = await result
             if isinstance(result, dict):
                 return web.json_response({"ok": True, **result})
             return web.json_response({"ok": True, "result": result})
