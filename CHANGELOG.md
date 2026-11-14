@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.5.1] - 2026-11-13
+
+### Added
+- **Unified 11-Agent Canonical Pipeline (`apex/engine/canonical_pipeline.py`, `apex/cockpit/replay_engine.py`, `tools/live_lifecycle_drill.py`):**
+  - Routes Live Scanning, Historical Replay (`20x`/`50x`/`100x` across `2d`/`5d`/`10d`), and `60s Live 0.01-Lot MT5 Drill` (`strict` | `plumbing` mode) through one shared `Canonical11AgentPipeline` emitting a 11-stage `AgentPipelineTrace` with explicit `symbol` and `timeframe` metadata.
+  - Historical Replay enforces `min_net_avg_R >= 0.10`, real Z3 gates, and steps simulated trades bar-by-bar through `AutonomousPositionOrchestrator`.
+- **251-Symbol Asset Picker, Replay Trade Log & 11-Agent X-Ray Modal (`apex/cockpit/static/index.html`, `apex/cockpit/web_cockpit.py`, `apex_runner.py`):**
+  - Searchable 251-symbol dropdown grouped by asset class (`Auto Top-12 Active Basket`, `Auto Best Open Mover`, `FOREX`, `INDICES`, `METALS`, `CRYPTO`, `US_EQUITIES`, `ENERGY`, `COMMODITIES`) plus Replay Window/Speed & Drill Mode selectors and a clickable **11-Agent X-Ray Scorecard** modal.
+
+### Fixed
+- **6 Live Cockpit & Cost Forensic Bugs (`universe_scanner.py`, `mt5_feed.py`, `walkforward_db.py`, `model_selector.py`, `veto_committee.py`):**
+  - Clear top KPI titles (`ACCOUNT EQUITY`, `OPEN POSITIONS & MESH`, `AI BRAIN & QUOTA`, `CONTAGION & Z3 INTEGRITY`) and non-`UNKNOWN` `active_model_label` before the first AI call.
+  - Persisted AI model-family quarantine cooldowns in SQLite (`model_family_cooldowns`) across bot restarts.
+  - Closed-market weekend exclusion requiring BOTH `trade_mode == SYMBOL_TRADE_MODE_FULL` AND tick age `<= 120s` (eliminating `SUGAR`/`UKCOCOA` weekend leaks).
+  - Asset-class commission (`$4.50/lot` FOREX/METALS only, `$0.00` CRYPTO/INDICES/US_EQUITIES/ENERGY/COMMODITIES) + `ContractSpec` risk scaling (fixing `ADAUSD` skew).
+  - Atomic `effective_cost_pips >= spread_pips` clamping, forced `Q-KELLY = 0.00%` on filtered/chop rows, and actionable-first sorting in `scan_cycle()`.
+
+---
+
 ## [2.5.0] - 2026-11-13
 
 ### Added

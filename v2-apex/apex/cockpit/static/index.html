@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PocketBot Apex v2.4 — Live Institutional Cockpit</title>
+  <title>PocketBot Apex v2.5.1 — Live Institutional Cockpit</title>
   <style>
     :root {
       --bg: #070b14;
@@ -150,31 +150,50 @@
 
   <section class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-label">Account Equity</div>
+      <div class="kpi-label">ACCOUNT EQUITY</div>
       <div class="kpi-val" id="kpi-equity">--</div>
       <div class="kpi-sub" id="kpi-pnl">Daily P/L: --</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Open Positions &amp; Mesh</div>
+      <div class="kpi-label">OPEN POSITIONS &amp; MESH</div>
       <div class="kpi-val" id="kpi-open">0 Open</div>
       <div class="kpi-sub" id="kpi-mesh">Mesh: --</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Verified AI Model &amp; Families</div>
+      <div class="kpi-label">AI BRAIN &amp; QUOTA</div>
       <div class="kpi-val" id="kpi-ai-model">--</div>
       <div class="kpi-sub" id="kpi-ai-quarantined">Quarantined: None</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">Contagion Shock Z &amp; Aegis Z3</div>
+      <div class="kpi-label">CONTAGION &amp; Z3 INTEGRITY</div>
       <div class="kpi-val" id="kpi-contagion">Z = 0.00</div>
       <div class="kpi-sub" id="kpi-aegis">Aegis Z3: --</div>
     </div>
   </section>
 
-  <section class="controls">
+  <section class="controls" style="flex-wrap:wrap;gap:8px;align-items:center;">
+    <input id="asset-search" type="text" placeholder="Filter 251 assets..." oninput="filterAssetSelect()" style="background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px;width:135px;font-size:12px;" />
+    <select id="asset-select" style="background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:12px;max-width:210px;">
+      <option value="AUTO_TOP12">Auto Top-12 Active Basket</option>
+      <option value="AUTO_BEST_MOVER">Auto Best Open Mover</option>
+    </select>
+    <select id="drill-mode" style="background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:12px;">
+      <option value="plumbing">Drill: 11-Agent Scorecard + 0.01-Lot Plumbing</option>
+      <option value="strict">Drill: Strict 11-Agent Gate</option>
+    </select>
+    <select id="replay-window" style="background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:12px;">
+      <option value="2">Replay: 2d</option>
+      <option value="5" selected>Replay: 5d</option>
+      <option value="10">Replay: 10d</option>
+    </select>
+    <select id="replay-speed" style="background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:12px;">
+      <option value="20">20x</option>
+      <option value="50">50x</option>
+      <option value="100" selected>100x</option>
+    </select>
     <button class="btn-amber" id="btn-pause" onclick="sendControl('pause')">Pause Scan</button>
-    <button class="btn-cyan" id="btn-drill" onclick="sendControl('drill')">Run 60s Live 0.01-Lot MT5 Drill</button>
-    <button class="btn-blue" id="btn-replay" onclick="sendControl('replay')">Run 100x Historical Replay</button>
+    <button class="btn-cyan" id="btn-drill" onclick="runDrill()">Run 60s Live 0.01-Lot MT5 Drill</button>
+    <button class="btn-blue" id="btn-replay" onclick="runReplay()">Run Historical Replay</button>
     <button class="btn-purple" id="btn-refresh" onclick="sendControl('refresh_ai')">Refresh AI Brain</button>
     <button class="btn-danger" id="btn-panic" onclick="panicFlatten()">PANIC FLATTEN ALL DEMO POSITIONS</button>
     <span class="control-msg" id="control-msg"></span>
@@ -183,23 +202,48 @@
   <section class="split-grid">
     <div class="panel" id="drill-panel">
       <div class="panel-title">
-        <span>Live 0.01-Lot MT5 Lifecycle Drill</span>
-        <span class="badge" id="drill-status">IDLE</span>
+        <span>Live 0.01-Lot MT5 Lifecycle Drill <span id="drill-sym-badge"></span></span>
+        <span>
+          <button class="badge" id="btn-drill-xray" style="display:none;cursor:pointer;border:1px solid #38bdf8;background:#0f172a;color:#38bdf8;margin-right:6px;" onclick="openXrayModal('drill')">11-Agent X-Ray</button>
+          <span class="badge" id="drill-status">IDLE</span>
+        </span>
       </div>
-      <div id="drill-body" class="muted">Click "Run 60s Live 0.01-Lot MT5 Drill" to execute a live DEMO bracket order, stream P/L, test SLTP tighten, and settle.</div>
+      <div id="drill-body" class="muted">Select an asset (or Auto Best Open Mover) and click "Run 60s Live 0.01-Lot MT5 Drill".</div>
     </div>
 
     <div class="panel" id="replay-panel">
       <div class="panel-title">
-        <span>100x Historical Market Replay (Isolated)</span>
-        <span class="badge" id="replay-status">IDLE</span>
+        <span>Historical Market Replay (11-Agent + In-Flight) <span id="replay-sym-badge"></span></span>
+        <span>
+          <button class="badge" id="btn-replay-xray" style="display:none;cursor:pointer;border:1px solid #38bdf8;background:#0f172a;color:#38bdf8;margin-right:6px;" onclick="openXrayModal('replay')">11-Agent X-Ray</button>
+          <span class="badge" id="replay-status">IDLE</span>
+        </span>
       </div>
       <div id="replay-stats" class="muted" style="margin-bottom:6px;">Ready to replay 5 trading days of FusionMarkets M5/M15 candles.</div>
       <svg class="equity-chart" id="replay-svg" viewBox="0 0 400 100" preserveAspectRatio="none">
         <polyline id="replay-line" fill="none" stroke="#06b6d4" stroke-width="2" points="0,50 400,50" />
       </svg>
+      <div id="replay-trades-wrap" style="margin-top:8px;max-height:140px;overflow-y:auto;display:none;">
+        <table>
+          <thead><tr><th>Symbol</th><th>Side</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">Net R</th><th class="num">P/L</th><th>Exit Reason</th></tr></thead>
+          <tbody id="replay-trades-body"></tbody>
+        </table>
+      </div>
     </div>
   </section>
+
+  <div id="xray-modal" style="display:none;position:fixed;inset:0;background:rgba(2,6,23,0.82);z-index:9999;align-items:center;justify-content:center;padding:16px;">
+    <div style="background:#0f172a;border:1px solid #334155;border-radius:10px;max-width:780px;width:100%;max-height:85vh;overflow-y:auto;padding:16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <strong id="xray-title" style="color:#f8fafc;font-size:14px;">11-Agent Canonical Pipeline X-Ray</strong>
+        <button onclick="closeXrayModal()" style="background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;padding:4px 10px;cursor:pointer;">Close</button>
+      </div>
+      <table>
+        <thead><tr><th>#</th><th>Agent / Gate</th><th>Status</th><th>Metric</th><th>Detail</th></tr></thead>
+        <tbody id="xray-body"></tbody>
+      </table>
+    </div>
+  </div>
 
   <section class="panel">
     <div class="panel-title">
@@ -282,14 +326,92 @@
       if (lastState) renderState(lastState);
     }
 
-    async function sendControl(action) {
+    let latestTraces = { drill: null, replay: null };
+    let lastCatalogHash = '';
+
+    function populateCatalogSelect(catalog) {
+      if (!catalog || typeof catalog !== 'object') return;
+      const keys = Object.keys(catalog).sort();
+      const hash = keys.map(k => k + ':' + (catalog[k] || []).length).join('|');
+      if (!hash || hash === lastCatalogHash) return;
+      lastCatalogHash = hash;
+      const sel = document.getElementById('asset-select');
+      const prevVal = sel.value;
+      sel.innerHTML = '<option value="AUTO_TOP12">Auto Top-12 Active Basket</option><option value="AUTO_BEST_MOVER">Auto Best Open Mover</option>';
+      keys.forEach(group => {
+        const syms = catalog[group] || [];
+        if (!syms.length) return;
+        const og = document.createElement('optgroup');
+        og.label = `${group} (${syms.length})`;
+        syms.forEach(sym => {
+          const opt = document.createElement('option');
+          opt.value = sym;
+          opt.textContent = sym;
+          og.appendChild(opt);
+        });
+        sel.appendChild(og);
+      });
+      if (prevVal) sel.value = prevVal;
+      filterAssetSelect();
+    }
+
+    function filterAssetSelect() {
+      const q = (document.getElementById('asset-search').value || '').trim().toUpperCase();
+      const sel = document.getElementById('asset-select');
+      Array.from(sel.querySelectorAll('optgroup')).forEach(og => {
+        let visibleInGroup = 0;
+        Array.from(og.querySelectorAll('option')).forEach(opt => {
+          const match = !q || opt.value.toUpperCase().includes(q);
+          opt.hidden = !match;
+          if (match) visibleInGroup++;
+        });
+        og.hidden = visibleInGroup === 0;
+      });
+    }
+
+    function runDrill() {
+      const sym = document.getElementById('asset-select').value;
+      const mode = document.getElementById('drill-mode').value;
+      sendControl('drill', { symbol: sym, drill_mode: mode });
+    }
+
+    function runReplay() {
+      const sym = document.getElementById('asset-select').value;
+      const win = Number(document.getElementById('replay-window').value || 5);
+      const spd = Number(document.getElementById('replay-speed').value || 100);
+      sendControl('replay', { symbol: sym, window_days: win, speed: spd });
+    }
+
+    function openXrayModal(source) {
+      const trace = latestTraces[source];
+      if (!trace || !trace.stages) return;
+      document.getElementById('xray-title').textContent =
+        `11-Agent X-Ray: ${trace.symbol || ''} (${trace.timeframe || 'M5'}) — ${trace.passed_all ? 'ALL PASS' : 'BLOCKED AT STAGE ' + trace.blocked_stage}`;
+      document.getElementById('xray-body').innerHTML = trace.stages.map(st => {
+        const cls = st.passed ? 'pos' : 'neg';
+        return `<tr>
+          <td>${st.stage_num}</td>
+          <td><strong>${esc(st.agent_name)}</strong></td>
+          <td class="${cls}">${st.passed ? 'PASS' : 'BLOCK'}</td>
+          <td class="muted">${esc(st.metric_value || '')}</td>
+          <td class="muted">${esc(st.detail || '')}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('xray-modal').style.display = 'flex';
+    }
+
+    function closeXrayModal() {
+      document.getElementById('xray-modal').style.display = 'none';
+    }
+
+    async function sendControl(action, payload) {
       const msgEl = document.getElementById('control-msg');
       msgEl.textContent = 'Sending ' + action + '...';
       try {
         const res = await fetch('/api/control/' + action, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Apex-CSRF': csrfToken },
-          body: '{}'
+          body: JSON.stringify(payload || {})
         });
         const data = await res.json();
         msgEl.textContent = data.message || ('Action ' + action + ': ' + (data.ok ? 'OK' : 'Failed'));
@@ -337,19 +459,31 @@
       const pauseBtn = document.getElementById('btn-pause');
       pauseBtn.textContent = s.paused ? 'Resume Scan' : 'Pause Scan';
 
+      if (s.catalog_symbols) populateCatalogSelect(s.catalog_symbols);
+
       // Drill panel
       const d = s.drill_state || {};
       document.getElementById('drill-status').textContent = d.status || 'IDLE';
+      document.getElementById('drill-sym-badge').innerHTML = d.symbol ? `<span class="badge">${esc(d.symbol)}</span>` : '';
+      if (d.trace) {
+        latestTraces.drill = d.trace;
+        document.getElementById('btn-drill-xray').style.display = 'inline-block';
+      }
       if (d.message) {
-        const dPnl = d.floating_pnl !== undefined ? ` | Floating: ${Number(d.floating_pnl).toFixed(2)} ${cur}` : '';
-        const dTicket = d.ticket ? ` | Ticket #${d.ticket}` : '';
-        document.getElementById('drill-body').innerHTML =
-          `<strong>${esc(d.symbol || '')}</strong>${esc(dTicket)}${esc(dPnl)}<br>${esc(d.message)}`;
+        const dPnl = (d.ticket && d.floating_pnl !== undefined) ? ` | Floating: ${Number(d.floating_pnl).toFixed(2)} ${cur}` : '';
+        const dTicket = d.ticket ? `Ticket #${d.ticket}` : '';
+        const headerLine = (d.symbol || dTicket || dPnl) ? `<strong>${esc(d.symbol || '')}</strong> ${esc(dTicket)}${esc(dPnl)}<br>` : '';
+        document.getElementById('drill-body').innerHTML = `${headerLine}${esc(d.message)}`;
       }
 
       // Replay panel
       const rp = s.replay_state || {};
       document.getElementById('replay-status').textContent = rp.status || 'IDLE';
+      document.getElementById('replay-sym-badge').innerHTML = rp.symbol ? `<span class="badge">${esc(rp.symbol)}</span>` : '';
+      if (rp.last_trace) {
+        latestTraces.replay = rp.last_trace;
+        document.getElementById('btn-replay-xray').style.display = 'inline-block';
+      }
       if (rp.message) {
         document.getElementById('replay-stats').textContent = rp.message;
       }
@@ -363,6 +497,28 @@
           return `${x.toFixed(1)},${y.toFixed(1)}`;
         }).join(' ');
         document.getElementById('replay-line').setAttribute('points', pts);
+      }
+      const rtWrap = document.getElementById('replay-trades-wrap');
+      const rtBody = document.getElementById('replay-trades-body');
+      const rTrades = rp.trades || [];
+      if (rTrades.length) {
+        rtWrap.style.display = 'block';
+        rtBody.innerHTML = rTrades.slice(-20).reverse().map(t => {
+          const nr = Number(t.net_r || 0);
+          const pnlUsd = Number(t.pnl_cad ?? t.pnl_usd ?? 0);
+          const cls = nr >= 0 ? 'pos' : 'neg';
+          return `<tr>
+            <td><strong>${esc(t.symbol || '')}</strong></td>
+            <td>${esc(t.side || '')}</td>
+            <td class="num">${Number(t.entry_price ?? t.entry ?? 0).toFixed(4)}</td>
+            <td class="num">${Number(t.exit_price ?? t.exit ?? 0).toFixed(4)}</td>
+            <td class="num ${cls}">${nr >= 0 ? '+' : ''}${nr.toFixed(2)}R</td>
+            <td class="num ${cls}">${pnlUsd >= 0 ? '+' : ''}${pnlUsd.toFixed(2)}</td>
+            <td class="muted">${esc(t.exit_reason || '')}</td>
+          </tr>`;
+        }).join('');
+      } else {
+        rtWrap.style.display = 'none';
       }
 
       // Open positions

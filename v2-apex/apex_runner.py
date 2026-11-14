@@ -311,7 +311,14 @@ class ApexOrchestrator:
             self.web_cockpit.push_state({"paused": self.paused})
         return {"paused": self.paused, "message": "Paused" if self.paused else "Resumed"}
 
-    def _handle_web_drill(self) -> dict[str, object]:
+    def _handle_web_drill(self, payload: dict[str, Any] | None = None) -> dict[str, object]:
+        payload = payload or {}
+        raw_sym = str(payload.get("symbol", "") or "").strip().upper()
+        sym_override = None if raw_sym in {"", "AUTO_BEST_MOVER", "AUTO_TOP12"} else raw_sym
+        drill_mode = str(payload.get("drill_mode", "plumbing") or "plumbing").strip().lower()
+        if drill_mode not in {"strict", "plumbing"}:
+            drill_mode = "plumbing"
+
         with self._bg_lock:
             if self._drill_running:
                 return {"started": False, "message": "Live drill is already running."}
@@ -324,8 +331,10 @@ class ApexOrchestrator:
                 cb = self.web_cockpit.update_drill_state if self.web_cockpit is not None else None
                 run_live_lifecycle_drill(
                     hold_seconds=15,
+                    symbol_override=sym_override,
                     db_path=self.ledger.db_path,
                     on_update=cb,
+                    drill_mode=drill_mode,
                 )
             except Exception as exc:
                 if self.web_cockpit is not None:
@@ -335,19 +344,42 @@ class ApexOrchestrator:
                     self._drill_running = False
 
         threading.Thread(target=_worker, name="ApexWebDrillThread", daemon=True).start()
-        return {"started": True, "message": "Started 60s Live 0.01-Lot MT5 Demo Drill."}
+        target_label = sym_override or "Auto Best Open Mover"
+        return {"started": True, "message": f"Started 60s Live Drill ({drill_mode.upper()}) on {target_label}."}
 
-    def _handle_web_replay(self) -> dict[str, object]:
+    def _handle_web_replay(self, payload: dict[str, Any] | None = None) -> dict[str, object]:
+        payload = payload or {}
+        raw_sym = str(payload.get("symbol", "") or "").strip().upper()
+        symbols_arg = None if raw_sym in {"", "AUTO_TOP12", "AUTO_BEST_MOVER"} else (raw_sym,)
+        try:
+            window_days = int(payload.get("window_days", 5))
+        except (TypeError, ValueError):
+            window_days = 5
+        if window_days not in {2, 5, 10}:
+            window_days = 5
+        try:
+            speed = float(payload.get("speed", 100.0))
+        except (TypeError, ValueError):
+            speed = 100.0
+        if speed not in {20.0, 50.0, 100.0}:
+            speed = 100.0
+
         with self._bg_lock:
             if self._replay_running:
-                return {"started": False, "message": "100x Replay is already running."}
+                return {"started": False, "message": "Historical Replay is already running."}
             self._replay_running = True
 
         def _worker() -> None:
             try:
                 engine = HistoricalReplayEngine()
                 cb = self.web_cockpit.update_replay_state if self.web_cockpit is not None else None
-                engine.run_replay(feed_router=self.feed_router, on_update=cb)
+                engine.run_replay(
+                    feed_router=self.feed_router,
+                    symbols=symbols_arg,
+                    window_days=window_days,
+                    speed=speed,
+                    on_update=cb,
+                )
             except Exception as exc:
                 if self.web_cockpit is not None:
                     self.web_cockpit.update_replay_state({"status": "ERROR", "message": str(exc)})
@@ -356,7 +388,8 @@ class ApexOrchestrator:
                     self._replay_running = False
 
         threading.Thread(target=_worker, name="ApexWebReplayThread", daemon=True).start()
-        return {"started": True, "message": "Started 100x Historical Market Replay."}
+        target_label = raw_sym if symbols_arg else "Auto Top-12 Active Basket"
+        return {"started": True, "message": f"Started {int(speed)}x ({window_days}d) Replay on {target_label}."}
 
     def _handle_web_refresh_ai(self) -> dict[str, object]:
         report = self.sleep_consolidator.run_full_cycle(
@@ -434,12 +467,24 @@ class ApexOrchestrator:
 
         serialized_events = [asdict(ev) for ev in combined_events]
 
+        catalog_grouped: dict[str, list[str]] = {}
+        try:
+            catalog_items = self.universe_scanner.get_catalog()
+            for item in catalog_items:
+                ac = item.asset_class.value
+                catalog_grouped.setdefault(ac, []).append(item.canonical_name or item.name)
+            for ac in catalog_grouped:
+                catalog_grouped[ac] = sorted(set(catalog_grouped[ac]))
+        except Exception:
+            catalog_grouped = {}
+
         self.web_cockpit.push_state(
             {
                 "run_mode": self.mode.upper(),
                 "mind_state_badge": mind_badge,
                 "universe_scanned_count": self.last_scan_summary.open_scanned if self.last_scan_summary else 0,
                 "universe_total_count": self.last_scan_summary.total_scanned if self.last_scan_summary else 0,
+                "catalog_symbols": catalog_grouped,
                 "account_currency": account_currency,
                 "account_equity": round(float(self.execution_router.account_equity_usd), 2),
                 "daily_pnl": round(float(daily_pnl), 2),

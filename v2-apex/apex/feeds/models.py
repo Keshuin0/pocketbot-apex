@@ -128,6 +128,8 @@ class ContractSpec:
     max_volume_lots: float
     step_volume_lots: float
     source: str
+    trade_tick_value: float = 0.0
+    trade_tick_size: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

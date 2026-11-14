@@ -16,6 +16,7 @@ import numpy as np
 
 from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
 from apex.cockpit.tui_dashboard import BrokerExecutionEvent, SymbolCockpitRow
+from apex.engine.canonical_pipeline import compute_asset_class_commission_usd
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import AssetClass, DiscoveredSymbol, Side, Tick
@@ -95,7 +96,7 @@ class UniverseScanner:
         scanner_cfg = self.config.get("scanner", {})
         self.max_candidates_per_cycle: int = int(scanner_cfg.get("max_candidates_per_cycle", 12))
         self.auto_enable_market_watch: bool = bool(scanner_cfg.get("auto_enable_market_watch", True))
-        self.max_tick_age_seconds: float = float(scanner_cfg.get("max_tick_age_seconds", 180.0))
+        self.max_tick_age_seconds: float = float(scanner_cfg.get("max_tick_age_seconds", 120.0))
         self.min_candles_required: int = int(scanner_cfg.get("min_candles_required", 30))
         self.min_net_avg_R: float = float(scanner_cfg.get("min_net_avg_R", 0.10))
 
@@ -130,6 +131,12 @@ class UniverseScanner:
         now_utc: float | None = None,
     ) -> tuple[bool, str]:
         """Determine if a symbol is open and actively trading."""
+        mt5_client = getattr(self.feed_router, "mt5", None)
+        if mt5_client is not None and getattr(mt5_client, "_initialized", False):
+            check_fn = getattr(mt5_client, "is_symbol_trade_mode_full", None)
+            if callable(check_fn) and not check_fn(symbol):
+                return False, "TRADE_MODE_CLOSED"
+
         if tick is None:
             return False, "NO_TICK"
 
@@ -390,6 +397,7 @@ class UniverseScanner:
             )
 
         spread_px = tick.spread
+        spread_pips_atomic = round(max(spread_px / pip_size, 0.0), 2)
         diag = self.regime_classifier.classify_candles(
             symbol=sym,
             candles=candles,
@@ -408,10 +416,11 @@ class UniverseScanner:
             one_r_price_distance=sl_dist,
             side=Side.BUY,
         )
+        effective_cost_pips = max(float(nbbo.winning_cost_pips), spread_pips_atomic)
         if nbbo.pips_saved > 0.0:
-            best_venue_str = f"{nbbo.winning_venue.upper()} (-{nbbo.pips_saved:.1f}p)"
+            best_venue_str = f"{nbbo.winning_venue.upper()} ({effective_cost_pips:.1f}p, -{nbbo.pips_saved:.1f}p)"
         else:
-            best_venue_str = f"{nbbo.winning_venue.upper()} ({nbbo.winning_cost_pips:.1f}p)"
+            best_venue_str = f"{nbbo.winning_venue.upper()} ({effective_cost_pips:.1f}p)"
 
         gate_verdict = self.momentum_dom_gate.evaluate(
             symbol=sym,
@@ -423,10 +432,21 @@ class UniverseScanner:
             dom_analytics=dom,
         )
 
+        commission_usd = compute_asset_class_commission_usd(sym, candidate.asset_class)
+        risk_per_lot_usd = 100.0
+        if spec is not None:
+            if getattr(spec, "trade_tick_value", 0.0) > 0.0 and getattr(spec, "trade_tick_size", 0.0) > 0.0:
+                risk_per_lot_usd = max((sl_dist / spec.trade_tick_size) * spec.trade_tick_value, 1.0)
+            elif spec.lot_size > 0.0:
+                # For low-priced USD-quoted crypto/CFDs (e.g. ADAUSD), sl_dist * lot_size gives true $ risk/lot
+                est = sl_dist * spec.lot_size
+                if est > 0.0:
+                    risk_per_lot_usd = max(est, 1.0)
+
         eff_cost_model = cost_model or TimeMachineCostModel(
-            commission_per_lot_round_turn_usd=4.50,
+            commission_per_lot_round_turn_usd=commission_usd,
             lots=0.10,
-            risk_per_lot_usd=100.0,
+            risk_per_lot_usd=risk_per_lot_usd,
             spread_price=spread_px,
             vwap_slippage_price=0.2 * pip_size,
         )
@@ -525,13 +545,13 @@ class UniverseScanner:
             timeframe=tf,
             bid=tick.bid,
             ask=tick.ask,
-            spread_pips=candidate.spread_pips,
+            spread_pips=spread_pips_atomic,
             regime=diag.regime.value,
             hurst=diag.hurst_exponent,
             kaufman_er=diag.kaufman_er,
             obi=dom.obi if dom else None,
             net_avg_r=tm_res.net_avg_R,
-            rec_risk_pct=tm_res.recommended_risk_pct,
+            rec_risk_pct=(tm_res.recommended_risk_pct if passed_all_quant else 0.0),
             ai_verdict=ai_label,
             quarantine_mode=q_state.mode.value,
             profit_factor=q_state.profit_factor,
@@ -558,4 +578,10 @@ class UniverseScanner:
             row = self.evaluate_candidate_pipeline(candidate)
             rows.append(row)
 
+        rows.sort(
+            key=lambda r: (
+                0 if (r.regime == "TRENDING_EXPANSION" and (r.rec_risk_pct or 0.0) > 0.0) else 1,
+                -(r.net_avg_r if r.net_avg_r is not None else -999.0),
+            )
+        )
         return rows, summary

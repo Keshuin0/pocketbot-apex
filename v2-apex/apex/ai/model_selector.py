@@ -174,6 +174,7 @@ class AdaptiveModelSelector:
         self,
         soft_pro_threshold_pct: float = 0.70,
         discovery_ttl_seconds: float = 3600.0,
+        ledger_db: Any = None,
     ) -> None:
         self.soft_pro_threshold_pct: float = float(soft_pro_threshold_pct)
         self.discovery_ttl_seconds: float = float(discovery_ttl_seconds)
@@ -182,6 +183,28 @@ class AdaptiveModelSelector:
         self._last_verified_model: dict[str, str] = {}
         self._last_studio_discovery_utc: float = 0.0
         self._last_agy_discovery_utc: float = 0.0
+        self._ledger_db: Any = None
+        if ledger_db is not None:
+            self.set_ledger_db(ledger_db)
+
+    def set_ledger_db(self, ledger_db: Any, now_utc: float | None = None) -> None:
+        """Attach WalkForwardLedgerDB and restore any active persisted family cooldowns."""
+        self._ledger_db = ledger_db
+        if ledger_db is None:
+            return
+        loader = getattr(ledger_db, "load_active_family_cooldowns", None)
+        if not callable(loader):
+            return
+        try:
+            active = loader(now_utc=now_utc)
+        except Exception:
+            return
+        for key, (until_ts, reason) in active.items():
+            if ":" in key:
+                prov, fam = key.split(":", 1)
+                self._family_cooldowns[(prov.strip(), fam.strip().lower())] = (float(until_ts), reason)
+            else:
+                self._family_cooldowns[("agy_pro", key.strip().lower())] = (float(until_ts), reason)
 
     def quarantine_family(
         self,
@@ -200,6 +223,13 @@ class AdaptiveModelSelector:
         prev_until, _ = self._family_cooldowns.get((provider, fam), (0.0, ""))
         if until_ts > prev_until:
             self._family_cooldowns[(provider, fam)] = (until_ts, reason[:120])
+        if self._ledger_db is not None:
+            saver = getattr(self._ledger_db, "save_family_cooldown", None)
+            if callable(saver):
+                try:
+                    saver(f"{provider}:{fam}", until_ts, reason[:120], ts)
+                except Exception:
+                    pass
         for m in self.get_models(provider):
             m_fam = m.family or classify_model_family(m.model_id)
             if m_fam == fam:

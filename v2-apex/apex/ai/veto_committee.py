@@ -105,6 +105,16 @@ class HybridAIRouterStatus:
     model_quota_summary: dict[str, Any] = field(default_factory=dict)
 
     @property
+    def active_model_label(self) -> str:
+        """Return human-readable active provider + top READY model (never UNKNOWN)."""
+        if not self.enabled or self.active_primary == AIProviderName.PURE_MATH.value:
+            return "PURE_MATH: deterministic"
+        sel = str(self.model_quota_summary.get("selected_model", "") or "").strip()
+        if sel and sel.lower() not in {"none", "unknown"}:
+            return f"{self.active_primary.upper()}: {sel}"
+        return f"{self.active_primary.upper()}: READY"
+
+    @property
     def dashboard_badge(self) -> str:
         """Format compact header badge, e.g. `AI Brain: AGY_PRO [Auto -> Pure Math fallback]`."""
         primary_upper = self.active_primary.upper()
@@ -253,7 +263,7 @@ class AIVetoCommittee:
         self._agy_cooldown_until_utc: float = 0.0
         self.min_net_avg_R: float = 0.10
         self.ledger_db: Any = ledger_db
-        self.model_selector: AdaptiveModelSelector = AdaptiveModelSelector()
+        self.model_selector: AdaptiveModelSelector = AdaptiveModelSelector(ledger_db=ledger_db)
         self.aegis: AegisVerifier = AegisVerifier(
             ledger_db=ledger_db,
             model_selector=self.model_selector,
