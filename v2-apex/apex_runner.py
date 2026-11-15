@@ -348,10 +348,31 @@ class ApexOrchestrator:
         target_label = sym_override or "Auto Best Open Mover"
         return {"started": True, "message": f"Started 60s Live Drill ({drill_mode.upper()}) on {target_label}."}
 
+    def _resolve_replay_symbols(self, raw_sym: str) -> tuple[tuple[str, ...], str]:
+        """Resolve cockpit selector into concrete replay symbols & display label."""
+        from apex.cockpit.replay_engine import DEFAULT_REPLAY_SYMBOLS
+
+        matrix = list(getattr(self, "last_matrix", None) or ())
+        if raw_sym in {"", "AUTO_TOP12"}:
+            active = [str(r.symbol).upper() for r in matrix if getattr(r, "symbol", None)]
+            merged: list[str] = []
+            for s in [*active, "BTCUSD", "ETHUSD", *DEFAULT_REPLAY_SYMBOLS]:
+                if s and s not in merged:
+                    merged.append(s)
+            return tuple(merged[:12]), "Auto Top-12 Active Basket"
+        if raw_sym == "AUTO_BEST_MOVER":
+            if matrix:
+                best = max(matrix, key=lambda r: abs(float(getattr(r, "net_avg_r", 0.0) or 0.0)))
+                sym = str(getattr(best, "symbol", "") or "").upper()
+                if sym:
+                    return (sym,), f"Auto Best Open Mover ({sym})"
+            return ("BTCUSD",), "Auto Best Open Mover (BTCUSD)"
+        return (raw_sym,), raw_sym
+
     def _handle_web_replay(self, payload: dict[str, Any] | None = None) -> dict[str, object]:
         payload = payload or {}
         raw_sym = str(payload.get("symbol", "") or "").strip().upper()
-        symbols_arg = None if raw_sym in {"", "AUTO_TOP12", "AUTO_BEST_MOVER"} else (raw_sym,)
+        symbols_arg, target_label = self._resolve_replay_symbols(raw_sym)
         try:
             window_days = int(payload.get("window_days", 5))
         except (TypeError, ValueError):
@@ -389,7 +410,6 @@ class ApexOrchestrator:
                     self._replay_running = False
 
         threading.Thread(target=_worker, name="ApexWebReplayThread", daemon=True).start()
-        target_label = raw_sym if symbols_arg else "Auto Top-12 Active Basket"
         return {"started": True, "message": f"Started {int(speed)}x ({window_days}d) Replay on {target_label}."}
 
     def _handle_web_refresh_ai(self) -> dict[str, object]:
@@ -590,7 +610,7 @@ def format_web_cockpit_banner(cockpit_url: str, mode: str) -> str:
     """Return a compact 5-line startup banner for the Web Cockpit engine console."""
     return (
         "============================================================\n"
-        f"  POCKETBOT APEX v2.7.0  |  Mode: {mode.upper()}\n"
+        f"  POCKETBOT APEX v2.7.1  |  Mode: {mode.upper()}\n"
         f"  Chrome Cockpit URL: {cockpit_url}\n"
         "  Keep this engine window minimized;\n"
         "  view & control everything in the Chrome Cockpit window.\n"
@@ -605,7 +625,7 @@ def format_single_line_heartbeat(orchestrator: ApexOrchestrator) -> str:
     total = orchestrator.last_scan_summary.total_scanned if orchestrator.last_scan_summary else 0
     state = "PAUSED" if orchestrator.paused else "SCANNING"
     ts = datetime.datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] APEX v2.7.0 | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
+    line = f"[{ts}] APEX v2.7.1 | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
     return line[:96].ljust(96)
 
 

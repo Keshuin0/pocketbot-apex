@@ -203,6 +203,7 @@ class AutonomousPositionOrchestrator:
         execute_broker_actions: bool = False,
     ) -> PositionDecision:
         """Evaluate one open position across Rules A-D and optionally dispatch SLTP/close."""
+        candles = list(candles or ())
         now_ts = float(now_utc if now_utc is not None else time.time())
         open_ts = float(opened_at_utc if opened_at_utc is not None else now_ts)
         st, current_r = self._register_or_update_state(
@@ -527,15 +528,16 @@ class AutonomousPositionOrchestrator:
 
     def reconcile_closed_deals(
         self,
-        open_tickets: set[int],
+        open_tickets: set[int] | None,
         deals_fetcher: Optional[Callable[[int], Sequence[Any]]] = None,
     ) -> list[dict[str, Any]]:
         """Detect tracked positions no longer open on broker and log MFE_R/MAE_R autopsy."""
-        closed_tickets = [t for t in list(self.tracked.keys()) if t not in open_tickets]
+        open_set = set(open_tickets or ())
+        closed_tickets = [t for t in list(self.tracked.keys()) if t not in open_set]
         reconciled: list[dict[str, Any]] = []
         for ticket in closed_tickets:
             st = self.tracked.pop(ticket)
-            deals = deals_fetcher(ticket) if deals_fetcher is not None else (mt5.history_deals_get(position=ticket) or ())
+            deals = list((deals_fetcher(ticket) if deals_fetcher is not None else mt5.history_deals_get(position=ticket)) or ())
             exit_deals = [d for d in deals if int(getattr(d, "entry", -1)) == int(getattr(mt5, "DEAL_ENTRY_OUT", 1))]
             if not exit_deals:
                 continue

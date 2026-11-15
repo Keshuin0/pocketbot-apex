@@ -118,6 +118,9 @@ class Canonical11AgentPipeline:
         in_flight_ready: bool = True,
     ) -> AgentPipelineTrace:
         """Execute all 11 stages deterministically and emit an AgentPipelineTrace."""
+        candles = list(candles or ())
+        h1_candles = list(h1_candles) if h1_candles is not None else None
+        open_positions = list(open_positions or ())
         stages: list[PipelineStageResult] = []
         asset_class = self._alias_mapper.classify_asset_class(symbol)
 

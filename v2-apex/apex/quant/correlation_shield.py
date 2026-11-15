@@ -196,12 +196,15 @@ class FactorExposureVerdict:
 
 
 def compute_ledoit_wolf_and_tail_correlation(
-    returns_matrix: np.ndarray,
+    returns_matrix: np.ndarray | None,
     tail_sigma: float = 1.5,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute (1) Ledoit-Wolf Shrinkage correlation matrix (rho_lw) and
     (2) Lower-Tail Crash Co-Movement matrix (rho_tail conditioned on <= -1.5 sigma stress bars).
     """
+    if returns_matrix is None:
+        eye = np.eye(1, dtype=np.float64)
+        return eye, eye.copy()
     x = np.asarray(returns_matrix, dtype=np.float64)
     if x.ndim != 2 or x.shape[0] < 5 or x.shape[1] < 2:
         m = x.shape[1] if x.ndim == 2 else 1
@@ -281,8 +284,10 @@ class CorrelationShield:
         self.tail_sigma: float = float(tail_sigma)
         self._return_histories: dict[str, np.ndarray] = {}
 
-    def register_return_series(self, symbol: str, returns: Sequence[float]) -> None:
+    def register_return_series(self, symbol: str, returns: Sequence[float] | None) -> None:
         """Cache trailing return series for empirical Ledoit-Wolf & tail-crash correlation checks."""
+        if returns is None:
+            return
         arr = np.asarray(returns, dtype=np.float64)
         if arr.ndim == 1 and len(arr) >= 5:
             self._return_histories[symbol.upper().strip()] = arr
@@ -296,11 +301,11 @@ class CorrelationShield:
 
     def compute_portfolio_factor_exposures(
         self,
-        positions: Sequence[PositionRiskSpec],
+        positions: Sequence[PositionRiskSpec] | None,
     ) -> dict[str, float]:
         """Compute net signed factor exposures (in % of total equity at risk) across ``positions``."""
         exposures: dict[str, float] = {f: 0.0 for f in CANONICAL_FACTORS}
-        for pos in positions:
+        for pos in positions or ():
             r_pct = self._resolve_risk_pct(pos)
             weights = decompose_symbol_factors(pos.symbol, pos.side)
             for factor, w in weights.items():
@@ -310,12 +315,13 @@ class CorrelationShield:
     def evaluate_proposed_trade(
         self,
         proposed: PositionRiskSpec,
-        open_positions: Sequence[PositionRiskSpec],
+        open_positions: Sequence[PositionRiskSpec] | None,
         return_histories: Mapping[str, Sequence[float]] | None = None,
     ) -> FactorExposureVerdict:
         """Check whether adding ``proposed`` to ``open_positions`` breaches the 1.0% factor cap or 0.72 tail-crash correlation."""
-        before = self.compute_portfolio_factor_exposures(open_positions)
-        after = self.compute_portfolio_factor_exposures([*open_positions, proposed])
+        open_list = list(open_positions or ())
+        before = self.compute_portfolio_factor_exposures(open_list)
+        after = self.compute_portfolio_factor_exposures([*open_list, proposed])
         prop_risk_pct = self._resolve_risk_pct(proposed)
 
         proposed_factors = decompose_symbol_factors(proposed.symbol, proposed.side)
@@ -339,13 +345,15 @@ class CorrelationShield:
         hist_map: dict[str, np.ndarray] = dict(self._return_histories)
         if return_histories:
             for k, v in return_histories.items():
+                if v is None:
+                    continue
                 hist_map[k.upper().strip()] = np.asarray(v, dtype=np.float64)
 
         prop_sym_u = proposed.symbol.upper().strip()
-        if prop_sym_u in hist_map and open_positions:
+        if prop_sym_u in hist_map and open_list:
             prop_ret = hist_map[prop_sym_u]
             sign_prop = 1.0 if proposed.side == Side.BUY else -1.0
-            for op in open_positions:
+            for op in open_list:
                 op_sym_u = op.symbol.upper().strip()
                 if op_sym_u not in hist_map or op_sym_u == prop_sym_u:
                     continue
