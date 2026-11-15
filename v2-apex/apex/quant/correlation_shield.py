@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
+import numpy as np
+
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.models import AssetClass, Side
 
@@ -193,11 +195,73 @@ class FactorExposureVerdict:
     reason: str = "ok"
 
 
+def compute_ledoit_wolf_and_tail_correlation(
+    returns_matrix: np.ndarray,
+    tail_sigma: float = 1.5,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute (1) Ledoit-Wolf Shrinkage correlation matrix (rho_lw) and
+    (2) Lower-Tail Crash Co-Movement matrix (rho_tail conditioned on <= -1.5 sigma stress bars).
+    """
+    x = np.asarray(returns_matrix, dtype=np.float64)
+    if x.ndim != 2 or x.shape[0] < 5 or x.shape[1] < 2:
+        m = x.shape[1] if x.ndim == 2 else 1
+        eye = np.eye(m, dtype=np.float64)
+        return eye, eye.copy()
+
+    t_len, m_cols = x.shape
+    mean = np.mean(x, axis=0, keepdims=True)
+    xc = x - mean
+    sample_cov = (xc.T @ xc) / float(t_len)
+
+    # Ledoit-Wolf analytical shrinkage toward scaled identity target
+    mu = np.trace(sample_cov) / float(m_cols)
+    target = mu * np.eye(m_cols, dtype=np.float64)
+    gamma = float(np.sum((sample_cov - target) ** 2))
+    if gamma <= 1e-18:
+        shrunk_cov = sample_cov
+    else:
+        # Sum of squared Frobenius deviations of rank-1 outer products
+        sq_norms = np.sum(xc**2, axis=1)
+        phi = float(np.sum(sq_norms**2) / float(t_len) - np.sum(sample_cov**2)) / float(t_len)
+        delta = max(0.0, min(1.0, phi / gamma))
+        shrunk_cov = (1.0 - delta) * sample_cov + delta * target
+
+    stds_lw = np.sqrt(np.maximum(np.diag(shrunk_cov), 1e-18))
+    rho_lw = shrunk_cov / np.outer(stds_lw, stds_lw)
+    rho_lw = np.clip(rho_lw, -1.0, 1.0)
+    np.fill_diagonal(rho_lw, 1.0)
+
+    # Lower-Tail Crash Co-Movement (<= -tail_sigma joint stress bars)
+    stds = np.std(xc, axis=0)
+    stds = np.where(stds > 1e-12, stds, 1e-12)
+    z = xc / stds
+    rho_tail = np.eye(m_cols, dtype=np.float64)
+    for i in range(m_cols):
+        for j in range(i + 1, m_cols):
+            stress_mask = (z[:, i] <= -tail_sigma) | (z[:, j] <= -tail_sigma)
+            if int(np.sum(stress_mask)) >= 4:
+                zi = z[stress_mask, i]
+                zj = z[stress_mask, j]
+                zi_c = zi - np.mean(zi)
+                zj_c = zj - np.mean(zj)
+                denom = float(np.sqrt(np.sum(zi_c**2) * np.sum(zj_c**2)))
+                val = float(np.sum(zi_c * zj_c) / denom) if denom > 1e-12 else 0.0
+                val = max(-1.0, min(1.0, val))
+                rho_tail[i, j] = val
+                rho_tail[j, i] = val
+            else:
+                rho_tail[i, j] = rho_lw[i, j]
+                rho_tail[j, i] = rho_lw[j, i]
+
+    return rho_lw, rho_tail
+
+
 class CorrelationShield:
-    """Currency & Factor Exposure Guard (`apex/quant/correlation_shield.py`).
+    """Currency, Factor & Empirical Tail-Crash Exposure Guard (`apex/quant/correlation_shield.py`).
 
     Respects `enabled` (`config["filters"]["correlation_cap"]["enabled"]`) for walk-forward A/B testing.
-    Caps net single-currency / factor exposure at `max_factor_risk_pct` (default `1.0%` total equity at risk).
+    Caps net single-currency / factor exposure at `max_factor_risk_pct` (default `1.0%` total equity at risk),
+    and blocks hidden crash-correlated trades where max(|rho_lw|, |rho_tail|) >= `max_empirical_corr` (0.72).
     """
 
     def __init__(
@@ -205,12 +269,23 @@ class CorrelationShield:
         enabled: bool = True,
         max_factor_risk_pct: float = 1.0,
         account_equity_usd: float = 10_000.0,
+        max_empirical_corr: float = 0.72,
+        tail_sigma: float = 1.5,
     ) -> None:
         if max_factor_risk_pct <= 0.0:
             raise ValueError(f"max_factor_risk_pct must be > 0, got {max_factor_risk_pct}")
         self.enabled: bool = bool(enabled)
         self.max_factor_risk_pct: float = float(max_factor_risk_pct)
         self.account_equity_usd: float = float(account_equity_usd)
+        self.max_empirical_corr: float = float(max_empirical_corr)
+        self.tail_sigma: float = float(tail_sigma)
+        self._return_histories: dict[str, np.ndarray] = {}
+
+    def register_return_series(self, symbol: str, returns: Sequence[float]) -> None:
+        """Cache trailing return series for empirical Ledoit-Wolf & tail-crash correlation checks."""
+        arr = np.asarray(returns, dtype=np.float64)
+        if arr.ndim == 1 and len(arr) >= 5:
+            self._return_histories[symbol.upper().strip()] = arr
 
     def _resolve_risk_pct(self, pos: PositionRiskSpec) -> float:
         if pos.risk_pct > 0.0:
@@ -236,8 +311,9 @@ class CorrelationShield:
         self,
         proposed: PositionRiskSpec,
         open_positions: Sequence[PositionRiskSpec],
+        return_histories: Mapping[str, Sequence[float]] | None = None,
     ) -> FactorExposureVerdict:
-        """Check whether adding ``proposed`` to ``open_positions`` breaches the 1.0% factor exposure cap."""
+        """Check whether adding ``proposed`` to ``open_positions`` breaches the 1.0% factor cap or 0.72 tail-crash correlation."""
         before = self.compute_portfolio_factor_exposures(open_positions)
         after = self.compute_portfolio_factor_exposures([*open_positions, proposed])
         prop_risk_pct = self._resolve_risk_pct(proposed)
@@ -258,6 +334,41 @@ class CorrelationShield:
                     f"{factor} net exposure would reach {net_after:+.2f}% ({direction} {factor} "
                     f"{abs(net_after):.2f}% > {self.max_factor_risk_pct:.2f}% equity risk cap)"
                 )
+
+        # Empirical Ledoit-Wolf + Lower-Tail Crash Co-Movement check
+        hist_map: dict[str, np.ndarray] = dict(self._return_histories)
+        if return_histories:
+            for k, v in return_histories.items():
+                hist_map[k.upper().strip()] = np.asarray(v, dtype=np.float64)
+
+        prop_sym_u = proposed.symbol.upper().strip()
+        if prop_sym_u in hist_map and open_positions:
+            prop_ret = hist_map[prop_sym_u]
+            sign_prop = 1.0 if proposed.side == Side.BUY else -1.0
+            for op in open_positions:
+                op_sym_u = op.symbol.upper().strip()
+                if op_sym_u not in hist_map or op_sym_u == prop_sym_u:
+                    continue
+                op_ret = hist_map[op_sym_u]
+                n_common = min(len(prop_ret), len(op_ret))
+                if n_common < 10:
+                    continue
+                mat = np.column_stack([prop_ret[-n_common:], op_ret[-n_common:]])
+                rho_lw_mat, rho_tail_mat = compute_ledoit_wolf_and_tail_correlation(mat, tail_sigma=self.tail_sigma)
+                rho_lw = float(rho_lw_mat[0, 1])
+                rho_tail = float(rho_tail_mat[0, 1])
+                sign_op = 1.0 if op.side == Side.BUY else -1.0
+                # Effective directional correlation: positive means stacking same-direction risk
+                dom_rho = rho_tail if abs(rho_tail) >= abs(rho_lw) else rho_lw
+                eff_corr = sign_prop * sign_op * dom_rho
+                if eff_corr >= self.max_empirical_corr:
+                    tag = f"TAIL_CORR_{op_sym_u}"
+                    breached.append(tag)
+                    breach_details.append(
+                        f"Empirical/Tail crash correlation {proposed.symbol}({proposed.side.value}) vs "
+                        f"{op.symbol}({op.side.value}): rho_lw={rho_lw:+.2f}, rho_tail={rho_tail:+.2f} "
+                        f">= {self.max_empirical_corr:.2f}"
+                    )
 
         if not self.enabled:
             return FactorExposureVerdict(

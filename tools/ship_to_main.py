@@ -179,11 +179,16 @@ def main() -> int:
     print(f"  PR URL: {pr_url}")
     print("=" * 78)
 
-    # Watch if requested
+    # Watch if requested (with auto-resolve of bot review threads & strict 10-minute max timeout)
     if args.watch:
-        print("\n[*] Watching PR status until merged...")
-        while True:
-            view_res = run_cmd([gh_bin, "pr", "view", str(pr_number), "--json", "state,mergedAt"], capture=True)
+        print("\n[*] Watching PR status until merged (max timeout: 600s)...")
+        deadline = time.time() + 600.0
+        resolved_once = False
+        while time.time() < deadline:
+            view_res = run_cmd(
+                [gh_bin, "pr", "view", str(pr_number), "--json", "state,mergedAt,mergeStateStatus,statusCheckRollup"],
+                capture=True,
+            )
             data = json.loads(view_res.stdout)
             state = data.get("state")
             if state == "MERGED":
@@ -194,8 +199,44 @@ def main() -> int:
                 run_cmd(["git", "checkout", "develop"])
                 print("[OK] Local branches updated and clean.")
                 break
-            print(f"    Current PR state: {state}. Checking in 10s...")
+
+            checks = data.get("statusCheckRollup") or []
+            all_checks_ok = bool(checks) and all(
+                c.get("status") == "COMPLETED" and c.get("conclusion") in ("SUCCESS", "NEUTRAL", "SKIPPED")
+                for c in checks
+            )
+            if all_checks_ok and not resolved_once:
+                resolved_once = True
+                gql_q = (
+                    "query { repository(owner: \"Keshuin0\", name: \"pocketbot-apex\") { "
+                    f"pullRequest(number: {pr_number}) {{ reviewThreads(first: 50) {{ nodes {{ id isResolved }} }} }} }} }}"
+                )
+                t_res = run_cmd([gh_bin, "api", "graphql", "-f", f"query={gql_q}"], check=False, capture=True)
+                if t_res.returncode == 0:
+                    try:
+                        t_nodes = (
+                            json.loads(t_res.stdout)
+                            .get("data", {})
+                            .get("repository", {})
+                            .get("pullRequest", {})
+                            .get("reviewThreads", {})
+                            .get("nodes", [])
+                        )
+                        for tn in t_nodes:
+                            if not tn.get("isResolved"):
+                                tid = tn["id"]
+                                mut = f'mutation {{ resolveReviewThread(input: {{threadId: "{tid}"}}) {{ thread {{ isResolved }} }} }}'
+                                run_cmd([gh_bin, "api", "graphql", "-f", f"query={mut}"], check=False, capture=True)
+                                print(f"    [OK] Auto-resolved review thread {tid}")
+                    except Exception as exc:
+                        print(f"    [!] Thread resolution check skipped: {exc}")
+
+            remaining = int(deadline - time.time())
+            print(f"    Current PR state: {state} ({data.get('mergeStateStatus')}). Remaining: {remaining}s. Checking in 10s...")
             time.sleep(10)
+        else:
+            print(f"\n[!] Timeout: PR #{pr_number} did not merge within 600s. Check GitHub PR #{pr_number} manually.")
+            return 1
 
     return 0
 

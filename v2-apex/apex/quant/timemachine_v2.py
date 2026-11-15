@@ -18,7 +18,9 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import numpy as np
+from scipy.stats.qmc import Sobol
 
+from apex.compute.hyperion_fabric import get_hyperion_fabric
 from apex.feeds.models import Candle, Side
 
 
@@ -103,6 +105,7 @@ class BlockBootstrapTimeMachine:
         seed: int = 19,
         account_equity_usd: float = 10_000.0,
         max_risk_pct: float = 0.5,
+        use_qmc_sobol: bool = True,
     ) -> None:
         if replays < 100:
             raise ValueError(f"replays must be >= 100, got {replays}")
@@ -114,6 +117,7 @@ class BlockBootstrapTimeMachine:
         self.seed: int = int(seed)
         self.account_equity_usd: float = float(account_equity_usd)
         self.max_risk_pct: float = min(float(max_risk_pct), self.MAX_EQUITY_RISK_PCT)
+        self.use_qmc_sobol: bool = bool(use_qmc_sobol)
 
     @staticmethod
     def build_relative_bar_ratios(candles: Sequence[Candle]) -> np.ndarray:
@@ -142,20 +146,43 @@ class BlockBootstrapTimeMachine:
         pool_length: int,
         horizon_bars: int,
         rng: np.random.Generator,
+        use_qmc_sobol: bool | None = None,
     ) -> np.ndarray:
         """Generate `(replays, horizon_bars)` indices via Politis & Romano Stationary Block Bootstrap.
 
-        At step $t = 0$, draw a uniform starting index $I_0 \\in \\{0, \\dots, L-1\\}$.
-        At each subsequent step $t > 0$:
-          - With probability $1 - p$ (where $p = 1 / \\text{mean\\_block\\_length}$), continue the
-            contiguous historical block: $I_t = (I_{t-1} + 1) \\bmod L$.
-          - With probability $p$, start a new random block at $I_t \\sim \\text{Uniform}(0, L-1)$.
-        This preserves multi-bar volatility clustering and GARCH-like serial dependence in bar ranges.
+        When ``use_qmc_sobol`` is enabled (default), uses Owen-Scrambled Sobol Low-Discrepancy
+        Quasi-Monte Carlo sequences paired with Antithetic Mirror Variates (``1 - u``) so variance
+        converges near O(1/N) instead of O(1/sqrt(N)).
         """
+        qmc_on = self.use_qmc_sobol if use_qmc_sobol is None else bool(use_qmc_sobol)
         p_restart = 1.0 / max(self.mean_block_length, 1.0)
         indices = np.empty((self.replays, horizon_bars), dtype=np.int64)
-        indices[:, 0] = rng.integers(0, pool_length, size=self.replays)
 
+        if qmc_on:
+            half_n = (self.replays + 1) // 2
+            sobol_dim = min(max(1, horizon_bars), 64)
+            sobol = Sobol(d=sobol_dim, scramble=True, seed=int(self.seed))
+            u_half = sobol.random(half_n)
+            if horizon_bars > sobol_dim:
+                extra = rng.random((half_n, horizon_bars - sobol_dim))
+                u_half = np.hstack([u_half, extra])
+            u_anti = 1.0 - u_half
+            u_all = np.vstack([u_half, u_anti])[: self.replays]
+
+            indices[:, 0] = np.clip((u_all[:, 0] * pool_length).astype(np.int64), 0, pool_length - 1)
+            if horizon_bars > 1:
+                u_step = u_all[:, 1:]
+                restarts = u_step < p_restart
+                # Rescale conditional uniform [0, p_restart) -> [0, pool_length)
+                jump_u = np.clip(u_step / max(p_restart, 1e-9), 0.0, 0.999999999)
+                random_jumps = np.clip((jump_u * pool_length).astype(np.int64), 0, pool_length - 1)
+                for t in range(1, horizon_bars):
+                    prev_idx = indices[:, t - 1]
+                    cont_idx = (prev_idx + 1) % pool_length
+                    indices[:, t] = np.where(restarts[:, t - 1], random_jumps[:, t - 1], cont_idx)
+            return indices
+
+        indices[:, 0] = rng.integers(0, pool_length, size=self.replays)
         if horizon_bars > 1:
             restarts = rng.random((self.replays, horizon_bars - 1)) < p_restart
             random_jumps = rng.integers(0, pool_length, size=(self.replays, horizon_bars - 1))
@@ -257,77 +284,39 @@ class BlockBootstrapTimeMachine:
             rng=rng,
         )
 
-        # Vectorized path evaluation across all 10,000 replays
-        sampled_high_ratios = bar_ratios[idx_matrix, 1]
-        sampled_low_ratios = bar_ratios[idx_matrix, 2]
-        sampled_close_ratios = bar_ratios[idx_matrix, 3]
+        # Vectorized 3D [1, N, H] path evaluation via HyperionComputeFabric (GPU / Numba LLVM / NumPy)
+        sampled_high_ratios = bar_ratios[idx_matrix, 1][np.newaxis, :, :]
+        sampled_low_ratios = bar_ratios[idx_matrix, 2][np.newaxis, :, :]
+        sampled_close_ratios = bar_ratios[idx_matrix, 3][np.newaxis, :, :]
+        tie_uniforms = rng.random((1, self.replays, int(horizon_bars)))
 
-        n_paths = self.replays
-        cur_prices = np.full(n_paths, float(entry_price), dtype=np.float64)
-        # 0 = active, 1 = target hit first, -1 = stop hit first
-        status = np.zeros(n_paths, dtype=np.int8)
-
-        for t in range(int(horizon_bars)):
-            active = status == 0
-            if not np.any(active):
-                break
-            hi = cur_prices * sampled_high_ratios[:, t]
-            lo = cur_prices * sampled_low_ratios[:, t]
-            cl = cur_prices * sampled_close_ratios[:, t]
-
-            if is_long:
-                raw_stop = active & (lo <= float(stop_price))
-                raw_target = active & (hi >= float(target_price))
-            else:
-                raw_stop = active & (hi >= float(stop_price))
-                raw_target = active & (lo <= float(target_price))
-
-            both_touch = raw_stop & raw_target
-            if np.any(both_touch):
-                # Brownian-Bridge intra-bar tie-breaker weighted by open-to-barrier proximity & close polarity
-                d_stop = np.abs(cur_prices - float(stop_price))
-                d_target = np.abs(float(target_price) - cur_prices)
-                p_target_first = d_stop / np.maximum(d_stop + d_target, 1e-12)
-                polarity_boost = np.where((cl > cur_prices) if is_long else (cl < cur_prices), 0.15, -0.15)
-                p_target_first = np.clip(p_target_first + polarity_boost, 0.05, 0.95)
-                target_wins_tie = rng.random(n_paths) < p_target_first
-                hit_target = (raw_target & ~raw_stop) | (both_touch & target_wins_tie)
-                hit_stop = (raw_stop & ~raw_target) | (both_touch & ~target_wins_tie)
-            else:
-                hit_stop = raw_stop
-                hit_target = raw_target
-
-            status[hit_stop] = -1
-            status[hit_target] = 1
-            cur_prices = np.where(active, cl, cur_prices)
-
-        if is_long:
-            timeout_r = (cur_prices - float(entry_price)) / one_r_dist
-        else:
-            timeout_r = (float(entry_price) - cur_prices) / one_r_dist
-
-        gross_r = np.where(
-            status == 1,
-            target_r,
-            np.where(status == -1, -1.0, timeout_r),
+        fabric = get_hyperion_fabric()
+        batch_res = fabric.simulate_paths_batch(
+            hi_ratios=sampled_high_ratios,
+            lo_ratios=sampled_low_ratios,
+            cl_ratios=sampled_close_ratios,
+            tie_uniforms=tie_uniforms,
+            entry_prices=np.array([float(entry_price)], dtype=np.float64),
+            stop_prices=np.array([float(stop_price)], dtype=np.float64),
+            target_prices=np.array([float(target_price)], dtype=np.float64),
+            one_r_dists=np.array([float(one_r_dist)], dtype=np.float64),
+            target_rs=np.array([float(target_r)], dtype=np.float64),
+            cost_rs=np.array([float(round_trip_cost_r)], dtype=np.float64),
+            is_longs=np.array([is_long], dtype=np.bool_),
         )
-        # Deduct round-trip friction on EVERY simulated path
-        net_r = gross_r - round_trip_cost_r
 
-        p_target = float(np.mean(status == 1))
-        p_stop = float(np.mean(status == -1))
-        p_timeout = float(np.mean(status == 0))
-        prob_profit = float(np.mean(net_r > 0.0))
+        p_target = float(batch_res.p_target[0])
+        p_stop = float(batch_res.p_stop[0])
+        p_timeout = float(batch_res.p_timeout[0])
+        prob_profit = float(batch_res.prob_profit[0])
 
-        gross_avg_r = float(np.mean(gross_r))
-        net_avg_r = float(np.mean(net_r))
-        median_net_r = float(np.median(net_r))
+        gross_avg_r = float(batch_res.gross_avg_r[0])
+        net_avg_r = float(batch_res.net_avg_r[0])
+        median_net_r = float(batch_res.median_net_r[0])
 
-        # 95% Value-at-Risk and 95% Conditional Value-at-Risk (Expected Shortfall in worst 5% tail)
-        sorted_net_r = np.sort(net_r)
-        tail_cutoff = max(1, int(0.05 * len(sorted_net_r)))
-        var_95_r = float(sorted_net_r[tail_cutoff - 1])
-        cvar_95_r = float(np.mean(sorted_net_r[:tail_cutoff]))
+        var_95_r = float(batch_res.var_95_r[0])
+        cvar_95_r = float(batch_res.cvar_95_r[0])
+        net_r = batch_res.net_r_out[0]
 
         full_k, quarter_k, rec_pct, rec_usd = self.compute_quarter_kelly_risk(
             net_r_outcomes=net_r,
