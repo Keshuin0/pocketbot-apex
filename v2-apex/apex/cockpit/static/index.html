@@ -138,11 +138,12 @@
 <body>
   <header class="header">
     <div class="brand">
-      <h1>POCKETBOT APEX v2.4</h1>
+      <h1>POCKETBOT APEX v2.7</h1>
       <span class="pill" id="mode-pill">DEMO LOCKED</span>
       <span class="pill"><span class="dot" id="ws-dot"></span><span id="ws-status">Connecting...</span></span>
     </div>
     <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+      <span class="pill" id="compute-pill">Hyperion: --</span>
       <span class="pill" id="mind-pill">Mind State: FRESH</span>
       <span class="pill" id="universe-pill">Universe: 0 / 0</span>
     </div>
@@ -432,6 +433,12 @@
       if (s.csrf_token) csrfToken = s.csrf_token;
 
       document.getElementById('mode-pill').textContent = (s.run_mode || 'DEMO').toUpperCase();
+      const cf = s.compute_fabric || {};
+      if (cf.active_backend) {
+        const pCnt = cf.last_paths_count ? `${Math.round(cf.last_paths_count / 1000)}k QMC-Sobol` : 'QMC-Sobol';
+        const msStr = cf.last_batch_ms !== undefined ? `${Number(cf.last_batch_ms).toFixed(2)}ms` : '--';
+        document.getElementById('compute-pill').textContent = `Hyperion: ${cf.active_backend} | ${pCnt} (${msStr})`;
+      }
       document.getElementById('mind-pill').textContent = s.mind_state_badge || 'Mind State: FRESH';
       document.getElementById('universe-pill').textContent = `Universe: ${s.universe_scanned_count || 0} / ${s.universe_total_count || 0}`;
 

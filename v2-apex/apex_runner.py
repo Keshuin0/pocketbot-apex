@@ -33,6 +33,7 @@ from apex.cockpit.replay_engine import HistoricalReplayEngine
 from apex.cockpit.telegram_remote import TelegramRemoteController
 from apex.cockpit.tui_dashboard import ApexTUIDashboard, SymbolCockpitRow
 from apex.cockpit.web_cockpit import WebCockpitServer, launch_chrome_app
+from apex.compute.hyperion_fabric import get_hyperion_fabric
 from apex.execution.position_manager import AutonomousPositionOrchestrator
 from apex.execution.router import DualBrokerExecutionRouter, ExecutionOrderRequest
 from apex.feeds.dual_router import MarketFeedRouter
@@ -491,6 +492,7 @@ class ApexOrchestrator:
                 "quarantined_families": quarantined,
                 "contagion_shock_z": round(float(contagion_z), 2),
                 "aegis_badge": aegis_badge,
+                "compute_fabric": get_hyperion_fabric().to_cockpit_dict(),
                 "paused": self.paused,
                 "open_positions": serialized_positions,
                 "rows": serialized_rows,
@@ -588,7 +590,7 @@ def format_web_cockpit_banner(cockpit_url: str, mode: str) -> str:
     """Return a compact 5-line startup banner for the Web Cockpit engine console."""
     return (
         "============================================================\n"
-        f"  POCKETBOT APEX v2.6.0  |  Mode: {mode.upper()}\n"
+        f"  POCKETBOT APEX v2.7.0  |  Mode: {mode.upper()}\n"
         f"  Chrome Cockpit URL: {cockpit_url}\n"
         "  Keep this engine window minimized;\n"
         "  view & control everything in the Chrome Cockpit window.\n"
@@ -603,7 +605,7 @@ def format_single_line_heartbeat(orchestrator: ApexOrchestrator) -> str:
     total = orchestrator.last_scan_summary.total_scanned if orchestrator.last_scan_summary else 0
     state = "PAUSED" if orchestrator.paused else "SCANNING"
     ts = datetime.datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] APEX v2.6.0 | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
+    line = f"[{ts}] APEX v2.7.0 | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
     return line[:96].ljust(96)
 
 
