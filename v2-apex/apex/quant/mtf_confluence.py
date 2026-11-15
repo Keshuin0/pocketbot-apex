@@ -80,6 +80,7 @@ class MTFConfluenceFilter:
             )
 
         safe_atr = max(float(atr_m5), 1e-9)
+        m5_candles = list(m5_candles or ())
 
         # 1. Anti-Chase Overextension Check on M5/M15 bars
         anti_chase_ok = True

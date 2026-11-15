@@ -90,7 +90,7 @@ class HistoricalReplayEngine:
         feed_router: Any = None,
         candles_by_symbol: dict[str, Sequence[Candle]] | None = None,
         h1_by_symbol: dict[str, Sequence[Candle]] | None = None,
-        symbols: Sequence[str] = DEFAULT_REPLAY_SYMBOLS,
+        symbols: Sequence[str] | None = DEFAULT_REPLAY_SYMBOLS,
         window_days: int = 5,
         speed: int = 100,
         on_update: Callable[[dict[str, Any]], None] | None = None,
@@ -98,25 +98,31 @@ class HistoricalReplayEngine:
     ) -> ReplaySummary:
         """Execute a historical replay through the shared 11-agent pipeline & InFlightPositionManager."""
         bar_count = max(120, int(window_days) * 96)  # ~96 M15 bars/day
+        symbols_list = [str(s).strip().upper() for s in (symbols or DEFAULT_REPLAY_SYMBOLS) if str(s).strip()]
+        if not symbols_list:
+            symbols_list = list(DEFAULT_REPLAY_SYMBOLS)
+
         sym_candles: dict[str, list[Candle]] = {}
         sym_h1: dict[str, list[Candle]] = {}
 
         if candles_by_symbol is not None:
             for s, cs in candles_by_symbol.items():
-                if len(cs) >= 35:
+                if cs and len(cs) >= 35:
                     sym_candles[s] = list(cs)
             if h1_by_symbol:
                 for s, cs in h1_by_symbol.items():
-                    sym_h1[s] = list(cs)
+                    if cs:
+                        sym_h1[s] = list(cs)
         elif feed_router is not None:
-            for sym in symbols:
+            for sym in symbols_list:
                 try:
-                    cs = feed_router.get_candles(sym, timeframe="M15", count=bar_count)
+                    cs = feed_router.get_candles(sym, timeframe="M15", count=bar_count) or []
                     if len(cs) < 35:
-                        cs = feed_router.get_candles(sym, timeframe="M5", count=bar_count)
+                        cs = feed_router.get_candles(sym, timeframe="M5", count=bar_count) or []
                     if len(cs) >= 35:
                         sym_candles[sym] = list(cs)
-                        sym_h1[sym] = list(feed_router.get_candles(sym, timeframe="H1", count=max(40, int(window_days) * 24)))
+                        h1_cs = feed_router.get_candles(sym, timeframe="H1", count=max(40, int(window_days) * 24)) or []
+                        sym_h1[sym] = list(h1_cs)
                 except Exception:
                     continue
 
@@ -126,7 +132,7 @@ class HistoricalReplayEngine:
                 on_update(
                     {
                         "status": "NO_DATA",
-                        "symbol": ", ".join(symbols[:2]),
+                        "symbol": ", ".join(symbols_list[:2]),
                         "message": "No historical candles available for replay.",
                         "equity_curve": summary.equity_curve,
                         "trades": [],
@@ -149,7 +155,7 @@ class HistoricalReplayEngine:
 
         min_len = min(len(v) for v in sym_candles.values())
         window = 30
-        stride = max(1, (min_len - window - 10) // 35)
+        stride = max(1, (min_len - window - 10) // 90)
         sym_label = ", ".join(list(sym_candles.keys())[:3]) + ("..." if len(sym_candles) > 3 else "")
 
         if on_update:
@@ -298,6 +304,8 @@ class HistoricalReplayEngine:
                 time.sleep(delay)
 
         total = wins + losses
+        if len(equity_curve) < 2:
+            equity_curve.append(round(equity, 2))
         wr = (wins / total * 100.0) if total > 0 else 0.0
         pf = (gross_profit / gross_loss) if gross_loss > 1e-9 else (gross_profit if gross_profit > 0 else 0.0)
         summary = ReplaySummary(
