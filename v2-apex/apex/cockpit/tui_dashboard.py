@@ -12,7 +12,7 @@ Displays:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -62,6 +62,7 @@ class SymbolCockpitRow:
     entry_price: float = 0.0
     stop_loss: float = 0.0
     take_profit: float = 0.0
+    pipeline_trace: dict[str, Any] | None = None
 
 
 class ApexTUIDashboard:

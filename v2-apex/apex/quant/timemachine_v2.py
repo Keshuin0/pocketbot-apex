@@ -276,12 +276,26 @@ class BlockBootstrapTimeMachine:
             cl = cur_prices * sampled_close_ratios[:, t]
 
             if is_long:
-                # Conservative rule: check stop before target on same bar
-                hit_stop = active & (lo <= float(stop_price))
-                hit_target = active & (~hit_stop) & (hi >= float(target_price))
+                raw_stop = active & (lo <= float(stop_price))
+                raw_target = active & (hi >= float(target_price))
             else:
-                hit_stop = active & (hi >= float(stop_price))
-                hit_target = active & (~hit_stop) & (lo <= float(target_price))
+                raw_stop = active & (hi >= float(stop_price))
+                raw_target = active & (lo <= float(target_price))
+
+            both_touch = raw_stop & raw_target
+            if np.any(both_touch):
+                # Brownian-Bridge intra-bar tie-breaker weighted by open-to-barrier proximity & close polarity
+                d_stop = np.abs(cur_prices - float(stop_price))
+                d_target = np.abs(float(target_price) - cur_prices)
+                p_target_first = d_stop / np.maximum(d_stop + d_target, 1e-12)
+                polarity_boost = np.where((cl > cur_prices) if is_long else (cl < cur_prices), 0.15, -0.15)
+                p_target_first = np.clip(p_target_first + polarity_boost, 0.05, 0.95)
+                target_wins_tie = rng.random(n_paths) < p_target_first
+                hit_target = (raw_target & ~raw_stop) | (both_touch & target_wins_tie)
+                hit_stop = (raw_stop & ~raw_target) | (both_touch & ~target_wins_tie)
+            else:
+                hit_stop = raw_stop
+                hit_target = raw_target
 
             status[hit_stop] = -1
             status[hit_target] = 1

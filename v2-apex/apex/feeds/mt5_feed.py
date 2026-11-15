@@ -111,36 +111,68 @@ class MT5Feed:
         MT5 ``tick.time`` and ``copy_rates_from_pos`` timestamps are stamped in the broker's
         trade server timezone (e.g., UTC+2 / UTC+3) rather than true UTC. Comparing a fresh
         server timestamp against ``time.time()`` (true UTC) yields the exact timezone shift
-        when rounded to the nearest 15 minutes (900 seconds). Only applies shifts >= 30 minutes
-        (1800s) so quiet symbols with slightly older last ticks are not mis-shifted.
+        when rounded to the nearest 15 minutes (900 seconds) within ``[-43200, +50400]``.
         """
         raw_diff = float(server_timestamp) - float(local_utc_timestamp)
-        # Broker server offsets are multiples of 30 or 60 minutes (typically +7200s or +10800s)
-        # Guard against stale weekend ticks (> 24 hours old)
-        if abs(raw_diff) > 14 * 3600 or abs(raw_diff) < 1800:
+        if abs(raw_diff) < 900:
             return 0
-        return int(round(raw_diff / 1800.0) * 1800)
+        snapped = int(round(raw_diff / 900.0) * 900)
+        if snapped < -43200 or snapped > 50400:
+            return 0
+        return snapped
 
     def normalize_server_timestamp_to_utc(self, server_timestamp: float) -> float:
         """Convert an MT5 broker-timezone timestamp into a true UTC epoch timestamp."""
         return float(server_timestamp) - float(self._server_utc_offset_seconds)
 
     def _calibrate_server_utc_offset(self) -> int:
-        """Detect the broker's server UTC offset from active symbols."""
+        """Detect the broker's server UTC offset via max(tick.time) consensus across active symbols."""
         if not self._initialized:
             return 0
 
         now_utc = time.time()
-        probe_symbols = ("EURUSD", "USDJPY", "GBPUSD", "XAUUSD", "BTCUSD")
+        probe_symbols = ("BTCUSD", "ETHUSD", "SOLUSD", "EURUSD", "USDJPY", "XAUUSD")
+        tick_times: list[float] = []
+        seen_names: set[str] = set()
+
         for sym in probe_symbols:
             resolved = self.resolve_symbol(sym)
-            if not resolved:
+            if not resolved or resolved in seen_names:
                 continue
+            seen_names.add(resolved)
             tick = mt5.symbol_info_tick(resolved)
-            if tick is not None and getattr(tick, "time", 0) > 0:
-                offset = self.compute_utc_offset_seconds(float(tick.time), now_utc)
-                self._server_utc_offset_seconds = offset
-                return offset
+            if tick is not None and float(getattr(tick, "time", 0) or 0) > 0.0:
+                tick_times.append(float(tick.time))
+
+        # Fallback consensus scan across mt5.symbols_get() so 24/7 crypto/active feeds override stale FX
+        try:
+            all_syms = mt5.symbols_get() or ()
+            for s in all_syms:
+                sname = str(getattr(s, "name", "") or "")
+                if not sname or sname in seen_names:
+                    continue
+                seen_names.add(sname)
+                tick = mt5.symbol_info_tick(sname)
+                if tick is not None and float(getattr(tick, "time", 0) or 0) > 0.0:
+                    tick_times.append(float(tick.time))
+        except Exception as exc:
+            logger.debug("Fallback mt5.symbols_get() clock scan skipped: %s", exc)
+
+        if not tick_times:
+            return self._server_utc_offset_seconds
+
+        max_tick_time = max(tick_times)
+        snapped_offset = self.compute_utc_offset_seconds(max_tick_time, now_utc)
+        if -43200 <= snapped_offset <= 50400 and abs((max_tick_time - snapped_offset) - now_utc) <= 180.0:
+            self._server_utc_offset_seconds = snapped_offset
+            return snapped_offset
+
+        logger.debug(
+            "MT5 clock calibration skipped: max_tick=%.0f, snapped_offset=%d, residual=%.1fs",
+            max_tick_time,
+            snapped_offset,
+            (max_tick_time - snapped_offset) - now_utc,
+        )
         return self._server_utc_offset_seconds
 
     def resolve_symbol(self, symbol: str) -> str | None:

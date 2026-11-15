@@ -207,7 +207,7 @@ def test_tui_no_wrap_v241_and_web_banner_no_scroll_spam() -> None:
             assert all(col.no_wrap for col in renderable.columns)
 
     banner = format_web_cockpit_banner("http://127.0.0.1:8765", "demo-auto")
-    assert "POCKETBOT APEX v2.4.1" in banner
+    assert "POCKETBOT APEX v2.6.0" in banner
     assert "http://127.0.0.1:8765" in banner
     assert len(banner.strip().splitlines()) <= 6
 
@@ -219,7 +219,7 @@ def test_tui_no_wrap_v241_and_web_banner_no_scroll_spam() -> None:
     hb = format_single_line_heartbeat(fake_orch)  # type: ignore[arg-type]
     assert "\n" not in hb
     assert len(hb) < 100
-    assert "APEX v2.4.1" in hb
+    assert "APEX v2.6.0" in hb
 
     # Chrome or Edge should be discoverable on Windows
     exe = find_browser_executable()
