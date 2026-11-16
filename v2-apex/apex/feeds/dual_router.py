@@ -464,8 +464,9 @@ class MarketFeedRouter:
 
         ct_slip_pips = (float(ctrader_slippage_price) / safe_pip) if ctrader_slippage_price is not None else 0.10
         mt5_slip_pips = (float(mt5_slippage_price) / safe_pip) if mt5_slippage_price is not None else 0.15
-        if norm_sym in self.ctrader._dom_engines:
-            engine = self.ctrader._dom_engines[norm_sym]
+        ct_dom_sym = self.ctrader.resolve_symbol(norm_sym) or norm_sym
+        if ct_dom_sym in self.ctrader._dom_engines:
+            engine = self.ctrader._dom_engines[ct_dom_sym]
             snap = engine.snapshot()
             if (side == Side.BUY and snap.asks) or (side == Side.SELL and snap.bids):
                 try:
@@ -484,6 +485,7 @@ class MarketFeedRouter:
             ctrader_vwap_slippage_pips=ct_slip_pips,
             mt5_vwap_slippage_pips=mt5_slip_pips,
             ctrader_dom=ct_dom,
+            side=side,
         )
 
     def get_tick(self, symbol: str) -> tuple[Tick | None, TickDiscrepancyAlert | None]:
@@ -524,9 +526,13 @@ class MarketFeedRouter:
         return None, None
 
     def get_candles(self, symbol: str, timeframe: str = "M5", count: int = 200) -> list[Candle]:
-        """Fetch historical M5/M15 candles from active feed."""
+        """Fetch historical M5/M15/H1 candles from active feed (MT5 primary, cTrader fallback)."""
         if self.mt5.is_connected:
-            return self.mt5.get_candles(symbol=symbol, timeframe=timeframe, count=count)
+            candles = self.mt5.get_candles(symbol=symbol, timeframe=timeframe, count=count)
+            if candles:
+                return candles
+        if self.ctrader.is_connected and hasattr(self.ctrader, "get_candles"):
+            return self.ctrader.get_candles(symbol=symbol, timeframe=timeframe, count=count)
         return []
 
     def get_contract_spec(self, symbol: str) -> ContractSpec | None:

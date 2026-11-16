@@ -406,12 +406,24 @@
       document.getElementById('xray-modal').style.display = 'none';
     }
 
+    async function refreshCsrfToken() {
+      try {
+        const res = await fetch('/api/csrf', { credentials: 'same-origin' });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.csrf_token) csrfToken = data.csrf_token;
+        }
+      } catch (_) {}
+    }
+
     async function sendControl(action, payload) {
       const msgEl = document.getElementById('control-msg');
       msgEl.textContent = 'Sending ' + action + '...';
       try {
+        if (!csrfToken) await refreshCsrfToken();
         const res = await fetch('/api/control/' + action, {
           method: 'POST',
+          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json', 'X-Apex-CSRF': csrfToken },
           body: JSON.stringify(payload || {})
         });
@@ -430,7 +442,8 @@
 
     function renderState(s) {
       lastState = s;
-      if (s.csrf_token) csrfToken = s.csrf_token;
+      const clean = { ...s };
+      delete clean.csrf_token;
 
       document.getElementById('mode-pill').textContent = (s.run_mode || 'DEMO').toUpperCase();
       const cf = s.compute_fabric || {};
@@ -652,7 +665,8 @@
       };
     }
 
-    fetch('/api/state').then(r => r.json()).then(renderState).catch(() => {});
+    refreshCsrfToken();
+    fetch('/api/state', { credentials: 'same-origin' }).then(r => r.json()).then(renderState).catch(() => {});
     connectWS();
   </script>
 </body>

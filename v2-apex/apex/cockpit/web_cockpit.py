@@ -117,9 +117,8 @@ def launch_chrome_app(url: str, no_gui: bool = False) -> Optional[subprocess.Pop
     return None
 
 
-def _default_state(csrf_token: str) -> dict[str, Any]:
+def _default_state() -> dict[str, Any]:
     return {
-        "csrf_token": csrf_token,
         "run_mode": "DEMO-AUTO",
         "mind_state_badge": "AWAKE",
         "universe_scanned_count": 0,
@@ -148,6 +147,7 @@ def _default_state(csrf_token: str) -> dict[str, Any]:
             "equity_curve": [],
         },
         "open_positions": [],
+        "pending_confirmations": [],
         "rows": [],
         "broker_events": [],
         "updated_at": time.time(),
@@ -169,7 +169,7 @@ class WebCockpitServer:
         self.max_port = max(int(max_port), self.requested_port)
         self.port: int = self.requested_port
         self.csrf_token: str = secrets.token_urlsafe(32)
-        self._state: dict[str, Any] = _default_state(self.csrf_token)
+        self._state: dict[str, Any] = _default_state()
         self._state_lock = threading.Lock()
         self._control_handlers: dict[str, Callable[[], Any]] = dict(control_handlers or {})
 
@@ -231,7 +231,7 @@ class WebCockpitServer:
         with self._state_lock:
             merged = dict(self._state)
             merged.update(state_update)
-            merged["csrf_token"] = self.csrf_token
+            merged.pop("csrf_token", None)
             merged["updated_at"] = time.time()
             self._state = merged
             payload = json.dumps(merged, default=str)
@@ -301,6 +301,7 @@ class WebCockpitServer:
         app = web.Application()
         app.router.add_get("/", self._handle_index)
         app.router.add_get("/api/state", self._handle_api_state)
+        app.router.add_get("/api/csrf", self._handle_api_csrf)
         app.router.add_get("/ws", self._handle_ws)
         app.router.add_post("/api/control/{action}", self._handle_control)
 
@@ -339,24 +340,83 @@ class WebCockpitServer:
             self._runner = None
             self._site = None
 
+    def _is_same_origin(self, request: web.Request) -> bool:
+        """Validate Origin/Referer/Sec-Fetch-Site strictly against local loopback origins."""
+        from urllib.parse import urlparse
+
+        sec_site = str(request.headers.get("Sec-Fetch-Site", "") or "").strip().lower()
+        if sec_site == "cross-site":
+            return False
+
+        allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+        origin = str(request.headers.get("Origin", "") or "").strip()
+        if origin:
+            if origin.lower() == "null":
+                return False
+            parsed = urlparse(origin)
+            if parsed.scheme not in {"http", "https"}:
+                return False
+            host = (parsed.hostname or "").lower()
+            if host not in allowed_hosts:
+                return False
+            if parsed.port is not None and int(parsed.port) != int(self.port):
+                return False
+
+        referer = str(request.headers.get("Referer", "") or "").strip()
+        if referer:
+            parsed_ref = urlparse(referer)
+            ref_host = (parsed_ref.hostname or "").lower()
+            if ref_host and ref_host not in allowed_hosts:
+                return False
+        return True
+
     async def _handle_index(self, request: web.Request) -> web.Response:
         if INDEX_HTML_PATH.is_file():
             html = INDEX_HTML_PATH.read_text(encoding="utf-8")
-            return web.Response(text=html, content_type="text/html")
+            resp = web.Response(text=html, content_type="text/html")
+            resp.set_cookie(
+                "apex_csrf",
+                self.csrf_token,
+                httponly=True,
+                samesite="Strict",
+                path="/",
+            )
+            return resp
         return web.Response(text="<h1>PocketBot Apex Cockpit HTML missing</h1>", content_type="text/html", status=404)
 
     async def _handle_api_state(self, request: web.Request) -> web.Response:
-        return web.json_response(self.get_state_snapshot())
+        snap = self.get_state_snapshot()
+        snap.pop("csrf_token", None)
+        return web.json_response(snap)
 
-    async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse:
+    async def _handle_api_csrf(self, request: web.Request) -> web.Response:
+        if not self._is_same_origin(request):
+            return web.json_response({"ok": False, "error": "Forbidden cross-origin CSRF fetch"}, status=403)
+        resp = web.json_response({"csrf_token": self.csrf_token})
+        resp.set_cookie(
+            "apex_csrf",
+            self.csrf_token,
+            httponly=True,
+            samesite="Strict",
+            path="/",
+        )
+        return resp
+
+    async def _handle_ws(self, request: web.Request) -> web.WebSocketResponse | web.Response:
+        if not self._is_same_origin(request):
+            return web.Response(status=403, text="Forbidden cross-origin WebSocket connection")
         ws = web.WebSocketResponse(heartbeat=20.0)
         await ws.prepare(request)
         self._clients.add(ws)
         try:
-            await ws.send_str(json.dumps(self.get_state_snapshot(), default=str))
+            snap = self.get_state_snapshot()
+            snap.pop("csrf_token", None)
+            await ws.send_str(json.dumps(snap, default=str))
             async for msg in ws:
                 if msg.type == WSMsgType.TEXT and msg.data.strip().lower() == "ping":
-                    await ws.send_str(json.dumps(self.get_state_snapshot(), default=str))
+                    snap_ping = self.get_state_snapshot()
+                    snap_ping.pop("csrf_token", None)
+                    await ws.send_str(json.dumps(snap_ping, default=str))
                 elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSE):
                     break
         finally:
@@ -364,15 +424,23 @@ class WebCockpitServer:
         return ws
 
     async def _handle_control(self, request: web.Request) -> web.Response:
+        if not self._is_same_origin(request):
+            return web.json_response({"ok": False, "error": "Forbidden cross-origin control request"}, status=403)
         provided_csrf = request.headers.get("X-Apex-CSRF", "")
         if not provided_csrf or not secrets.compare_digest(provided_csrf, self.csrf_token):
             return web.json_response(
                 {"ok": False, "error": "Invalid or missing X-Apex-CSRF token"},
                 status=403,
             )
+        cookie_csrf = request.cookies.get("apex_csrf")
+        if cookie_csrf is not None and not secrets.compare_digest(cookie_csrf, self.csrf_token):
+            return web.json_response(
+                {"ok": False, "error": "CSRF cookie mismatch"},
+                status=403,
+            )
 
         action = request.match_info.get("action", "").strip()
-        if action not in {"pause", "drill", "replay", "refresh_ai", "panic_flatten"}:
+        if action not in {"pause", "drill", "replay", "refresh_ai", "panic_flatten", "confirm"}:
             return web.json_response({"ok": False, "error": f"Unknown action: {action}"}, status=404)
 
         if action == "pause" and "pause" not in self._control_handlers:

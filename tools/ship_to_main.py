@@ -94,7 +94,7 @@ def main() -> int:
     # 2. Run Security & Integrity Audit
     print("\n[Step 1/5] Running Pre-Commit Security & Integrity Audit...")
     audit_script = REPO_ROOT / "tools" / "repo_security_audit.py"
-    audit_res = run_cmd([sys.executable, str(audit_script)])
+    audit_res = run_cmd([sys.executable, "-B", str(audit_script)])
     if audit_res.returncode != 0:
         print("[!] Security audit failed. Aborting pipeline.")
         return 1
@@ -103,9 +103,12 @@ def main() -> int:
     if not args.skip_tests:
         print("\n[Step 2/5] Running Apex Verification Test Suite...")
         test_dir = REPO_ROOT / "v2-apex" / "tests"
-        env_vars = dict(PYTHONPATH=str(REPO_ROOT / "v2-apex"))
+        env_vars = {
+            "PYTHONPATH": str(REPO_ROOT / "v2-apex"),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
         test_res = subprocess.run(
-            [sys.executable, "-m", "pytest", str(test_dir), "-q"],
+            [sys.executable, "-B", "-m", "pytest", str(test_dir), "-q", "-p", "no:cacheprovider"],
             cwd=REPO_ROOT,
             env={**subprocess.os.environ, **env_vars},
         )

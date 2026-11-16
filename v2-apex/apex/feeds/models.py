@@ -184,6 +184,9 @@ class DOMAnalytics:
     best_ask: float
     spread_pips: float
     liquidity_walls: tuple[LiquidityWall, ...] = field(default_factory=tuple)
+    micro_price: float = 0.0
+    ofi: float = 0.0
+    vpin: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

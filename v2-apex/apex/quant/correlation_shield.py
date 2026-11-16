@@ -17,10 +17,12 @@ total equity at risk across all open trades.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
 import numpy as np
+from scipy.optimize import minimize
 
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.models import AssetClass, Side
@@ -172,12 +174,20 @@ def decompose_symbol_factors(symbol: str, side: Side | str) -> dict[str, float]:
 
 @dataclass(frozen=True, slots=True)
 class PositionRiskSpec:
-    """Open or proposed position specification with equity risk percentage (or USD risk)."""
+    """Open or proposed position specification with equity risk percentage and live telemetry."""
 
     symbol: str
     side: Side
     risk_pct: float
     risk_usd: float = 0.0
+    lots: float = 0.0
+    entry_price: float = 0.0
+    current_price: float = 0.0
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    profit_usd: float = 0.0
+    ticket: int = 0
+    venue: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,12 +205,53 @@ class FactorExposureVerdict:
     reason: str = "ok"
 
 
+def compute_tail_crash_correlation(
+    returns_a: Sequence[float] | np.ndarray,
+    returns_b: Sequence[float] | np.ndarray,
+    quantile: float = 0.05,
+) -> float:
+    """Compute non-parametric Joint Loss Lower-Tail Dependence Coefficient lambda_L(q).
+
+    lambda_L(q) = P(Z_a <= F_a^{-1}(q) | Z_b <= F_b^{-1}(q)), baseline-adjusted for independent
+    baseline probability q so independent normal pairs converge cleanly to 0.0 rather than -0.55.
+    """
+    a = np.asarray(returns_a, dtype=np.float64)
+    b = np.asarray(returns_b, dtype=np.float64)
+    n = min(len(a), len(b))
+    if n < 10:
+        return 0.0
+    a = a[-n:]
+    b = b[-n:]
+    if float(np.std(a)) <= 1e-12 or float(np.std(b)) <= 1e-12:
+        return 0.0
+
+    q = max(0.01, min(0.25, float(quantile)))
+    eff_q = max(q, min(0.20, 4.0 / float(n))) if n < 80 else q
+    qa = float(np.quantile(a, eff_q))
+    qb = float(np.quantile(b, eff_q))
+    mask_a = a <= qa
+    mask_b = b <= qb
+    cnt_a = int(np.sum(mask_a))
+    cnt_b = int(np.sum(mask_b))
+    if cnt_a < 2 or cnt_b < 2:
+        return 0.0
+
+    # Symmetric empirical conditional lower-tail exceedance probability
+    p_a_given_b = float(np.mean(mask_a[mask_b]))
+    p_b_given_a = float(np.mean(mask_b[mask_a]))
+    raw_lambda = 0.5 * (p_a_given_b + p_b_given_a)
+    excess_lambda = (raw_lambda - eff_q) / max(1.0 - eff_q, 1e-9)
+    return float(np.clip(excess_lambda, 0.0, 1.0))
+
+
 def compute_ledoit_wolf_and_tail_correlation(
     returns_matrix: np.ndarray | None,
     tail_sigma: float = 1.5,
+    quantile: float = 0.05,
+    directions: Sequence[float] | np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute (1) Ledoit-Wolf Shrinkage correlation matrix (rho_lw) and
-    (2) Lower-Tail Crash Co-Movement matrix (rho_tail conditioned on <= -1.5 sigma stress bars).
+    """Compute (1) Standardized Ledoit-Wolf Shrinkage correlation matrix (rho_lw) toward I and
+    (2) Non-parametric Joint Loss Lower-Tail Dependence matrix (rho_tail).
     """
     if returns_matrix is None:
         eye = np.eye(1, dtype=np.float64)
@@ -212,49 +263,42 @@ def compute_ledoit_wolf_and_tail_correlation(
         return eye, eye.copy()
 
     t_len, m_cols = x.shape
+    if directions is not None:
+        dir_vec = np.asarray(directions, dtype=np.float64)
+        if len(dir_vec) == m_cols:
+            x = x * dir_vec[np.newaxis, :]
+
+    # Standardize each return vector BEFORE Ledoit-Wolf shrinkage toward I
     mean = np.mean(x, axis=0, keepdims=True)
     xc = x - mean
-    sample_cov = (xc.T @ xc) / float(t_len)
+    stds = np.std(xc, axis=0)
+    stds = np.where(stds > 1e-12, stds, 1.0)
+    z = xc / stds
 
-    # Ledoit-Wolf analytical shrinkage toward scaled identity target
-    mu = np.trace(sample_cov) / float(m_cols)
+    sample_corr = (z.T @ z) / float(t_len)
+    mu = np.trace(sample_corr) / float(m_cols)
     target = mu * np.eye(m_cols, dtype=np.float64)
-    gamma = float(np.sum((sample_cov - target) ** 2))
+    gamma = float(np.sum((sample_corr - target) ** 2))
     if gamma <= 1e-18:
-        shrunk_cov = sample_cov
+        shrunk_corr = sample_corr
     else:
-        # Sum of squared Frobenius deviations of rank-1 outer products
-        sq_norms = np.sum(xc**2, axis=1)
-        phi = float(np.sum(sq_norms**2) / float(t_len) - np.sum(sample_cov**2)) / float(t_len)
+        sq_norms = np.sum(z**2, axis=1)
+        phi = float(np.sum(sq_norms**2) / float(t_len) - np.sum(sample_corr**2)) / float(t_len)
         delta = max(0.0, min(1.0, phi / gamma))
-        shrunk_cov = (1.0 - delta) * sample_cov + delta * target
+        shrunk_corr = (1.0 - delta) * sample_corr + delta * target
 
-    stds_lw = np.sqrt(np.maximum(np.diag(shrunk_cov), 1e-18))
-    rho_lw = shrunk_cov / np.outer(stds_lw, stds_lw)
+    diag_lw = np.sqrt(np.maximum(np.diag(shrunk_corr), 1e-18))
+    rho_lw = shrunk_corr / np.outer(diag_lw, diag_lw)
     rho_lw = np.clip(rho_lw, -1.0, 1.0)
     np.fill_diagonal(rho_lw, 1.0)
 
-    # Lower-Tail Crash Co-Movement (<= -tail_sigma joint stress bars)
-    stds = np.std(xc, axis=0)
-    stds = np.where(stds > 1e-12, stds, 1e-12)
-    z = xc / stds
+    # Joint Loss Lower-Tail Dependence matrix in loss direction (z < 0)
     rho_tail = np.eye(m_cols, dtype=np.float64)
     for i in range(m_cols):
         for j in range(i + 1, m_cols):
-            stress_mask = (z[:, i] <= -tail_sigma) | (z[:, j] <= -tail_sigma)
-            if int(np.sum(stress_mask)) >= 4:
-                zi = z[stress_mask, i]
-                zj = z[stress_mask, j]
-                zi_c = zi - np.mean(zi)
-                zj_c = zj - np.mean(zj)
-                denom = float(np.sqrt(np.sum(zi_c**2) * np.sum(zj_c**2)))
-                val = float(np.sum(zi_c * zj_c) / denom) if denom > 1e-12 else 0.0
-                val = max(-1.0, min(1.0, val))
-                rho_tail[i, j] = val
-                rho_tail[j, i] = val
-            else:
-                rho_tail[i, j] = rho_lw[i, j]
-                rho_tail[j, i] = rho_lw[j, i]
+            val = compute_tail_crash_correlation(z[:, i], z[:, j], quantile=quantile)
+            rho_tail[i, j] = val
+            rho_tail[j, i] = val
 
     return rho_lw, rho_tail
 
@@ -264,7 +308,8 @@ class CorrelationShield:
 
     Respects `enabled` (`config["filters"]["correlation_cap"]["enabled"]`) for walk-forward A/B testing.
     Caps net single-currency / factor exposure at `max_factor_risk_pct` (default `1.0%` total equity at risk),
-    and blocks hidden crash-correlated trades where max(|rho_lw|, |rho_tail|) >= `max_empirical_corr` (0.72).
+    blocks hidden crash-correlated trades where max(rho_lw, rho_tail) >= `max_empirical_corr` (0.72),
+    and solves Convex Portfolio Kelly Optimization over Stage-B survivors.
     """
 
     def __init__(
@@ -282,15 +327,17 @@ class CorrelationShield:
         self.account_equity_usd: float = float(account_equity_usd)
         self.max_empirical_corr: float = float(max_empirical_corr)
         self.tail_sigma: float = float(tail_sigma)
+        self._lock = threading.Lock()
         self._return_histories: dict[str, np.ndarray] = {}
 
     def register_return_series(self, symbol: str, returns: Sequence[float] | None) -> None:
-        """Cache trailing return series for empirical Ledoit-Wolf & tail-crash correlation checks."""
+        """Cache trailing return series thread-safely for empirical Ledoit-Wolf & tail correlation."""
         if returns is None:
             return
         arr = np.asarray(returns, dtype=np.float64)
         if arr.ndim == 1 and len(arr) >= 5:
-            self._return_histories[symbol.upper().strip()] = arr
+            with self._lock:
+                self._return_histories[symbol.upper().strip()] = arr
 
     def _resolve_risk_pct(self, pos: PositionRiskSpec) -> float:
         if pos.risk_pct > 0.0:
@@ -341,8 +388,9 @@ class CorrelationShield:
                     f"{abs(net_after):.2f}% > {self.max_factor_risk_pct:.2f}% equity risk cap)"
                 )
 
-        # Empirical Ledoit-Wolf + Lower-Tail Crash Co-Movement check
-        hist_map: dict[str, np.ndarray] = dict(self._return_histories)
+        # Standardized Ledoit-Wolf + Joint Loss Lower-Tail Dependence check
+        with self._lock:
+            hist_map: dict[str, np.ndarray] = dict(self._return_histories)
         if return_histories:
             for k, v in return_histories.items():
                 if v is None:
@@ -362,19 +410,22 @@ class CorrelationShield:
                 if n_common < 10:
                     continue
                 mat = np.column_stack([prop_ret[-n_common:], op_ret[-n_common:]])
-                rho_lw_mat, rho_tail_mat = compute_ledoit_wolf_and_tail_correlation(mat, tail_sigma=self.tail_sigma)
+                sign_op = 1.0 if op.side == Side.BUY else -1.0
+                # Multiply by s_i in {+1, -1} so portfolio losses sit strictly in the negative tail
+                rho_lw_mat, rho_tail_mat = compute_ledoit_wolf_and_tail_correlation(
+                    mat,
+                    tail_sigma=self.tail_sigma,
+                    directions=np.array([sign_prop, sign_op], dtype=np.float64),
+                )
                 rho_lw = float(rho_lw_mat[0, 1])
                 rho_tail = float(rho_tail_mat[0, 1])
-                sign_op = 1.0 if op.side == Side.BUY else -1.0
-                # Effective directional correlation: positive means stacking same-direction risk
-                dom_rho = rho_tail if abs(rho_tail) >= abs(rho_lw) else rho_lw
-                eff_corr = sign_prop * sign_op * dom_rho
+                eff_corr = max(rho_lw, rho_tail)
                 if eff_corr >= self.max_empirical_corr:
                     tag = f"TAIL_CORR_{op_sym_u}"
                     breached.append(tag)
                     breach_details.append(
                         f"Empirical/Tail crash correlation {proposed.symbol}({proposed.side.value}) vs "
-                        f"{op.symbol}({op.side.value}): rho_lw={rho_lw:+.2f}, rho_tail={rho_tail:+.2f} "
+                        f"{op.symbol}({op.side.value}): rho_lw={rho_lw:+.2f}, lambda_L={rho_tail:+.2f} "
                         f">= {self.max_empirical_corr:.2f}"
                     )
 
@@ -409,3 +460,116 @@ class CorrelationShield:
             breached_factors=tuple(breached),
             reason=reason,
         )
+
+    def optimize_portfolio_weights(
+        self,
+        candidates: Sequence[tuple[str, Side, float, float]],
+        open_positions: Sequence[PositionRiskSpec] | None = None,
+        return_histories: Mapping[str, Sequence[float]] | None = None,
+        max_concurrent_positions: int = 5,
+        portfolio_risk_budget_pct: float | None = None,
+    ) -> dict[str, float]:
+        """Solve Convex Quadratic Portfolio Kelly Optimization over Stage-B survivors.
+
+        ``candidates`` items: ``(symbol, side, net_avg_r, max_risk_pct)``.
+        Returns optimal risk allocation (%) per uppercase symbol respecting ``max_factor_risk_pct <= 1.0%``
+        and ``max_concurrent_positions``.
+        """
+        if not candidates:
+            return {}
+        open_list = list(open_positions or ())
+        slots_left = max(0, int(max_concurrent_positions) - len(open_list))
+        if slots_left == 0:
+            return {sym.upper().strip(): 0.0 for sym, _, _, _ in candidates}
+
+        items = [(sym.upper().strip(), side, float(ev), max(0.0, float(cap))) for sym, side, ev, cap in candidates]
+        n = len(items)
+        if not self.enabled:
+            return {sym: cap for sym, _, _, cap in items}
+
+        base_exp = self.compute_portfolio_factor_exposures(open_list)
+        if n == 1:
+            sym, side, ev, cap = items[0]
+            if ev <= 0.0 or cap <= 0.0:
+                return {sym: 0.0}
+            verdict = self.evaluate_proposed_trade(
+                PositionRiskSpec(symbol=sym, side=side, risk_pct=cap),
+                open_list,
+                return_histories=return_histories,
+            )
+            return {sym: cap if verdict.allowed else 0.0}
+
+        with self._lock:
+            hist_map = dict(self._return_histories)
+        if return_histories:
+            for k, v in return_histories.items():
+                if v is not None:
+                    hist_map[k.upper().strip()] = np.asarray(v, dtype=np.float64)
+
+        cov = np.eye(n, dtype=np.float64)
+        common_len = min(
+            (len(hist_map[s]) for s, _, _, _ in items if s in hist_map),
+            default=0,
+        )
+        if common_len >= 12 and all(s in hist_map for s, _, _, _ in items):
+            mat = np.column_stack([hist_map[s][-common_len:] for s, _, _, _ in items])
+            dirs = np.array([1.0 if side == Side.BUY else -1.0 for _, side, _, _ in items], dtype=np.float64)
+            rho_lw, rho_tail = compute_ledoit_wolf_and_tail_correlation(mat, directions=dirs)
+            cov = 0.70 * rho_lw + 0.30 * rho_tail
+            eig_min = float(np.min(np.linalg.eigvalsh(cov)))
+            if eig_min < 1e-4:
+                cov = cov + (1e-4 - eig_min) * np.eye(n, dtype=np.float64)
+
+        mu = np.array([max(ev, 0.0) for _, _, ev, _ in items], dtype=np.float64)
+        caps = np.array([cap if ev > 0.0 else 0.0 for _, _, ev, cap in items], dtype=np.float64)
+        if float(np.sum(caps)) <= 1e-12:
+            return {sym: 0.0 for sym, _, _, _ in items}
+
+        factor_list = list(CANONICAL_FACTORS)
+        f_mat = np.zeros((len(factor_list), n), dtype=np.float64)
+        for j, (sym, side, _, _) in enumerate(items):
+            fw = decompose_symbol_factors(sym, side)
+            for k_idx, fk in enumerate(factor_list):
+                f_mat[k_idx, j] = fw.get(fk, 0.0)
+        open_f = np.array([base_exp.get(fk, 0.0) for fk in factor_list], dtype=np.float64)
+
+        budget = (
+            float(portfolio_risk_budget_pct)
+            if portfolio_risk_budget_pct is not None
+            else min(float(self.max_factor_risk_pct) * max(1.0, float(slots_left) * 0.5), float(np.sum(caps)))
+        )
+
+        # Objective: minimize 0.5 * w^T Sigma w - alpha * mu^T w (concave Kelly/MV maximization)
+        alpha = max(float(np.max(caps)), 0.25) * 2.0
+
+        def _obj(w: np.ndarray) -> float:
+            return float(0.5 * (w @ cov @ w) - alpha * (mu @ w))
+
+        constraints: list[dict[str, object]] = [
+            {"type": "ineq", "fun": lambda w, b=budget: b - float(np.sum(w))},
+        ]
+        for k_idx in range(len(factor_list)):
+            row = f_mat[k_idx]
+            if not np.any(row):
+                continue
+            b0 = open_f[k_idx]
+            cap_f = max(float(self.max_factor_risk_pct), abs(b0))
+            constraints.append(
+                {"type": "ineq", "fun": lambda w, r=row, o=b0, c=cap_f: c - abs(o + float(r @ w))}
+            )
+
+        bounds = [(0.0, float(c)) for c in caps]
+        w0 = caps * min(1.0, budget / max(float(np.sum(caps)), 1e-9))
+        res = minimize(_obj, w0, method="SLSQP", bounds=bounds, constraints=constraints, options={"maxiter": 80})
+        w_opt = np.clip(res.x if res.success else w0, 0.0, caps)
+
+        # Enforce max_concurrent_positions top-K slots if more than slots_left received >0
+        pos_idx = np.argsort(-w_opt)
+        active = 0
+        out: dict[str, float] = {sym: 0.0 for sym, _, _, _ in items}
+        for idx in pos_idx:
+            val = round(float(w_opt[idx]), 4)
+            if val >= 0.01 and active < slots_left:
+                out[items[idx][0]] = val
+                active += 1
+        return out

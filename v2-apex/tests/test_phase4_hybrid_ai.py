@@ -69,7 +69,10 @@ def test_ansi_and_non_tty_wrapper_stripping() -> None:
     assert "London-NY session trap" in dec.reason
 
 
-def test_failover_permutations_studio_pro_math_and_midflight_cascade(tmp_path: Path) -> None:
+def test_failover_permutations_studio_pro_math_and_midflight_cascade(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Validate all failover permutations:
     1) Studio -> Pro -> Math (when Studio throws timeout/error, cascades to Pro; when Pro also errors, cascades to Pure Math)
     2) Pro -> Studio -> Math (when Pro throws timeout/error, cascades to Studio; when Studio also errors, cascades to Pure Math)
@@ -77,6 +80,12 @@ def test_failover_permutations_studio_pro_math_and_midflight_cascade(tmp_path: P
     """
     env_file = tmp_path / ".env"
     cfg_file = tmp_path / "apex_config.json"
+    fake_home = tmp_path / "home1"
+    (fake_home / ".gemini").mkdir(parents=True, exist_ok=True)
+    (fake_home / ".gemini" / "settings.json").write_text('{"auth": true}', encoding="utf-8")
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("HOME", str(fake_home))
+
     fake_agy = tmp_path / "fake_agy.exe"
     fake_agy.write_text("binary", encoding="utf-8")
 
@@ -166,10 +175,19 @@ def test_failover_permutations_studio_pro_math_and_midflight_cascade(tmp_path: P
     assert res_neither.cascade_path == ("pure_math",)
 
 
-def test_live_hot_reload_on_env_and_config_mtime_change(tmp_path: Path) -> None:
+def test_live_hot_reload_on_env_and_config_mtime_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Verify hot-reloading when .env or config/apex_config.json changes on disk without restarting."""
     env_file = tmp_path / ".env"
     cfg_file = tmp_path / "apex_config.json"
+    fake_home = tmp_path / "home1"
+    (fake_home / ".gemini").mkdir(parents=True, exist_ok=True)
+    (fake_home / ".gemini" / "settings.json").write_text('{"auth": true}', encoding="utf-8")
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("HOME", str(fake_home))
+
     fake_agy = tmp_path / "fake_agy.exe"
     fake_agy.write_text("binary", encoding="utf-8")
 

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from collections import deque
+from dataclasses import dataclass, field, replace
 from typing import Any, Sequence
 
 import numpy as np
@@ -19,6 +20,7 @@ from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
 from apex.cockpit.tui_dashboard import BrokerExecutionEvent, SymbolCockpitRow
 from apex.engine.canonical_pipeline import (
     AgentPipelineTrace,
+    Canonical11AgentPipeline,
     PipelineStageResult,
     compute_asset_class_commission_usd,
 )
@@ -27,6 +29,7 @@ from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import AssetClass, DiscoveredSymbol, Side, Tick
 from apex.ledger.walkforward_db import WalkForwardLedgerDB
 from apex.quant.contagion_oracle import ContagionOracle, ContagionTelemetry
+from apex.quant.correlation_shield import CorrelationShield, PositionRiskSpec
 from apex.quant.momentum_dom import (
     InstrumentTier,
     MomentumDOMGate,
@@ -89,6 +92,8 @@ class UniverseScanner:
         ai_committee: AIVetoCommittee,
         ledger: WalkForwardLedgerDB,
         config: dict[str, Any] | None = None,
+        correlation_shield: CorrelationShield | None = None,
+        canonical_pipeline: Canonical11AgentPipeline | None = None,
     ) -> None:
         self.feed_router: MarketFeedRouter = feed_router
         self.regime_classifier: RegimeClassifier = regime_classifier
@@ -113,10 +118,36 @@ class UniverseScanner:
             ceiling_atr_buffer=float(mtf_cfg.get("ceiling_atr_buffer", 0.30)),
             max_chase_atr_multiple=float(mtf_cfg.get("max_chase_atr_multiple", 2.2)),
         )
+        corr_cfg = self.config.get("filters", {}).get("correlation_cap", {})
+        risk_cfg = self.config.get("risk", {})
+        self.correlation_shield: CorrelationShield = correlation_shield or CorrelationShield(
+            enabled=bool(corr_cfg.get("enabled", True)),
+            max_factor_risk_pct=float(corr_cfg.get("max_factor_risk_pct", 1.0)),
+            account_equity_usd=float(risk_cfg.get("account_equity_usd", 10_000.0)),
+        )
+        self._custom_pipeline = canonical_pipeline is not None
+        self.canonical_pipeline: Canonical11AgentPipeline = canonical_pipeline or Canonical11AgentPipeline(
+            regime_classifier=self.regime_classifier,
+            momentum_dom_gate=self.momentum_dom_gate,
+            mtf_filter=self.mtf_filter,
+            time_machine=self.time_machine,
+            correlation_shield=self.correlation_shield,
+            ai_committee=self.ai_committee,
+            contagion_oracle=self.contagion_oracle,
+            config=self.config,
+            min_net_avg_r=self.min_net_avg_R,
+        )
         self.last_contagion: ContagionTelemetry | None = None
         self.recent_audit_events: list[BrokerExecutionEvent] = []
         self._cached_catalog: list[DiscoveredSymbol] = []
         self._last_catalog_discovery_time: float = 0.0
+        self._spread_history: dict[str, deque[float]] = {}
+        self._tick_rate_history: dict[str, deque[float]] = {}
+        self._last_tick_seen: dict[str, float] = {}
+
+    def get_catalog(self, force: bool = False) -> list[DiscoveredSymbol]:
+        """Alias returning the discovered broker symbol catalog across active feeds."""
+        return self.discover_or_get_catalog(force=force)
 
     def discover_catalog(self, force: bool = False) -> list[DiscoveredSymbol]:
         """Fetch or refresh the full broker catalog across active feeds."""
@@ -379,6 +410,8 @@ class UniverseScanner:
                     )
                     for s in default_symbols
                 ]
+        elif not target_symbols:
+            catalog = []
         elif isinstance(target_symbols[0], str):
             catalog = [
                 DiscoveredSymbol(
@@ -417,7 +450,7 @@ class UniverseScanner:
         open_scores = [ps for ps in prescores if ps.is_open and ps.status_reason != "INSUFFICIENT_BARS"]
         open_scores.sort(key=lambda x: x.composite_mover_score, reverse=True)
 
-        effective_candidates = open_scores if open_scores else prescores
+        effective_candidates = open_scores
         top_selected = effective_candidates if target_symbols is not None else effective_candidates[: self.max_candidates_per_cycle]
         top_names = tuple(c.symbol for c in top_selected)
 
@@ -431,14 +464,15 @@ class UniverseScanner:
             asset_class_counts=asset_counts,
         )
 
-        return (open_scores if open_scores else prescores), summary
+        return open_scores, summary
 
     def evaluate_candidate_pipeline(
         self,
         candidate: CandidatePreScore,
         cost_model: TimeMachineCostModel | None = None,
+        open_positions: Sequence[PositionRiskSpec] = (),
     ) -> SymbolCockpitRow:
-        """Stage B: Full institutional quantitative pipeline on a single top candidate."""
+        """Stage B: Delegate candidate evaluation directly to Canonical11AgentPipeline."""
         sym = candidate.symbol
         tf = candidate.timeframe
         pip_size = max(0.01 if "JPY" in sym or "XAU" in sym else 0.0001, 1e-6)
@@ -447,7 +481,7 @@ class UniverseScanner:
             pip_size = max(spec.pip_size, 1e-9)
 
         tick, _ = self.feed_router.get_tick(sym)
-        candles = self.feed_router.get_candles(sym, timeframe=tf, count=200)
+        candles = self.feed_router.get_candles(sym, timeframe=tf, count=2048)
         dom = self.feed_router.get_dom_analytics(sym)
         q_state = self.ledger.get_quarantine_state(sym)
 
@@ -470,24 +504,69 @@ class UniverseScanner:
                 profit_factor=q_state.profit_factor,
             )
 
+        if not self._custom_pipeline:
+            self.canonical_pipeline.regime_classifier = self.regime_classifier
+            self.canonical_pipeline.momentum_dom_gate = self.momentum_dom_gate
+            self.canonical_pipeline.mtf_filter = self.mtf_filter
+            self.canonical_pipeline.time_machine = self.time_machine
+            self.canonical_pipeline.correlation_shield = self.correlation_shield
+            self.canonical_pipeline.ai_committee = self.ai_committee
+            self.canonical_pipeline.contagion_oracle = self.contagion_oracle
+            self.canonical_pipeline.min_net_avg_r = float(self.min_net_avg_R)
+
         spread_px = tick.spread
+        spread_hist = self._spread_history.setdefault(sym, deque(maxlen=120))
+        if spread_px > 0.0:
+            spread_hist.append(float(spread_px))
+
+        tick_ts = float(getattr(tick, "timestamp_utc", 0.0) or time.time())
+        prev_tick_ts = self._last_tick_seen.get(sym)
+        self._last_tick_seen[sym] = tick_ts
+        cur_tick_rate: float | None = None
+        rate_hist = self._tick_rate_history.setdefault(sym, deque(maxlen=120))
+        if prev_tick_ts is not None and tick_ts > prev_tick_ts:
+            dt_tick = max(tick_ts - prev_tick_ts, 1e-3)
+            cur_tick_rate = min(1.0 / dt_tick, 200.0)
+            rate_hist.append(cur_tick_rate)
+
+        if len(candles) >= 20:
+            cls_arr = np.asarray([float(c.close) for c in candles[-120:]], dtype=np.float64)
+            rets_arr = np.diff(cls_arr) / np.maximum(cls_arr[:-1], 1e-12)
+            self.correlation_shield.register_return_series(sym, rets_arr)
+
         spread_pips_atomic = round(max(spread_px / pip_size, 0.0), 2)
-        diag = self.regime_classifier.classify_candles(
+        h1_candles = self.feed_router.get_candles(sym, timeframe="H1", count=80)
+        side = self.infer_candidate_side(candles, h1_candles)
+        entry_px = tick.ask if side == Side.BUY else tick.bid
+
+        if self.last_contagion is None:
+            self.last_contagion = self.contagion_oracle.evaluate(feed_router=self.feed_router)
+        shock_z = float(self.last_contagion.cross_asset_shock_z)
+        rollover_flag = bool(self.last_contagion.rollover_illiquidity_flag)
+
+        trace = self.canonical_pipeline.evaluate(
             symbol=sym,
+            side=side,
+            timeframe=tf,
+            entry_price=entry_px,
             candles=candles,
-            current_spread=spread_px,
+            h1_candles=h1_candles,
+            spread_price=spread_px,
+            pip_size=pip_size,
+            dom_analytics=dom,
+            cross_asset_shock_z=shock_z,
+            rollover_illiquidity_flag=rollover_flag,
+            open_positions=open_positions,
+            contract_spec=spec,
+            cost_model=cost_model,
+            run_ai_committee=(self.ai_committee is not None),
+            feed_router=self.feed_router,
+            historical_spreads=list(spread_hist) if len(spread_hist) >= 5 else None,
+            current_tick_rate=cur_tick_rate,
+            historical_tick_rates=list(rate_hist) if len(rate_hist) >= 5 else None,
         )
 
-        h1_candles = self.feed_router.get_candles(sym, timeframe="H1", count=40)
-        side = self.infer_candidate_side(candles, h1_candles)
-
-        # Symmetric 1.5x ATR stop and 2.0R target
-        atr_val = max(diag.current_atr, pip_size * 5.0)
-        sl_dist = 1.5 * atr_val
-        entry_px = tick.ask if side == Side.BUY else tick.bid
-        stop_px = (entry_px - sl_dist) if side == Side.BUY else (entry_px + sl_dist)
-        target_px = (entry_px + 2.0 * sl_dist) if side == Side.BUY else (entry_px - 2.0 * sl_dist)
-
+        sl_dist = max(abs(trace.entry_price - trace.stop_loss), pip_size)
         nbbo = self.feed_router.evaluate_nbbo(
             symbol=sym,
             one_r_price_distance=sl_dist,
@@ -499,177 +578,53 @@ class UniverseScanner:
         else:
             best_venue_str = f"{nbbo.winning_venue.upper()} ({effective_cost_pips:.1f}p)"
 
-        gate_verdict = self.momentum_dom_gate.evaluate(
-            symbol=sym,
-            side=side,
-            entry_price=entry_px,
-            stop_price=stop_px,
-            candles=candles,
-            current_spread=spread_px,
-            dom_analytics=dom,
-        )
-
-        commission_usd = compute_asset_class_commission_usd(sym, candidate.asset_class)
-        risk_per_lot_usd = 100.0
-        if spec is not None:
-            if getattr(spec, "trade_tick_value", 0.0) > 0.0 and getattr(spec, "trade_tick_size", 0.0) > 0.0:
-                risk_per_lot_usd = max((sl_dist / spec.trade_tick_size) * spec.trade_tick_value, 1.0)
-            elif spec.lot_size > 0.0:
-                # For low-priced USD-quoted crypto/CFDs (e.g. ADAUSD), sl_dist * lot_size gives true $ risk/lot
-                est = sl_dist * spec.lot_size
-                if est > 0.0:
-                    risk_per_lot_usd = max(est, 1.0)
-
-        eff_cost_model = cost_model or TimeMachineCostModel(
-            commission_per_lot_round_turn_usd=commission_usd,
-            lots=0.10,
-            risk_per_lot_usd=risk_per_lot_usd,
-            spread_price=spread_px,
-            vwap_slippage_price=0.2 * pip_size,
-        )
-        tm_res = self.time_machine.simulate_candles(
-            symbol=sym,
-            side=side,
-            entry_price=entry_px,
-            stop_price=stop_px,
-            target_price=target_px,
-            candles=candles,
-            horizon_bars=36,
-            cost_model=eff_cost_model,
-        )
-
-        mtf_verdict = self.mtf_filter.evaluate(
-            symbol=sym,
-            side=side,
-            entry_price=entry_px,
-            atr_m5=atr_val,
-            m5_candles=candles,
-            h1_candles=h1_candles,
-        )
-
-        passed_all_quant = (
-            diag.allow_breakout_entries
-            and gate_verdict.passed
-            and mtf_verdict.passed
-            and tm_res.net_avg_R >= self.min_net_avg_R
-        )
+        stages_by_num = {st.stage_num: st for st in trace.stages}
+        passed_all_quant = all(bool(stages_by_num[n].passed) for n in (1, 2, 3, 5, 6) if n in stages_by_num)
+        stage2_detail = stages_by_num[2].detail if 2 in stages_by_num else trace.regime
 
         self.ledger.log_scan_event(
             symbol=sym,
             timeframe=tf,
-            regime=diag.regime.value,
-            hurst=diag.hurst_exponent,
-            kaufman_er=diag.kaufman_er,
-            vol_pct=diag.volatility_percentile,
+            regime=trace.regime,
+            hurst=trace.hurst_exponent,
+            kaufman_er=trace.kaufman_er,
+            vol_pct=trace.volatility_percentile,
             dom_obi=dom.obi if dom else None,
-            spread_pct_of_sl=gate_verdict.spread_pct_of_sl,
+            spread_pct_of_sl=trace.spread_pct_of_sl,
             passed_quant=passed_all_quant,
-            detail=f"{side.value} | {diag.reason}",
+            detail=f"{side.value} | {stage2_detail}",
         )
 
-        if self.last_contagion is None:
-            self.last_contagion = self.contagion_oracle.evaluate(feed_router=self.feed_router)
-        shock_z = float(self.last_contagion.cross_asset_shock_z)
-        rollover_flag = bool(self.last_contagion.rollover_illiquidity_flag)
-
-        z3_telemetry = {
-            "symbol": sym,
-            "side": side.value,
-            "timemachine_net_avg_R": tm_res.net_avg_R,
-            "spread_pct_of_sl": gate_verdict.spread_pct_of_sl,
-            "vol_pct": diag.volatility_percentile,
-            "cross_asset_shock_z": shock_z,
-            "rollover_illiquidity_flag": rollover_flag,
-        }
-        z3_dec, z3_msg = AegisVerifier.z3_pure_math_axiom_gate(z3_telemetry)
-        z3_ok = z3_dec == "APPROVE"
-
-        ai_label = "IDLE (Quant Filtered)"
-        ai_ok = z3_ok
-        ai_detail = z3_msg
-        if passed_all_quant:
-            latest_bar_ts = candles[-1].timestamp_utc if candles else 0.0
-            ctx = CandidateSetupAuditContext(
-                symbol=sym,
-                side=side,
-                timeframe=tf,
-                entry_price=entry_px,
-                stop_loss=stop_px,
-                take_profit=target_px,
-                regime=diag.regime.value,
-                hurst_exponent=diag.hurst_exponent,
-                kaufman_er=diag.kaufman_er,
-                volatility_percentile=diag.volatility_percentile,
-                dom_obi=dom.obi if dom else None,
-                spread_pct_of_sl=gate_verdict.spread_pct_of_sl,
-                net_avg_R=tm_res.net_avg_R,
-                prob_profit=tm_res.prob_profit,
-                cvar_95_R=tm_res.cvar_95_R,
-                recommended_risk_pct=tm_res.recommended_risk_pct,
-                session_utc_iso=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                bar_timestamp=latest_bar_ts,
-                rollover_illiquidity_flag=rollover_flag,
-                cross_asset_shock_z=shock_z,
-            )
-            ai_decision = self.ai_committee.evaluate_sync(ctx)
-            ai_label = f"{ai_decision.decision} ({ai_decision.confidence:.2f} via {ai_decision.provider_used})"
-            ai_ok = ai_decision.decision == "APPROVE"
-            ai_detail = f"{ai_decision.decision} ({ai_decision.model_used}) | {z3_msg}"
-            if ai_decision.decision == "VETO":
-                z3_tag = "Z3:PASS" if ai_decision.aegis_verified else "Z3:BYPASS"
-                self.recent_audit_events.append(
-                    BrokerExecutionEvent(
-                        timestamp_str=time.strftime("%H:%M:%S", time.gmtime()),
-                        symbol=sym,
-                        side=side.value,
-                        lots=0.0,
-                        price=entry_px,
-                        stop_loss=stop_px,
-                        take_profit=target_px,
-                        venue=f"AI/{ai_decision.provider_used.upper()}",
-                        status="VETO",
-                        details=f"model={ai_decision.model_used} | {z3_tag} | {ai_decision.reason[:80]}",
-                    )
+        if trace.ai_decision == "VETO" and trace.ai_model != "Z3_AXIOM_GATE":
+            stage9 = stages_by_num.get(9)
+            z3_tag = "Z3:PASS" if (stage9 and stage9.metric_value == "APPROVE") else "Z3:BYPASS"
+            self.recent_audit_events.append(
+                BrokerExecutionEvent(
+                    timestamp_str=time.strftime("%H:%M:%S", time.gmtime()),
+                    symbol=sym,
+                    side=side.value,
+                    lots=0.0,
+                    price=trace.entry_price,
+                    stop_loss=trace.stop_loss,
+                    take_profit=trace.take_profit,
+                    venue=f"AI/{(trace.ai_provider or 'ai').upper()}",
+                    status="VETO",
+                    details=f"model={trace.ai_model} | {z3_tag} | {trace.ai_reason[:80]}",
                 )
-                if len(self.recent_audit_events) > 20:
-                    self.recent_audit_events = self.recent_audit_events[-20:]
+            )
+            if len(self.recent_audit_events) > 20:
+                self.recent_audit_events = self.recent_audit_events[-20:]
 
-        rec_risk = float(tm_res.recommended_risk_pct) if passed_all_quant else 0.0
-        contagion_ok = (shock_z <= 3.5) and not (rollover_flag and diag.volatility_percentile > 85.0)
-        bracket_ok = (entry_px > 0.0) and (sl_dist > 0.0)
-        tm_ok = tm_res.net_avg_R >= self.min_net_avg_R
-        exec_ready = passed_all_quant and contagion_ok and ai_ok and bracket_ok
+        if not passed_all_quant and trace.ai_model != "Z3_AXIOM_GATE":
+            ai_label = "IDLE (Quant Filtered)"
+        elif trace.ai_model == "Z3_AXIOM_GATE":
+            ai_label = f"{trace.ai_decision} (Z3)"
+        elif self.ai_committee is not None and trace.ai_provider not in ("", "quant", "z3"):
+            ai_label = f"{trace.ai_decision} ({trace.ai_confidence:.2f} via {trace.ai_provider})"
+        else:
+            ai_label = f"{trace.ai_decision} ({trace.ai_model or 'PURE_QUANT'})"
 
-        trace_stages = [
-            PipelineStageResult(1, "trader-scanner + H1 MTF", mtf_verdict.passed, mtf_verdict.reason, f"{side.value} slope={mtf_verdict.h1_ema_slope:+.2f}"),
-            PipelineStageResult(2, "RegimeClassifier", diag.allow_breakout_entries, f"{diag.regime.value}: {diag.reason}", f"H={diag.hurst_exponent:.2f} ER={diag.kaufman_er:.2f}"),
-            PipelineStageResult(3, "trader-entry + MomentumDOM", gate_verdict.passed, ("; ".join(gate_verdict.reasons) if gate_verdict.reasons else ("OK" if gate_verdict.passed else "Blocked")), f"spread%SL={gate_verdict.spread_pct_of_sl:.1f}%"),
-            PipelineStageResult(4, "trader-exit", bracket_ok, f"{side.value} SL={stop_px:.5f} | TP={target_px:.5f} (2.0R)", f"1R={sl_dist:.5f}"),
-            PipelineStageResult(5, "TimeMachine v2 (Bootstrap)", tm_ok, f"net_avg_R={tm_res.net_avg_R:+.3f}R (floor={self.min_net_avg_r if hasattr(self, 'min_net_avg_r') else self.min_net_avg_R:.2f}R, comm=${commission_usd:.2f})", f"P(Win)={tm_res.prob_profit * 100:.0f}%"),
-            PipelineStageResult(6, "Contagion / News / Analyst", contagion_ok, f"shock_z={shock_z:.2f}, rollover={rollover_flag}", f"Z={shock_z:.2f}"),
-            PipelineStageResult(7, "trader-budget", (rec_risk > 0.0) if passed_all_quant else False, f"Q-Kelly={rec_risk:.2f}%" if passed_all_quant else "Q-Kelly forced 0.00% (filtered)", f"{rec_risk:.2f}%"),
-            PipelineStageResult(8, "trader-risk + CorrelationShield", q_state.mode.value == "ACTIVE", f"Quarantine={q_state.mode.value} PF={q_state.profit_factor:.2f}", "CAP<=1.0%"),
-            PipelineStageResult(9, "Aegis Z3 + AI Waterfall", ai_ok, ai_detail, z3_dec),
-            PipelineStageResult(10, "ExecutionRouter (DEMO)", exec_ready, "DEMO-locked + Server-side SL/TP armed" if exec_ready else "Blocked upstream prior to wire", "DEMO_SAFE"),
-            PipelineStageResult(11, "InFlightPositionManager", True, "2-Bar Grace Lock + Forward TM + 1R/1.5R Runner armed", "SHIELD8_Z3"),
-        ]
-        blocked_stage = next((st.stage_num for st in trace_stages if not st.passed), None)
-        trace_dict = AgentPipelineTrace(
-            symbol=sym,
-            timeframe=tf,
-            side=side.value,
-            entry_price=entry_px,
-            stop_loss=stop_px,
-            take_profit=target_px,
-            passed_all=exec_ready,
-            final_decision="APPROVE" if exec_ready else ("VETO" if (passed_all_quant and not ai_ok) else "FILTERED"),
-            net_avg_r=round(tm_res.net_avg_R, 4),
-            recommended_risk_pct=round(rec_risk, 4),
-            z3_status=z3_msg,
-            stages=trace_stages,
-        ).to_dict()
-        trace_dict["blocked_stage"] = blocked_stage
-
+        trace_dict = trace.to_dict()
         return SymbolCockpitRow(
             symbol=sym,
             tier=candidate.tier.value,
@@ -677,20 +632,20 @@ class UniverseScanner:
             bid=tick.bid,
             ask=tick.ask,
             spread_pips=spread_pips_atomic,
-            regime=diag.regime.value,
-            hurst=diag.hurst_exponent,
-            kaufman_er=diag.kaufman_er,
+            regime=trace.regime,
+            hurst=trace.hurst_exponent,
+            kaufman_er=trace.kaufman_er,
             obi=dom.obi if dom else None,
-            net_avg_r=tm_res.net_avg_R,
-            rec_risk_pct=rec_risk,
+            net_avg_r=trace.net_avg_r,
+            rec_risk_pct=trace.recommended_risk_pct,
             ai_verdict=ai_label,
             quarantine_mode=q_state.mode.value,
             profit_factor=q_state.profit_factor,
             best_venue=best_venue_str,
             side=side,
-            entry_price=entry_px,
-            stop_loss=stop_px,
-            take_profit=target_px,
+            entry_price=trace.entry_price,
+            stop_loss=trace.stop_loss,
+            take_profit=trace.take_profit,
             pipeline_trace=trace_dict,
         )
 
@@ -698,6 +653,7 @@ class UniverseScanner:
         self,
         target_symbols: Sequence[DiscoveredSymbol] | Sequence[str] | None = None,
         now_utc: float | None = None,
+        open_positions: Sequence[PositionRiskSpec] = (),
     ) -> tuple[list[SymbolCockpitRow], UniverseScanSummary]:
         """Execute a full two-stage funnel scan cycle."""
         # Recompute fresh ground-truth contagion & rollover telemetry on every cycle
@@ -707,8 +663,36 @@ class UniverseScanner:
 
         rows: list[SymbolCockpitRow] = []
         for candidate in top_candidates:
-            row = self.evaluate_candidate_pipeline(candidate)
+            row = self.evaluate_candidate_pipeline(candidate, open_positions=open_positions)
             rows.append(row)
+
+        # Stage-B Convex Portfolio Kelly Optimization across multi-symbol survivors
+        survivors = [
+            (idx, r)
+            for idx, r in enumerate(rows)
+            if (r.rec_risk_pct or 0.0) > 0.0
+            and (r.net_avg_r or 0.0) > 0.0
+            and str(r.ai_verdict).startswith("APPROVE")
+        ]
+        if len(survivors) >= 2:
+            opt_inputs = [
+                (r.symbol, r.side, float(r.net_avg_r or 0.0), float(r.rec_risk_pct or 0.0))
+                for _, r in survivors
+            ]
+            max_conc = int(self.config.get("risk", {}).get("max_concurrent_positions", 5))
+            opt_weights = self.correlation_shield.optimize_portfolio_weights(
+                candidates=opt_inputs,
+                open_positions=open_positions,
+                max_concurrent_positions=max_conc,
+            )
+            for idx, r in survivors:
+                new_risk = float(opt_weights.get(r.symbol.upper(), r.rec_risk_pct or 0.0))
+                if abs(new_risk - float(r.rec_risk_pct or 0.0)) > 1e-6:
+                    rows[idx] = replace(
+                        r,
+                        rec_risk_pct=round(new_risk, 4),
+                        ai_verdict=r.ai_verdict if new_risk > 0.0 else "PORTFOLIO_CAPPED",
+                    )
 
         rows.sort(
             key=lambda r: (

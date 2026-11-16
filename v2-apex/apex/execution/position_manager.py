@@ -98,10 +98,12 @@ class AutonomousPositionOrchestrator:
         weekend_cutoff_utc_hhmm: tuple[int, int] = (20, 45),
         sltp_sender: Optional[Callable[[int, str, float, float], int]] = None,
         close_sender: Optional[Callable[[int, str, Side, float, float], int]] = None,
+        feed_router: Optional[Any] = None,
     ) -> None:
         self.regime_classifier = regime_classifier or RegimeClassifier()
         self.time_machine = time_machine or BlockBootstrapTimeMachine(replays=2000, seed=19)
         self.ledger = ledger
+        self.feed_router = feed_router
         self.min_hold_bars = max(1, int(min_hold_bars))
         self.noise_cone_atr = float(noise_cone_atr)
         self.flash_crash_shock_z = float(flash_crash_shock_z)
@@ -490,12 +492,22 @@ class AutonomousPositionOrchestrator:
     def _dispatch_sltp(self, ticket: int, symbol: str, sl: float, tp: float) -> int:
         if self._sltp_sender is not None:
             return int(self._sltp_sender(ticket, symbol, sl, tp))
+
+        feed_router = getattr(self, "feed_router", None)
+        ct = getattr(feed_router, "ctrader", None) if feed_router is not None else None
+        mt5_pos = mt5.positions_get(ticket=int(ticket)) if getattr(mt5, "positions_get", None) else None
+        if not mt5_pos and ct is not None and ct.is_connected and hasattr(ct, "amend_position_sltp"):
+            res = ct.amend_position_sltp(position_id=int(ticket), stop_loss=float(sl), take_profit=float(tp), symbol=symbol)
+            return 10009 if (isinstance(res, dict) and res.get("ok")) else -1
+
+        info = mt5.symbol_info(symbol) if getattr(mt5, "symbol_info", None) else None
+        digits = int(getattr(info, "digits", 5) or 5) if info is not None else 5
         req = {
             "action": mt5.TRADE_ACTION_SLTP,
             "position": int(ticket),
             "symbol": symbol,
-            "sl": float(sl),
-            "tp": float(tp),
+            "sl": round(float(sl), digits),
+            "tp": round(float(tp), digits),
             "magic": 202611,
             "comment": "APEX_RATCHET",
         }
@@ -505,26 +517,47 @@ class AutonomousPositionOrchestrator:
     def _dispatch_close(self, ticket: int, symbol: str, side: Side, lots: float, price: float) -> int:
         if self._close_sender is not None:
             return int(self._close_sender(ticket, symbol, side, lots, price))
+
+        feed_router = getattr(self, "feed_router", None)
+        ct = getattr(feed_router, "ctrader", None) if feed_router is not None else None
+        mt5_pos = mt5.positions_get(ticket=int(ticket)) if getattr(mt5, "positions_get", None) else None
+        if not mt5_pos and ct is not None and ct.is_connected and hasattr(ct, "close_position"):
+            res = ct.close_position(position_id=int(ticket), volume_lots=float(lots), symbol=symbol)
+            return 10009 if (isinstance(res, dict) and res.get("ok")) else -1
+
         info = mt5.symbol_info(symbol)
+        digits = int(getattr(info, "digits", 5) or 5) if info is not None else 5
         filling = int(mt5.ORDER_FILLING_FOK)
         if info is not None:
             fm = int(getattr(info, "filling_mode", 0))
             filling = int(mt5.ORDER_FILLING_FOK) if (fm & 1) else (int(mt5.ORDER_FILLING_IOC) if (fm & 2) else int(mt5.ORDER_FILLING_RETURN))
-        req = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "position": int(ticket),
-            "symbol": symbol,
-            "volume": float(lots),
-            "type": int(mt5.ORDER_TYPE_SELL if side == Side.BUY else mt5.ORDER_TYPE_BUY),
-            "price": float(price),
-            "deviation": 50,
-            "magic": 202611,
-            "comment": "APEX_INFLIGHT_EXIT",
-            "type_time": int(mt5.ORDER_TIME_GTC),
-            "type_filling": filling,
-        }
-        res = mt5.order_send(req)
-        return int(getattr(res, "retcode", -1)) if res is not None else -1
+        last_retcode = -1
+        for fill_mode in dict.fromkeys(
+            [
+                filling,
+                int(mt5.ORDER_FILLING_IOC),
+                int(mt5.ORDER_FILLING_FOK),
+                int(mt5.ORDER_FILLING_RETURN),
+            ]
+        ):
+            req = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "position": int(ticket),
+                "symbol": symbol,
+                "volume": float(lots),
+                "type": int(mt5.ORDER_TYPE_SELL if side == Side.BUY else mt5.ORDER_TYPE_BUY),
+                "price": round(float(price), digits),
+                "deviation": 50,
+                "magic": 202611,
+                "comment": "APEX_INFLIGHT_EXIT",
+                "type_time": int(mt5.ORDER_TIME_GTC),
+                "type_filling": fill_mode,
+            }
+            res = mt5.order_send(req)
+            last_retcode = int(getattr(res, "retcode", -1)) if res is not None else -1
+            if last_retcode == int(getattr(mt5, "TRADE_RETCODE_DONE", 10009)):
+                return last_retcode
+        return last_retcode
 
     def reconcile_closed_deals(
         self,

@@ -277,12 +277,12 @@ def run_live_lifecycle_drill(
         trace_dict = trace.to_dict()
         _emit(
             "SCORECARD",
-            f"11-Agent Scorecard {symbol}: {'ALL PASS' if trace.passed_all else f'Blocked at Stage {trace.blocked_stage}: {trace.blocked_reason}'}",
+            f"11-Agent Scorecard {symbol}: {'ALL PASS' if trace.passed_all else f'Blocked at {trace.blocked_stage}: {trace.blocked_reason}'}",
             symbol=symbol,
             trace=trace_dict,
         )
         if mode_norm == "strict" and not trace.passed_all:
-            msg = f"STRICT 11-AGENT GATE REFUSAL on {symbol}: Stage {trace.blocked_stage} ({trace.blocked_reason})"
+            msg = f"STRICT 11-AGENT GATE REFUSAL on {symbol}: {trace.blocked_stage} ({trace.blocked_reason})"
             _emit("REJECTED", msg, symbol=symbol, trace=trace_dict)
             return DrillResult(
                 ok=False,
@@ -300,7 +300,7 @@ def run_live_lifecycle_drill(
                 close_retcode=0,
                 close_deal_id=0,
                 realized_pnl=0.0,
-                z3_status=f"BLOCKED_STAGE_{trace.blocked_stage}",
+                z3_status=f"BLOCKED_{trace.blocked_stage or 'FILTERED'}",
                 message=msg,
                 drill_mode=mode_norm,
                 trace=trace_dict,
@@ -312,11 +312,16 @@ def run_live_lifecycle_drill(
     stop_loss = round(entry_price - min_dist, digits)
     take_profit = round(entry_price + min_dist * 1.5, digits)
 
-    # Run Z3 formal pure-math axiom gate before sending order
+    # Run Z3 formal pure-math axiom gate before sending order (using computed TimeMachine net_avg_r when available)
+    computed_net_avg_r = (
+        float(trace_dict["net_avg_r"])
+        if isinstance(trace_dict, dict) and trace_dict.get("net_avg_r") is not None
+        else 0.35
+    )
     telemetry = {
         "symbol": symbol,
         "side": "BUY",
-        "timemachine_net_avg_R": 0.35,
+        "timemachine_net_avg_R": computed_net_avg_r,
         "spread_pct_of_sl": min(15.0, round((spread_px / max(min_dist, point)) * 100.0, 2)),
         "cross_asset_shock_z": 0.4,
         "vol_pct": 45.0,
@@ -357,88 +362,121 @@ def run_live_lifecycle_drill(
     # Locate the live MT5 position ticket
     pos_ticket = order_ticket
     pos_id = order_ticket
-    for _ in range(10):
-        positions = mt5.positions_get(symbol=symbol) or []
-        matched = [p for p in positions if int(getattr(p, "magic", 0)) == 202699]
-        if matched:
-            pos_ticket = int(matched[-1].ticket)
-            pos_id = int(getattr(matched[-1], "identifier", pos_ticket) or pos_ticket)
-            fill_price = float(matched[-1].price_open)
-            break
-        time.sleep(0.2)
-
     hold_secs = max(1, int(hold_seconds))
     last_floating = 0.0
+    sltp_retcode = -1
+    close_retcode = -1
+    close_deal_id = 0
+    close_px = fill_price
     orchestrator = AutonomousPositionOrchestrator()
     open_ts = time.time()
-    for sec in range(hold_secs):
-        positions = mt5.positions_get(ticket=pos_ticket) or []
-        cur_px = fill_price
-        if positions:
-            last_floating = float(positions[0].profit)
-            cur_px = float(getattr(positions[0], "price_current", fill_price) or fill_price)
-        pos_decision: PositionDecision = orchestrator.evaluate_position(
-            ticket=pos_ticket,
-            symbol=symbol,
-            side=Side.BUY,
-            entry_price=fill_price,
-            current_price=cur_px,
-            current_sl=stop_loss,
-            current_tp=take_profit,
-            lots=lots,
-            atr_value=max(min_dist, point * 10.0),
-            opened_at_utc=open_ts,
-            now_utc=time.time(),
-            candles=m5_candles[-30:] if len(m5_candles) >= 30 else None,
-        )
-        _emit(
-            "HOLDING",
-            (
-                f"Holding {symbol} #{pos_ticket} ({sec + 1}/{hold_secs}s) | "
-                f"Floating: {last_floating:+.2f} {currency} | InFlight: {pos_decision.action.value}"
-            ),
-            symbol=symbol,
-            ticket=pos_ticket,
-            floating_pnl=last_floating,
-            trace=trace_dict,
-        )
-        time.sleep(1.0)
 
-    # Tighten SL by 5 points (safe inside stop distance) to prove TRADE_ACTION_SLTP
-    tightened_sl = round(stop_loss + max(5.0 * point, point), digits)
-    if tightened_sl >= fill_price - max(stops_level_pts * point * 1.5, spread_px * 3.0):
-        tightened_sl = stop_loss
-    sltp_req = {
-        "action": mt5.TRADE_ACTION_SLTP,
-        "position": pos_ticket,
-        "symbol": symbol,
-        "sl": tightened_sl,
-        "tp": take_profit,
-        "magic": 202699,
-        "comment": "APEX_DRILL_SLTP",
-    }
-    sltp_res = mt5.order_send(sltp_req)
-    sltp_retcode = int(getattr(sltp_res, "retcode", -1)) if sltp_res is not None else -1
+    try:
+        for _ in range(10):
+            positions = mt5.positions_get(symbol=symbol) or []
+            matched = [p for p in positions if int(getattr(p, "magic", 0)) == 202699]
+            if matched:
+                pos_ticket = int(matched[-1].ticket)
+                pos_id = int(getattr(matched[-1], "identifier", pos_ticket) or pos_ticket)
+                fill_price = float(matched[-1].price_open)
+                break
+            time.sleep(0.2)
 
-    # Close position via opposite TRADE_ACTION_DEAL
-    close_tick = mt5.symbol_info_tick(symbol)
-    close_px = float(close_tick.bid) if close_tick is not None else fill_price
-    close_req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "position": pos_ticket,
-        "symbol": symbol,
-        "volume": lots,
-        "type": mt5.ORDER_TYPE_SELL,
-        "price": close_px,
-        "deviation": 50,
-        "magic": 202699,
-        "comment": "APEX_DRILL_CLOSE",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": filling,
-    }
-    close_res = mt5.order_send(close_req)
-    close_retcode = int(getattr(close_res, "retcode", -1)) if close_res is not None else -1
-    close_deal_id = int(getattr(close_res, "deal", 0) or 0) if close_res is not None else 0
+        for sec in range(hold_secs):
+            positions = mt5.positions_get(ticket=pos_ticket) or []
+            cur_px = fill_price
+            if positions:
+                last_floating = float(positions[0].profit)
+                cur_px = float(getattr(positions[0], "price_current", fill_price) or fill_price)
+            pos_decision: PositionDecision = orchestrator.evaluate_position(
+                ticket=pos_ticket,
+                symbol=symbol,
+                side=Side.BUY,
+                entry_price=fill_price,
+                current_sl=stop_loss,
+                current_tp=take_profit,
+                mark_price=cur_px,
+                lots=lots,
+                opened_at_utc=open_ts,
+                now_utc=time.time(),
+                candles=m5_candles[-30:] if len(m5_candles) >= 30 else None,
+            )
+            _emit(
+                "HOLDING",
+                (
+                    f"Holding {symbol} #{pos_ticket} ({sec + 1}/{hold_secs}s) | "
+                    f"Floating: {last_floating:+.2f} {currency} | InFlight: {pos_decision.action}"
+                ),
+                symbol=symbol,
+                ticket=pos_ticket,
+                floating_pnl=last_floating,
+                trace=trace_dict,
+            )
+            time.sleep(1.0)
+
+        # Tighten SL by 5 points (safe inside stop distance) to prove TRADE_ACTION_SLTP
+        tightened_sl = round(stop_loss + max(5.0 * point, point), digits)
+        if tightened_sl >= fill_price - max(stops_level_pts * point * 1.5, spread_px * 3.0):
+            tightened_sl = stop_loss
+        sltp_req = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": pos_ticket,
+            "symbol": symbol,
+            "sl": tightened_sl,
+            "tp": take_profit,
+            "magic": 202699,
+            "comment": "APEX_DRILL_SLTP",
+        }
+        sltp_res = mt5.order_send(sltp_req)
+        sltp_retcode = int(getattr(sltp_res, "retcode", -1)) if sltp_res is not None else -1
+
+        # Close position via opposite TRADE_ACTION_DEAL
+        close_tick = mt5.symbol_info_tick(symbol)
+        close_px = float(close_tick.bid) if close_tick is not None else fill_price
+        close_req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "position": pos_ticket,
+            "symbol": symbol,
+            "volume": lots,
+            "type": mt5.ORDER_TYPE_SELL,
+            "price": close_px,
+            "deviation": 50,
+            "magic": 202699,
+            "comment": "APEX_DRILL_CLOSE",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": filling,
+        }
+        close_res = mt5.order_send(close_req)
+        close_retcode = int(getattr(close_res, "retcode", -1)) if close_res is not None else -1
+        close_deal_id = int(getattr(close_res, "deal", 0) or 0) if close_res is not None else 0
+    finally:
+        # Orphan protection: guarantee the drill ticket cannot stay dangling on any exception or failed close
+        for attempt in range(4):
+            open_rem = mt5.positions_get(ticket=pos_ticket) or []
+            if not open_rem:
+                break
+            close_tick = mt5.symbol_info_tick(symbol)
+            retry_px = float(close_tick.bid) if close_tick is not None else fill_price
+            retry_req = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "position": pos_ticket,
+                "symbol": symbol,
+                "volume": lots,
+                "type": mt5.ORDER_TYPE_SELL,
+                "price": retry_px,
+                "deviation": 50,
+                "magic": 202699,
+                "comment": "APEX_DRILL_ORPHAN_CLOSE",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": filling,
+            }
+            retry_res = mt5.order_send(retry_req)
+            if retry_res is not None and int(getattr(retry_res, "retcode", -1)) == done_code:
+                close_retcode = done_code
+                close_px = retry_px
+                close_deal_id = int(getattr(retry_res, "deal", close_deal_id) or close_deal_id)
+                break
+            time.sleep(0.5 * (2**attempt))
 
     realized_pnl = last_floating
     for _ in range(10):
@@ -462,7 +500,7 @@ def run_live_lifecycle_drill(
         execution_mode=SymbolExecutionMode.ACTIVE,
         regime="DRILL",
         dom_obi=0.12,
-        predicted_net_r=0.35,
+        predicted_net_r=computed_net_avg_r,
         ai_decision="APPROVE",
         ai_confidence=1.0,
         ai_reason=z3_msg,

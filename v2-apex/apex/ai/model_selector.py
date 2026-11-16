@@ -318,8 +318,12 @@ class AdaptiveModelSelector:
         if not force and existing and (now_utc - self._last_studio_discovery_utc < self.discovery_ttl_seconds):
             return existing
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
-        req = urllib.request.Request(url, method="GET")
+        url = "https://generativelanguage.googleapis.com/v1beta/models"
+        req = urllib.request.Request(
+            url,
+            headers={"x-goog-api-key": api_key},
+            method="GET",
+        )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -396,7 +400,16 @@ class AdaptiveModelSelector:
                         continue
                     mid = parts[0].strip()
                     disp = parts[1].strip() if len(parts) > 1 else mid
-                    if not mid or "gemini" not in mid.lower():
+                    low_mid = mid.lower()
+                    if (
+                        not mid
+                        or low_mid in {"model", "id", "name"}
+                        or low_mid.startswith("---")
+                        or any(
+                            skip in low_mid
+                            for skip in ("embedding", "imagen", "veo", "-tts", "_tts")
+                        )
+                    ):
                         continue
                     if "xhigh" in mid.lower():
                         continue  # Skip ultra-heavy xhigh tier for real-time trading vetoes

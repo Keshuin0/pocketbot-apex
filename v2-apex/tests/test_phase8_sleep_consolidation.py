@@ -123,7 +123,7 @@ def test_phase_b_c_persistence_across_restart_and_slippage_feedback(tmp_path: Pa
     ts_base = datetime.datetime(2026, 11, 12, 14, 0, tzinfo=datetime.timezone.utc).timestamp()
 
     # Log 5 closed trades with elevated realized slippage on XAUUSD / mt5
-    for idx in range(5):
+    for idx in range(10):
         db1.log_trade_outcome(
             order_id=f"ORD-{idx}",
             symbol="XAUUSD",
@@ -180,8 +180,8 @@ def test_phase_b_c_persistence_across_restart_and_slippage_feedback(tmp_path: Pa
     assert res.canary_passed is True
     assert "[MORNING WAKE-UP READY]" in res.status_message
     assert mem_path.exists()
-    assert res.snapshot.trades_consolidated == 5
-    assert res.snapshot.audits_consolidated == 11
+    assert res.snapshot.trades_consolidated == 10
+    assert res.snapshot.audits_consolidated == 10
 
     # Slippage multiplier should be > 1.0 (realized_slippage_r=0.05 is high) and applied to Hydra
     mult = consolidator1.get_slippage_multiplier_for_symbol("XAUUSD", venue="mt5")
