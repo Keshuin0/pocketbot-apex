@@ -17,12 +17,18 @@ from typing import Any, Callable, Optional, Sequence
 
 import numpy as np
 
-from apex.engine.canonical_pipeline import AgentPipelineTrace, Canonical11AgentPipeline
+from apex.engine.canonical_pipeline import (
+    AgentPipelineTrace,
+    Canonical11AgentPipeline,
+    compute_asset_class_commission_usd,
+)
 from apex.execution.position_manager import AutonomousPositionOrchestrator
-from apex.feeds.models import Candle, Side
+from apex.feeds.alias_mapper import SmartAliasMapper
+from apex.feeds.models import AssetClass, Candle, Side
 from apex.quant.momentum_dom import InstrumentTier, classify_instrument_tier
 from apex.quant.regime import RegimeClassifier
 from apex.quant.timemachine_v2 import BlockBootstrapTimeMachine
+from apex.quant.universe_scanner import UniverseScanner
 
 DEFAULT_REPLAY_SYMBOLS: tuple[str, ...] = (
     "EURUSD",
@@ -189,6 +195,17 @@ class HistoricalReplayEngine:
             min_net_avg_r=min_net_avg_r,
         )
 
+    @staticmethod
+    def filter_causal_h1_candles(
+        h1_candles: Sequence[Candle] | None,
+        bar_ts: float,
+    ) -> list[Candle]:
+        """Return strictly completed H1 candles whose 1-hour close occurred at or before `bar_ts`."""
+        if not h1_candles or float(bar_ts) <= 0.0:
+            return []
+        cutoff = float(bar_ts)
+        return [c for c in h1_candles if (float(getattr(c, "timestamp_utc", 0.0) or 0.0) + 3600.0) <= cutoff]
+
     def run_replay(
         self,
         feed_router: Any = None,
@@ -306,7 +323,9 @@ class HistoricalReplayEngine:
             direction: Side = pos["side"]
             entry = pos["entry_price"]
             one_r = pos["one_r"]
-            signed_r = ((exit_px - entry) if direction == Side.BUY else (entry - exit_px)) / one_r
+            gross_r = ((exit_px - entry) if direction == Side.BUY else (entry - exit_px)) / one_r
+            cost_r = float(pos.get("round_trip_cost_r", 0.0) or 0.0)
+            signed_r = gross_r - cost_r
             pnl_cad = signed_r * risk_amt
             equity += pnl_cad
             equity_curve.append(round(equity, 2))
@@ -381,6 +400,7 @@ class HistoricalReplayEngine:
                         timeframe=bar.timeframe,
                         now_utc=float(bar.timestamp_utc),
                         bars_held_override=bars_held,
+                        initial_one_r=pos["one_r"],
                         force_evaluate=True,
                     )
                     pos["ratchet_stage"] = dec.ratchet_stage
@@ -393,9 +413,9 @@ class HistoricalReplayEngine:
                         closed_px = float(bar.close)
                         closed_reason = dec.ratchet_stage
 
-                if closed_px is None and (bars_held >= 7 or idx == min_len - 1):
+                if closed_px is None and idx == min_len - 1:
                     closed_px = float(bar.close)
-                    closed_reason = "HORIZON_CLOSE"
+                    closed_reason = "END_OF_REPLAY"
 
                 if closed_px is not None:
                     active_positions.pop(sym, None)
@@ -404,14 +424,18 @@ class HistoricalReplayEngine:
             # Step 2: Evaluate causal new entries strictly from closed history up to `idx`
             is_eval_bar = ((idx - window) % eval_stride == 0) and (idx < min_len - 1)
             if is_eval_bar:
+                alias_mapper = SmartAliasMapper()
                 for sym, cs in sym_candles.items():
                     bars_processed += 1
                     if sym in active_positions or len(active_positions) >= max_slots:
                         continue
                     hist = cs[idx - window : idx + 1][-window:]
-                    direction = Side.BUY if hist[-1].close >= hist[-5].close else Side.SELL
+                    bar_ts = float(hist[-1].timestamp_utc)
+                    causal_h1 = self.filter_causal_h1_candles(sym_h1.get(sym), bar_ts)
+                    direction = UniverseScanner.infer_candidate_side(hist, causal_h1)
                     entry = float(hist[-1].close)
-                    h1_cs = sym_h1.get(sym)
+                    pip_sz = 0.01 if ("JPY" in sym or "XAU" in sym) else 0.0001
+                    spread_px = max(entry * 0.0001, pip_sz * 0.5)
 
                     trace: AgentPipelineTrace = self.pipeline.evaluate(
                         symbol=sym,
@@ -419,9 +443,9 @@ class HistoricalReplayEngine:
                         timeframe=hist[-1].timeframe,
                         entry_price=entry,
                         candles=hist,
-                        h1_candles=h1_cs,
-                        spread_price=max(entry * 0.0001, 1e-5),
-                        pip_size=0.01 if "JPY" in sym or "XAU" in sym else 0.0001,
+                        h1_candles=causal_h1,
+                        spread_price=spread_px,
+                        pip_size=pip_sz,
                         run_ai_committee=False,
                     )
                     last_trace_dict = trace.to_dict()
@@ -437,6 +461,12 @@ class HistoricalReplayEngine:
                     cur_sl = trace.stop_loss
                     cur_tp = trace.take_profit
                     one_r = max(abs(entry - cur_sl), 1e-6)
+                    ac = alias_mapper.classify_asset_class(sym)
+                    lot_units = 100_000.0 if ac == AssetClass.FOREX else (100.0 if "XAU" in sym else 1.0)
+                    comm_usd = compute_asset_class_commission_usd(sym, asset_class=ac)
+                    risk_per_lot = max(one_r * lot_units, 100.0)
+                    slip_px = 0.4 * pip_sz
+                    rt_cost_r = ((spread_px + slip_px) / one_r) + (comm_usd / risk_per_lot)
                     active_positions[sym] = {
                         "ticket": ticket,
                         "symbol": sym,
@@ -445,6 +475,7 @@ class HistoricalReplayEngine:
                         "cur_sl": cur_sl,
                         "cur_tp": cur_tp,
                         "one_r": one_r,
+                        "round_trip_cost_r": rt_cost_r,
                         "entry_idx": idx,
                         "ratchet_stage": "GRACE_LOCK",
                         "trace": last_trace_dict,

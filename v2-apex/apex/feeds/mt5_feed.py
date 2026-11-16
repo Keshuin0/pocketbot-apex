@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import logging
+from decimal import Decimal
 import math
 import time
 from typing import Any, Sequence
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+except ImportError:  # pragma: no cover - headless/cTrader-only nodes
+    mt5 = None  # type: ignore[assignment]
 
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.models import (
@@ -21,13 +25,13 @@ from apex.feeds.models import (
 logger = logging.getLogger(__name__)
 
 MT5_TIMEFRAME_MAP: dict[str, int] = {
-    "M1": mt5.TIMEFRAME_M1,
-    "M5": mt5.TIMEFRAME_M5,
-    "M15": mt5.TIMEFRAME_M15,
-    "M30": mt5.TIMEFRAME_M30,
-    "H1": mt5.TIMEFRAME_H1,
-    "H4": mt5.TIMEFRAME_H4,
-    "D1": mt5.TIMEFRAME_D1,
+    "M1": int(getattr(mt5, "TIMEFRAME_M1", 1)),
+    "M5": int(getattr(mt5, "TIMEFRAME_M5", 5)),
+    "M15": int(getattr(mt5, "TIMEFRAME_M15", 15)),
+    "M30": int(getattr(mt5, "TIMEFRAME_M30", 30)),
+    "H1": int(getattr(mt5, "TIMEFRAME_H1", 16385)),
+    "H4": int(getattr(mt5, "TIMEFRAME_H4", 16388)),
+    "D1": int(getattr(mt5, "TIMEFRAME_D1", 16408)),
 }
 
 
@@ -52,6 +56,7 @@ class MT5Feed:
         self._initialized: bool = False
         self._server_utc_offset_seconds: int = 0
         self._symbol_map: dict[str, str] = {}
+        self._contract_specs: dict[str, ContractSpec] = {}
         self.alias_mapper: SmartAliasMapper = SmartAliasMapper()
         self._catalog: dict[str, DiscoveredSymbol] = {}
 
@@ -61,7 +66,7 @@ class MT5Feed:
         override = getattr(self, "_connected", None)
         if override is not None:
             return bool(override)
-        if not self._initialized:
+        if not self._initialized or mt5 is None:
             return False
         term_info = mt5.terminal_info()
         return term_info is not None
@@ -75,6 +80,10 @@ class MT5Feed:
         """Initialize the MT5 IPC session, enforce the DEMO safety invariant, and calibrate UTC offset."""
         if self.allow_live:
             verify_live_unlock(True, cli_args=self._cli_args)
+        if mt5 is None:
+            logger.debug("MetaTrader5 package unavailable; MT5 feed staying offline.")
+            self._initialized = False
+            return False
 
         ok = mt5.initialize(self.terminal_path) if self.terminal_path else mt5.initialize()
         if not ok:
@@ -227,6 +236,69 @@ class MT5Feed:
 
         return None
 
+    def get_fx_conversion_rate(self, from_ccy: str, to_ccy: str = "USD") -> float:
+        """Convert 1 unit of ``from_ccy`` into ``to_ccy`` using live ticks with safe static major fallbacks."""
+        src = (from_ccy or "USD").upper().strip()
+        dst = (to_ccy or "USD").upper().strip()
+        if src == dst or not src or not dst:
+            return 1.0
+
+        def _mid_for(pair: str) -> float:
+            tick = self.get_tick(pair)
+            if tick is not None and tick.bid > 0.0 and tick.ask > 0.0:
+                return 0.5 * (float(tick.bid) + float(tick.ask))
+            if self._initialized and mt5 is not None:
+                res = self.resolve_symbol(pair)
+                if res:
+                    mt_tick = mt5.symbol_info_tick(res)
+                    if mt_tick is not None:
+                        b = float(getattr(mt_tick, "bid", 0.0) or 0.0)
+                        a = float(getattr(mt_tick, "ask", 0.0) or 0.0)
+                        if b > 0.0 and a > 0.0:
+                            return 0.5 * (b + a)
+            return 0.0
+
+        direct = _mid_for(f"{src}{dst}")
+        if direct > 0.0:
+            return direct
+        inv = _mid_for(f"{dst}{src}")
+        if inv > 0.0:
+            return 1.0 / inv
+
+        # Bridge through USD for crosses such as SGD -> USD or JPY -> EUR
+        static_usd_per_unit = {
+            "USD": 1.0,
+            "EUR": 1.08,
+            "GBP": 1.27,
+            "AUD": 0.65,
+            "NZD": 0.60,
+            "CAD": 1.0 / 1.38,
+            "CHF": 1.0 / 0.88,
+            "JPY": 1.0 / 150.0,
+            "SGD": 1.0 / 1.34,
+            "HKD": 1.0 / 7.78,
+            "CNH": 1.0 / 7.25,
+            "SEK": 1.0 / 10.6,
+            "NOK": 1.0 / 10.8,
+        }
+
+        def _to_usd(ccy: str) -> float:
+            if ccy == "USD":
+                return 1.0
+            m = _mid_for(f"{ccy}USD")
+            if m > 0.0:
+                return m
+            m_inv = _mid_for(f"{'USD'}{ccy}")
+            if m_inv > 0.0:
+                return 1.0 / m_inv
+            return static_usd_per_unit.get(ccy, 0.0)
+
+        src_usd = _to_usd(src)
+        dst_usd = _to_usd(dst)
+        if src_usd > 0.0 and dst_usd > 0.0:
+            return src_usd / dst_usd
+        return 1.0
+
     def discover_catalog(self, auto_enable_market_watch: bool = True) -> list[DiscoveredSymbol]:
         """Discover and categorize ALL symbols available in the MT5 broker catalog.
 
@@ -321,7 +393,7 @@ class MT5Feed:
         point = float(info.point) if info.point > 0 else float(10 ** (-digits))
         pip_size = self.compute_pip_size(digits, point)
 
-        return ContractSpec(
+        spec = ContractSpec(
             symbol=symbol.upper(),
             digits=digits,
             pip_size=pip_size,
@@ -334,6 +406,8 @@ class MT5Feed:
             trade_tick_value=float(getattr(info, "trade_tick_value", 0.0) or 0.0),
             trade_tick_size=float(getattr(info, "trade_tick_size", 0.0) or 0.0),
         )
+        self._contract_specs[symbol.upper()] = spec
+        return spec
 
     def is_symbol_trade_mode_full(self, symbol: str) -> bool:
         """Return True strictly if MT5 symbol_info.trade_mode == SYMBOL_TRADE_MODE_FULL (4)."""
@@ -402,7 +476,7 @@ class MT5Feed:
         if not resolved:
             return []
 
-        rates = mt5.copy_rates_from_pos(resolved, MT5_TIMEFRAME_MAP[norm_tf], 0, int(count))
+        rates = mt5.copy_rates_from_pos(resolved, MT5_TIMEFRAME_MAP[norm_tf], 1, int(count))
         if rates is None or len(rates) == 0:
             return []
 
@@ -459,11 +533,14 @@ class MT5Feed:
             return []
         res: list[dict[str, Any]] = []
         for p in positions:
+            raw_t = float(getattr(p, "time", 0) or 0)
+            norm_t = int(self.normalize_server_timestamp_to_utc(raw_t)) if raw_t > 0.0 else 0
             res.append(
                 {
                     "ticket": int(getattr(p, "ticket", 0)),
                     "symbol": str(getattr(p, "symbol", "")),
                     "type": int(getattr(p, "type", 0)),
+                    "time": norm_t,
                     "volume": float(getattr(p, "volume", 0.0)),
                     "price_open": float(getattr(p, "price_open", 0.0)),
                     "sl": float(getattr(p, "sl", 0.0)),
@@ -480,56 +557,119 @@ class MT5Feed:
         symbol: str,
         entry_price: float,
         stop_loss: float,
-        risk_amount: float,
+        risk_amount: float | None = None,
+        *,
+        risk_usd: float | None = None,
+        commission_per_lot_rt: float | None = None,
+        account_currency: str | None = None,
     ) -> float:
-        """Compute broker-compliant lot size based on stop loss distance, tick value, and volume constraints.
-
-        Uses the exact broker tick value (reported in account currency) and snaps to
-        volume_min, volume_max, and volume_step.
-        """
-        resolved = self.resolve_symbol(symbol)
-        if not resolved or not self._initialized:
-            return 0.01
-
-        info = mt5.symbol_info(resolved)
-        if info is None:
-            return 0.01
-
-        vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
-        vol_max = float(getattr(info, "volume_max", 100.0) or 100.0)
-        vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
+        """Compute broker-compliant lot size deducting FX-converted round-turn commission and never clamping up."""
+        eff_risk = float(risk_usd if risk_usd is not None else (risk_amount if risk_amount is not None else 0.0))
+        if eff_risk <= 0.0:
+            return 0.0
 
         sl_dist = abs(float(entry_price) - float(stop_loss))
         if sl_dist <= 1e-12:
-            return vol_min
+            return 0.0
 
-        tick_size = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0) or 1e-5)
-        tick_val = float(
-            getattr(info, "trade_tick_value_loss", 0.0)
-            or getattr(info, "trade_tick_value", 0.0)
-            or 0.0
-        )
+        norm_sym = symbol.upper().strip()
+        spec = self._contract_specs.get(norm_sym)
+        info = None
+        if self._initialized and mt5 is not None:
+            resolved = self.resolve_symbol(symbol)
+            if resolved:
+                info = mt5.symbol_info(resolved)
 
-        # In MT5, trade_tick_value is expressed in account currency per 1.0 lot per tick_size
-        if tick_size > 0.0 and tick_val > 0.0:
-            loss_per_lot = (sl_dist / tick_size) * tick_val
-        else:
+        if info is None and spec is None:
+            return 0.0
+
+        if info is not None:
+            vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
+            vol_max = float(getattr(info, "volume_max", 100.0) or 100.0)
+            vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
+            tick_size = float(getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0) or 0.0)
+            tick_val = float(
+                getattr(info, "trade_tick_value_loss", 0.0)
+                or getattr(info, "trade_tick_value", 0.0)
+                or 0.0
+            )
             contract_sz = float(getattr(info, "trade_contract_size", 100_000.0) or 100_000.0)
-            loss_per_lot = sl_dist * contract_sz
+            raw_profit_ccy = getattr(info, "currency_profit", "")
+            quote_ccy = raw_profit_ccy.upper().strip() if isinstance(raw_profit_ccy, str) else ""
+        else:
+            assert spec is not None
+            vol_min = float(spec.min_volume_lots or 0.01)
+            vol_max = float(spec.max_volume_lots or 100.0)
+            vol_step = float(spec.step_volume_lots or 0.01)
+            tick_size = float(spec.trade_tick_size or 0.0)
+            tick_val = float(spec.trade_tick_value or 0.0)
+            contract_sz = float(spec.lot_size or 100_000.0)
+            quote_ccy = ""
 
-        if loss_per_lot <= 1e-9:
-            return vol_min
+        if account_currency:
+            acct_ccy = account_currency.upper().strip()
+        elif self._initialized and mt5 is not None:
+            acct_info = mt5.account_info()
+            raw_acct = getattr(acct_info, "currency", "USD") if acct_info is not None else "USD"
+            acct_ccy = raw_acct.upper().strip() if isinstance(raw_acct, str) and raw_acct.strip() else "USD"
+        else:
+            acct_ccy = "USD"
 
-        lots_raw = float(risk_amount) / loss_per_lot
+        if not quote_ccy:
+            clean_sym = norm_sym.split(".", 1)[0].split("_", 1)[0]
+            if clean_sym.startswith(("BTC", "ETH", "SOL", "XRP", "LTC", "ADA")):
+                quote_ccy = "USD"
+            elif clean_sym.endswith("USD"):
+                quote_ccy = "USD"
+            elif clean_sym.endswith(("JPY", "CHF", "CAD", "GBP", "EUR", "AUD", "NZD", "SGD", "HKD", "CNH")):
+                quote_ccy = clean_sym[-3:]
+            else:
+                quote_ccy = "USD"
+
+        # MT5 trade_tick_value is already reported in account currency per 1.0 lot per tick_size
+        if tick_size > 0.0 and tick_val > 0.0:
+            sl_loss_per_lot_acct = (sl_dist / tick_size) * tick_val
+        else:
+            fx_rate = self.get_fx_conversion_rate(quote_ccy, acct_ccy)
+            sl_loss_per_lot_acct = sl_dist * contract_sz * fx_rate
+
+        is_forex_or_metal = False
+        try:
+            inferred_ac = self.alias_mapper.classify_asset_class(norm_sym)
+            is_forex_or_metal = inferred_ac in (AssetClass.FOREX, AssetClass.METALS)
+        except Exception:
+            clean_sym = norm_sym.split(".", 1)[0]
+            is_forex_or_metal = clean_sym.startswith(("XAU", "XAG")) or (len(clean_sym) == 6 and clean_sym.isalpha())
+
+        if commission_per_lot_rt is not None:
+            comm_usd = max(0.0, float(commission_per_lot_rt))
+        elif spec is not None and spec.commission_per_lot_rt is not None:
+            comm_usd = max(0.0, float(spec.commission_per_lot_rt))
+        else:
+            comm_usd = 4.50 if is_forex_or_metal else 0.0
+
+        comm_acct_ccy = comm_usd * self.get_fx_conversion_rate("USD", acct_ccy)
+        all_in_risk_per_lot = sl_loss_per_lot_acct + comm_acct_ccy
+        if all_in_risk_per_lot <= 1e-9:
+            return 0.0
+
+        lots_raw = eff_risk / all_in_risk_per_lot
+        if lots_raw < vol_min:
+            return 0.0
 
         if vol_step > 0.0:
-            # Conservative floor snapping guarantees position risk never rounds UP above risk_amount
-            steps = math.floor((lots_raw / vol_step) + 1e-9)
-            lots_snapped = steps * vol_step
+            steps = math.floor((lots_raw / vol_step) + 1e-12)
+            lots_snapped = min(vol_max, steps * vol_step)
+            try:
+                exp = Decimal(str(vol_step)).normalize().as_tuple().exponent
+                decimals = max(0, -int(exp)) if isinstance(exp, int) else 2
+            except Exception:
+                decimals = 2
+            lots_final = round(lots_snapped, decimals)
         else:
-            lots_snapped = lots_raw
+            lots_final = round(min(vol_max, lots_raw), 2)
 
-        lots_final = max(vol_min, min(vol_max, lots_snapped))
-        decimals = max(0, min(8, int(round(-math.log10(vol_step))))) if 0.0 < vol_step < 1.0 else 0
-        return round(lots_final, decimals)
+        if lots_final < vol_min:
+            return 0.0
+        return float(lots_final)
 

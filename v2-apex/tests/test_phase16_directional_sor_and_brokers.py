@@ -179,7 +179,16 @@ def test_ctrader_trendbars_res_cache_reconcile_and_router_candle_fallback(tmp_pa
     assert ct_open[0]["position_id"] == 778899
     assert ct_open[0]["lots"] == pytest.approx(0.20, abs=1e-4)
 
+    def _ack_close(req, *_args, **_kwargs):
+        if isinstance(req, oa_msg.ProtoOAClosePositionReq):
+            ev = oa_msg.ProtoOAExecutionEvent()
+            ev.executionType = oa_model.ProtoOAExecutionType.ORDER_FILLED
+            ev.position.positionId = int(req.positionId)
+            ev.position.positionStatus = 2
+            router.ctrader._handle_execution_event(ev)
+
     router.ctrader._client = MagicMock()
+    router.ctrader._client.send.side_effect = _ack_close
     exec_router = DualBrokerExecutionRouter(feed_router=router)
     pos_specs = exec_router.get_open_positions()
     assert any(p.symbol == "EURUSD" for p in pos_specs)
@@ -197,7 +206,31 @@ def test_ctrader_execution_alias_resolution_and_dual_venue_position_manager(tmp_
     router = MarketFeedRouter(config_path=cfg)
     router.mt5._connected = False
     router.ctrader._connected = True
+
+    def _ack_all(req, *_args, **_kwargs):
+        ev = oa_msg.ProtoOAExecutionEvent()
+        ev.executionType = oa_model.ProtoOAExecutionType.ORDER_FILLED
+        if isinstance(req, oa_msg.ProtoOANewOrderReq):
+            ev.order.clientOrderId = str(req.clientOrderId)
+            ev.order.orderId = 9001
+            ev.position.positionId = 554433
+            ev.position.positionStatus = 1
+            ev.position.tradeData.symbolId = int(req.symbolId)
+            ev.position.tradeData.volume = int(req.volume)
+            ev.position.tradeData.tradeSide = int(req.tradeSide)
+            ev.position.price = 140.05
+            router.ctrader._handle_execution_event(ev)
+        elif isinstance(req, oa_msg.ProtoOAAmendPositionSLTPReq):
+            ev.position.positionId = int(req.positionId)
+            ev.position.positionStatus = 1
+            router.ctrader._handle_execution_event(ev)
+        elif isinstance(req, oa_msg.ProtoOAClosePositionReq):
+            ev.position.positionId = int(req.positionId)
+            ev.position.positionStatus = 2
+            router.ctrader._handle_execution_event(ev)
+
     router.ctrader._client = MagicMock()
+    router.ctrader._client.send.side_effect = _ack_all
     router.ctrader.register_symbol_mapping("NVIDIA", symbol_id=505, pip_size=0.01, digits=2)
     router.ctrader._latest_ticks["NVIDIA"] = Tick("NVIDIA", bid=140.00, ask=140.05, timestamp_utc=1_700_000_500.0, source="ctrader")
 

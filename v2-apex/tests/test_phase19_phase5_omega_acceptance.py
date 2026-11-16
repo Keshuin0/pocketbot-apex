@@ -309,9 +309,9 @@ def test_omega5_shield3_conformal_and_canary_randomization(tmp_path: Path) -> No
         # Non-hallucinating wrong/right calibration rows: realized +0.8R vs APPROVE (y=1 -> alpha = 0.20)
         db.grade_ai_shadow_outcome(aid, realized_r=0.8 if i < 12 else -1.0)
 
-    p_accurate = db.get_conformal_p_value("studio_api", "cal-model", raw_confidence=0.90)  # alpha=0.10
-    p_lowconf = db.get_conformal_p_value("studio_api", "cal-model", raw_confidence=0.05)  # alpha=0.95 -> larger nonconformity
-    assert p_accurate < p_lowconf
+    p_accurate = db.get_conformal_p_value("studio_api", "cal-model", raw_confidence=0.90)  # cand_alpha=0.10 -> conforms well (higher p)
+    p_lowconf = db.get_conformal_p_value("studio_api", "cal-model", raw_confidence=0.05)  # cand_alpha=0.95 -> poor conformity (lower p)
+    assert p_accurate > p_lowconf
     quantiles = db.compute_conformal_quantiles(alpha=0.15)
     assert "studio_api:cal-model" in quantiles
     assert "conformal_p_calib_85" in quantiles["studio_api:cal-model"]

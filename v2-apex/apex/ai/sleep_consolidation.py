@@ -252,7 +252,7 @@ class SleepWakeConsolidator:
         }
 
         with self.ledger_db._connect() as conn:
-            trades_cnt = int(conn.execute("SELECT COUNT(*) FROM trade_ledger").fetchone()[0])
+            trades_cnt = int(conn.execute("SELECT COUNT(*) FROM trade_ledger WHERE is_drill = 0").fetchone()[0])
             audits_cnt = int(conn.execute("SELECT COUNT(*) FROM ai_epistemic_audit").fetchone()[0])
 
         snap = SemanticMemorySnapshot(

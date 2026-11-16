@@ -475,6 +475,51 @@ class MarketFeedRouter:
                 except Exception as exc:
                     logger.debug("VWAP slippage estimate skipped for %s: %s", norm_sym, exc)
 
+        ct_override = None
+        mt5_override = None
+        base_ct = self.nbbo_engine.ctrader_profile
+        base_mt5 = self.nbbo_engine.mt5_profile
+        if self.ctrader.is_connected and hasattr(self.ctrader, "_account_authorized"):
+            ct_ok = bool(getattr(self.ctrader, "_connected", False))
+            if hasattr(self.ctrader, "_is_authenticated") and getattr(self.ctrader, "_client", None) is not None:
+                ct_ok = ct_ok and bool(getattr(self.ctrader, "_is_authenticated", True))
+            if not ct_ok:
+                ct_override = VenueFeeProfile(
+                    venue=base_ct.venue,
+                    commission_per_lot_round_turn_usd=base_ct.commission_per_lot_round_turn_usd,
+                    pip_value_per_lot_usd=base_ct.pip_value_per_lot_usd,
+                    ping_ms=base_ct.ping_ms,
+                    latency_penalty_pips_per_100ms=base_ct.latency_penalty_pips_per_100ms,
+                    margin_and_autotrading_ok=False,
+                )
+        if self.mt5.is_connected and getattr(self.mt5, "_initialized", False):
+            try:
+                import MetaTrader5 as _mt5
+
+                term = _mt5.terminal_info()
+                acct = _mt5.account_info()
+                mt5_ok = True
+                if term is not None and isinstance(getattr(term, "trade_allowed", None), bool):
+                    mt5_ok = mt5_ok and bool(term.trade_allowed)
+                if acct is not None:
+                    mf = getattr(acct, "margin_free", None)
+                    ml = getattr(acct, "margin_level", None)
+                    if isinstance(mf, (int, float)) and not isinstance(mf, bool) and float(mf) <= 0.0:
+                        mt5_ok = False
+                    if isinstance(ml, (int, float)) and not isinstance(ml, bool) and 0.0 < float(ml) < 100.0:
+                        mt5_ok = False
+                if not mt5_ok:
+                    mt5_override = VenueFeeProfile(
+                        venue=base_mt5.venue,
+                        commission_per_lot_round_turn_usd=base_mt5.commission_per_lot_round_turn_usd,
+                        pip_value_per_lot_usd=base_mt5.pip_value_per_lot_usd,
+                        ping_ms=base_mt5.ping_ms,
+                        latency_penalty_pips_per_100ms=base_mt5.latency_penalty_pips_per_100ms,
+                        margin_and_autotrading_ok=False,
+                    )
+            except Exception as exc:
+                logger.debug("MT5 venue health probe skipped: %s", exc)
+
         return self.nbbo_engine.evaluate_symbol(
             symbol=norm_sym,
             configured_mode=self.mesh_mode,
@@ -485,6 +530,8 @@ class MarketFeedRouter:
             ctrader_vwap_slippage_pips=ct_slip_pips,
             mt5_vwap_slippage_pips=mt5_slip_pips,
             ctrader_dom=ct_dom,
+            ctrader_profile_override=ct_override,
+            mt5_profile_override=mt5_override,
             side=side,
         )
 
@@ -572,3 +619,25 @@ class MarketFeedRouter:
                 norm = canon
         engine = self.ctrader.get_or_create_dom_engine(norm)
         return engine.compute_vwap_fill(side=side, target_volume_units=target_volume_units)
+
+    def get_fx_conversion_rate(self, from_ccy: str, to_ccy: str = "USD") -> float:
+        """Convert 1 unit of ``from_ccy`` into ``to_ccy`` using active feed ticks."""
+        src = (from_ccy or "USD").upper().strip()
+        dst = (to_ccy or "USD").upper().strip()
+        if src == dst or not src or not dst:
+            return 1.0
+        mt5_fn = getattr(self.mt5, "get_fx_conversion_rate", None)
+        if callable(mt5_fn):
+            try:
+                rate = float(mt5_fn(src, dst))
+                if rate > 0.0:
+                    return rate
+            except Exception as exc:
+                logger.debug("MT5 FX conversion fallback triggered for %s->%s: %s", src, dst, exc)
+        tick, _ = self.get_tick(f"{src}{dst}")
+        if tick is not None and tick.bid > 0.0 and tick.ask > 0.0:
+            return 0.5 * (float(tick.bid) + float(tick.ask))
+        inv_tick, _ = self.get_tick(f"{dst}{src}")
+        if inv_tick is not None and inv_tick.bid > 0.0 and inv_tick.ask > 0.0:
+            return 1.0 / (0.5 * (float(inv_tick.bid) + float(inv_tick.ask)))
+        return 1.0

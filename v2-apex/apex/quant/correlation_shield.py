@@ -466,7 +466,7 @@ class CorrelationShield:
         candidates: Sequence[tuple[str, Side, float, float]],
         open_positions: Sequence[PositionRiskSpec] | None = None,
         return_histories: Mapping[str, Sequence[float]] | None = None,
-        max_concurrent_positions: int = 5,
+        max_concurrent_positions: int = 2,
         portfolio_risk_budget_pct: float | None = None,
     ) -> dict[str, float]:
         """Solve Convex Quadratic Portfolio Kelly Optimization over Stage-B survivors.
@@ -554,8 +554,20 @@ class CorrelationShield:
                 continue
             b0 = open_f[k_idx]
             cap_f = max(float(self.max_factor_risk_pct), abs(b0))
+            # Smooth linear inequalities without non-differentiable abs() kink inside SLSQP
             constraints.append(
-                {"type": "ineq", "fun": lambda w, r=row, o=b0, c=cap_f: c - abs(o + float(r @ w))}
+                {
+                    "type": "ineq",
+                    "fun": lambda w, r=row, o=b0, c=cap_f: c - (o + float(r @ w)),
+                    "jac": lambda w, r=row: -r,
+                }
+            )
+            constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda w, r=row, o=b0, c=cap_f: c + (o + float(r @ w)),
+                    "jac": lambda w, r=row: r,
+                }
             )
 
         bounds = [(0.0, float(c)) for c in caps]

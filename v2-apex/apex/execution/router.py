@@ -21,13 +21,17 @@ from __future__ import annotations
 
 import datetime
 import logging
+from decimal import Decimal
 import math
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Sequence
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+except ImportError:  # pragma: no cover - headless/cTrader-only nodes
+    mt5 = None  # type: ignore[assignment]
 from ctrader_open_api.messages import (
     OpenApiMessages_pb2 as oa_msg,
     OpenApiModelMessages_pb2 as oa_model,
@@ -37,8 +41,8 @@ from apex.cockpit.tui_dashboard import BrokerExecutionEvent
 from apex.feeds.ctrader_feed import CTRADER_PRICE_SCALE, CTRADER_VOLUME_CENTS_PER_UNIT
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.hydra_nbbo import ResolvedMeshTopology, SyntheticNBBOResult
-from apex.feeds.models import DOMAnalytics, LiquidityWall, Side, verify_live_unlock
-from apex.ledger.walkforward_db import WalkForwardLedgerDB
+from apex.feeds.models import AssetClass, ContractSpec, DOMAnalytics, LiquidityWall, Side, verify_live_unlock
+from apex.ledger.walkforward_db import SymbolExecutionMode, WalkForwardLedgerDB
 from apex.quant.correlation_shield import CorrelationShield, PositionRiskSpec
 
 logger = logging.getLogger(__name__)
@@ -59,6 +63,12 @@ class ExecutionOrderRequest:
     order_type: str = "MARKET"  # "MARKET" or "LIMIT"
     comment: str = "PocketBot_Apex"
     force_paper_shadow: bool = False
+    predicted_net_r: float = 0.0
+    regime: str = "UNKNOWN"
+    ai_decision: str = "APPROVE"
+    ai_confidence: float = 1.0
+    ai_reason: str = ""
+    dom_obi: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,8 +190,9 @@ class DualBrokerExecutionRouter:
 
     def get_open_positions(self) -> list[PositionRiskSpec]:
         """Fetch all currently open positions across MT5 and Paper-Shadow, normalized to PositionRiskSpec."""
+        self.prune_closed_shadow_positions()
         specs: list[PositionRiskSpec] = []
-        if self.feed_router.mt5.is_connected:
+        if mt5 is not None and self.feed_router.mt5.is_connected:
             raw_pos = self.feed_router.mt5.get_open_positions()
             for p in raw_pos:
                 raw_sym = str(p.get("symbol", ""))
@@ -301,8 +312,11 @@ class DualBrokerExecutionRouter:
         entry_price: float,
         stop_loss: float,
         risk_usd: float,
+        *,
+        commission_per_lot_rt: float | None = None,
+        account_currency: str | None = None,
     ) -> float:
-        """Compute broker-compliant lot size using MT5 feed calculator or contract spec fallback."""
+        """Compute broker-compliant lot size using MT5 feed calculator or FX/commission-adjusted cTrader spec."""
         if self.feed_router.mt5.is_connected:
             return self.feed_router.mt5.compute_compliant_lot_size(
                 symbol=symbol,
@@ -310,19 +324,82 @@ class DualBrokerExecutionRouter:
                 stop_loss=stop_loss,
                 risk_amount=risk_usd,
             )
+        norm_sym = symbol.upper().strip()
         spec = self.feed_router.ctrader.get_contract_spec(symbol)
+        if spec is None:
+            clean_fb = norm_sym.split(".", 1)[0].split("_", 1)[0]
+            mapper = getattr(getattr(self.feed_router, "mt5", None), "alias_mapper", None)
+            ac_fb = mapper.classify_asset_class(clean_fb) if mapper is not None else AssetClass.FOREX
+            if ac_fb == AssetClass.FOREX:
+                fb_lot_sz = 100_000.0
+            elif clean_fb.startswith("XAU"):
+                fb_lot_sz = 100.0
+            elif clean_fb.startswith("XAG"):
+                fb_lot_sz = 5_000.0
+            else:
+                fb_lot_sz = 1.0
+            spec = ContractSpec(
+                symbol=norm_sym,
+                digits=3 if "JPY" in clean_fb else (2 if fb_lot_sz <= 100.0 else 5),
+                pip_size=0.01 if "JPY" in clean_fb else (0.1 if clean_fb.startswith("XAU") else 0.0001),
+                point_size=0.001 if "JPY" in clean_fb else 0.00001,
+                lot_size=fb_lot_sz,
+                min_volume_lots=0.01,
+                max_volume_lots=100.0,
+                step_volume_lots=0.01,
+                source="synthetic_fallback",
+            )
         if spec is not None:
             sl_dist = abs(float(entry_price) - float(stop_loss))
-            if sl_dist > 1e-12:
-                loss_per_lot = sl_dist * spec.lot_size
-                lots_raw = float(risk_usd) / loss_per_lot if loss_per_lot > 0.0 else spec.min_volume_lots
-                step = spec.step_volume_lots if spec.step_volume_lots > 0 else 0.01
-                steps = math.floor((lots_raw / step) + 1e-9)
-                snapped = steps * step
-                step_decimals = max(0, min(8, int(round(-math.log10(step))))) if 0.0 < step < 1.0 else 0
-                rounded = round(snapped, step_decimals)
-                return max(spec.min_volume_lots, min(spec.max_volume_lots, rounded))
-        return 0.01
+            eff_risk = float(risk_usd)
+            if sl_dist <= 1e-12 or eff_risk <= 0.0:
+                return 0.0
+
+            clean_sym = norm_sym.split(".", 1)[0].split("_", 1)[0]
+            if clean_sym.startswith(("BTC", "ETH", "SOL", "XRP", "LTC", "ADA")):
+                quote_ccy = "USD"
+            elif clean_sym.endswith("USD"):
+                quote_ccy = "USD"
+            elif clean_sym.endswith(("JPY", "CHF", "CAD", "GBP", "EUR", "AUD", "NZD", "SGD", "HKD", "CNH")):
+                quote_ccy = clean_sym[-3:]
+            else:
+                quote_ccy = "USD"
+
+            acct_ccy = (account_currency or "USD").upper().strip()
+            fx_fn = getattr(self.feed_router, "get_fx_conversion_rate", None)
+            fx_q_to_acct = float(fx_fn(quote_ccy, acct_ccy)) if callable(fx_fn) else 1.0
+            fx_usd_to_acct = float(fx_fn("USD", acct_ccy)) if callable(fx_fn) else 1.0
+
+            sl_loss_per_lot = sl_dist * float(spec.lot_size) * max(1e-9, fx_q_to_acct)
+            is_forex_or_metal = clean_sym.startswith(("XAU", "XAG")) or (len(clean_sym) == 6 and clean_sym.isalpha())
+            if commission_per_lot_rt is not None:
+                comm_usd = max(0.0, float(commission_per_lot_rt))
+            elif getattr(spec, "commission_per_lot_rt", None) is not None:
+                comm_usd = max(0.0, float(spec.commission_per_lot_rt))  # type: ignore[arg-type]
+            else:
+                comm_usd = 4.50 if is_forex_or_metal else 0.0
+
+            all_in_risk = sl_loss_per_lot + (comm_usd * max(1e-9, fx_usd_to_acct))
+            if all_in_risk <= 1e-9:
+                return 0.0
+
+            lots_raw = eff_risk / all_in_risk
+            if lots_raw < float(spec.min_volume_lots):
+                return 0.0
+
+            step = float(spec.step_volume_lots) if float(spec.step_volume_lots) > 0.0 else 0.01
+            steps = math.floor((lots_raw / step) + 1e-12)
+            snapped = min(float(spec.max_volume_lots), steps * step)
+            try:
+                exp = Decimal(str(step)).normalize().as_tuple().exponent
+                step_decimals = max(0, -int(exp)) if isinstance(exp, int) else 2
+            except Exception:
+                step_decimals = 2
+            rounded = round(snapped, step_decimals)
+            if rounded < float(spec.min_volume_lots):
+                return 0.0
+            return float(rounded)
+        return 0.0
 
     @property
     def cumulative_sor_savings(self) -> tuple[float, float]:
@@ -566,6 +643,8 @@ class DualBrokerExecutionRouter:
     @staticmethod
     def detect_mt5_filling_mode(symbol: str) -> int:
         """Detect the broker's supported MT5 filling mode bitmask (`FOK`, `IOC`, or `RETURN`)."""
+        if mt5 is None:
+            return 1
         info = mt5.symbol_info(symbol)
         if info is None:
             return int(mt5.ORDER_FILLING_FOK)
@@ -598,31 +677,76 @@ class DualBrokerExecutionRouter:
             try:
                 spec = ct._contract_specs.get(resolved_sym) or ct._contract_specs.get(norm_sym)
                 lot_units = spec.lot_size if spec else 100_000.0
+                digits = int(spec.digits) if spec and getattr(spec, "digits", 0) else 5
+
+                # Re-anchor MARKET SL/TP to live broker quote right before wire transmission
+                send_order = order
+                if order.order_type.upper() == "MARKET":
+                    live_tick = ct.get_tick(norm_sym) or self.feed_router.get_tick(norm_sym)[0]
+                    if live_tick is not None:
+                        live_px = float(live_tick.ask if order.side == Side.BUY else live_tick.bid)
+                        if live_px > 0.0:
+                            planned_sl_dist = abs(float(order.entry_price) - float(order.stop_loss))
+                            planned_tp_dist = abs(float(order.take_profit) - float(order.entry_price))
+                            if planned_sl_dist > 0.0 and planned_tp_dist > 0.0:
+                                new_sl = round(
+                                    live_px - planned_sl_dist if order.side == Side.BUY else live_px + planned_sl_dist,
+                                    digits,
+                                )
+                                new_tp = round(
+                                    live_px + planned_tp_dist if order.side == Side.BUY else live_px - planned_tp_dist,
+                                    digits,
+                                )
+                                send_order = ExecutionOrderRequest(
+                                    symbol=order.symbol,
+                                    side=order.side,
+                                    lots=order.lots,
+                                    entry_price=live_px,
+                                    stop_loss=new_sl,
+                                    take_profit=new_tp,
+                                    risk_usd=order.risk_usd,
+                                    order_type=order.order_type,
+                                    comment=order.comment,
+                                    force_paper_shadow=order.force_paper_shadow,
+                                    predicted_net_r=order.predicted_net_r,
+                                    regime=order.regime,
+                                    ai_decision=order.ai_decision,
+                                    ai_confidence=order.ai_confidence,
+                                    ai_reason=order.ai_reason,
+                                    dom_obi=order.dom_obi,
+                                )
+
                 req = self.build_ctrader_Order_req(
                     account_id=ct.account_id,
                     symbol_id=sid,
-                    order=order,
+                    order=send_order,
                     lot_size_units=lot_units,
                 )
-                send_res: dict[str, object] = {"ok": True, "order_id": req.clientOrderId}
+                send_res: dict[str, object] = {
+                    "ok": False,
+                    "status": "REJECTED",
+                    "error_code": "CTRADER_NO_EXECUTION_ACK",
+                    "order_id": req.clientOrderId,
+                }
                 if hasattr(ct, "send_new_order"):
                     maybe_res = ct.send_new_order(req)
                     if isinstance(maybe_res, dict):
                         send_res = maybe_res
                 elif ct._client is not None:
                     ct._client.send(req)
+                    send_res = {"ok": True, "order_id": req.clientOrderId}
 
-                if not bool(send_res.get("ok", True)):
+                if not bool(send_res.get("ok", False)):
                     err_detail = str(send_res.get("error_code") or "cTrader order rejected")
                     self.record_broker_event(
                         BrokerExecutionEvent(
                             timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
                             symbol=norm_sym,
-                            side=order.side.value,
-                            lots=order.lots,
-                            price=order.entry_price,
-                            stop_loss=order.stop_loss,
-                            take_profit=order.take_profit,
+                            side=send_order.side.value,
+                            lots=send_order.lots,
+                            price=send_order.entry_price,
+                            stop_loss=send_order.stop_loss,
+                            take_profit=send_order.take_profit,
                             venue="CTRADER",
                             status="REJECTED",
                             details=err_detail[:60],
@@ -633,20 +757,28 @@ class DualBrokerExecutionRouter:
                 exec_price = float(send_res.get("executed_price") or 0.0)
                 if exec_price <= 0.0:
                     exec_price = (
-                        order.entry_price + vwap_slippage_price
-                        if order.side == Side.BUY
-                        else order.entry_price - vwap_slippage_price
+                        send_order.entry_price + vwap_slippage_price
+                        if send_order.side == Side.BUY
+                        else send_order.entry_price - vwap_slippage_price
                     )
+                if send_order.order_type.upper() == "MARKET":
+                    p_sl = abs(float(send_order.entry_price) - float(send_order.stop_loss))
+                    p_tp = abs(float(send_order.take_profit) - float(send_order.entry_price))
+                    final_sl = round(exec_price - p_sl if send_order.side == Side.BUY else exec_price + p_sl, digits)
+                    final_tp = round(exec_price + p_tp if send_order.side == Side.BUY else exec_price - p_tp, digits)
+                else:
+                    final_sl = send_order.stop_loss
+                    final_tp = send_order.take_profit
                 receipt_oid = str(send_res.get("order_id") or req.clientOrderId)
                 self.record_broker_event(
                     BrokerExecutionEvent(
                         timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
                         symbol=norm_sym,
-                        side=order.side.value,
-                        lots=order.lots,
+                        side=send_order.side.value,
+                        lots=send_order.lots,
                         price=exec_price,
-                        stop_loss=order.stop_loss,
-                        take_profit=order.take_profit,
+                        stop_loss=final_sl,
+                        take_profit=final_tp,
                         venue="CTRADER",
                         status="FILLED",
                         details=f"Order {receipt_oid[:10]} | Sent [{mesh_topology}]",
@@ -655,12 +787,12 @@ class DualBrokerExecutionRouter:
                 return ExecutionReceipt(
                     order_id=receipt_oid,
                     symbol=norm_sym,
-                    side=order.side,
-                    lots=order.lots,
-                    requested_entry=order.entry_price,
+                    side=send_order.side,
+                    lots=send_order.lots,
+                    requested_entry=send_order.entry_price,
                     executed_price=exec_price,
-                    stop_loss=order.stop_loss,
-                    take_profit=order.take_profit,
+                    stop_loss=final_sl,
+                    take_profit=final_tp,
                     realized_slippage_price=vwap_slippage_price,
                     realized_slippage_r=vwap_slippage_price / sl_dist,
                     venue="ctrader",
@@ -694,7 +826,7 @@ class DualBrokerExecutionRouter:
     ) -> ExecutionReceipt | None:
         """Attempt wire dispatch to MetaTrader 5 IPC if connected and AutoTrading is enabled."""
         norm_sym = order.symbol.upper()
-        if self.feed_router.mt5.is_connected:
+        if mt5 is not None and self.feed_router.mt5.is_connected:
             term_info = mt5.terminal_info()
             trade_allowed = bool(getattr(term_info, "trade_allowed", False)) if term_info is not None else False
             resolved = self.feed_router.mt5.resolve_symbol(norm_sym)
@@ -718,7 +850,30 @@ class DualBrokerExecutionRouter:
                     if tick is not None
                     else float(order.entry_price)
                 )
-                req_price = live_px if order.order_type.upper() == "MARKET" else float(order.entry_price)
+                is_market = order.order_type.upper() == "MARKET"
+                req_price = live_px if is_market else float(order.entry_price)
+                planned_sl_dist = abs(float(order.entry_price) - float(order.stop_loss))
+                planned_tp_dist = abs(float(order.take_profit) - float(order.entry_price))
+                if is_market and tick is not None and planned_sl_dist > 0.0 and planned_tp_dist > 0.0:
+                    if order.side == Side.BUY:
+                        send_sl = round(live_px - planned_sl_dist, digits)
+                        send_tp = round(live_px + planned_tp_dist, digits)
+                    else:
+                        send_sl = round(live_px + planned_sl_dist, digits)
+                        send_tp = round(live_px - planned_tp_dist, digits)
+                else:
+                    send_sl = round(float(order.stop_loss), digits)
+                    send_tp = round(float(order.take_profit), digits)
+
+                mt5_action = mt5.TRADE_ACTION_DEAL if is_market else mt5.TRADE_ACTION_PENDING
+                if is_market:
+                    mt5_order_type = mt5.ORDER_TYPE_BUY if order.side == Side.BUY else mt5.ORDER_TYPE_SELL
+                else:
+                    mt5_order_type = (
+                        getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2)
+                        if order.side == Side.BUY
+                        else getattr(mt5, "ORDER_TYPE_SELL_LIMIT", 3)
+                    )
 
                 # Probe mt5.order_check across candidate filling modes so IOC/FOK/RETURN mismatches never drop silently
                 chosen_filling = detected_filling
@@ -726,13 +881,13 @@ class DualBrokerExecutionRouter:
                 if callable(order_check_fn):
                     for cand_fill in candidate_fillings:
                         probe_req = {
-                            "action": mt5.TRADE_ACTION_DEAL if order.order_type.upper() == "MARKET" else mt5.TRADE_ACTION_PENDING,
+                            "action": mt5_action,
                             "symbol": resolved,
                             "volume": float(order.lots),
-                            "type": mt5.ORDER_TYPE_BUY if order.side == Side.BUY else mt5.ORDER_TYPE_SELL,
+                            "type": mt5_order_type,
                             "price": round(req_price, digits),
-                            "sl": round(float(order.stop_loss), digits),
-                            "tp": round(float(order.take_profit), digits),
+                            "sl": send_sl,
+                            "tp": send_tp,
                             "deviation": 20,
                             "magic": 202611,
                             "comment": order.comment,
@@ -745,13 +900,13 @@ class DualBrokerExecutionRouter:
                             break
 
                 mt5_req = {
-                    "action": mt5.TRADE_ACTION_DEAL if order.order_type.upper() == "MARKET" else mt5.TRADE_ACTION_PENDING,
+                    "action": mt5_action,
                     "symbol": resolved,
                     "volume": float(order.lots),
-                    "type": mt5.ORDER_TYPE_BUY if order.side == Side.BUY else mt5.ORDER_TYPE_SELL,
+                    "type": mt5_order_type,
                     "price": round(req_price, digits),
-                    "sl": round(float(order.stop_loss), digits),
-                    "tp": round(float(order.take_profit), digits),
+                    "sl": send_sl,
+                    "tp": send_tp,
                     "deviation": 20,
                     "magic": 202611,
                     "comment": order.comment,
@@ -771,6 +926,12 @@ class DualBrokerExecutionRouter:
 
                 if res is not None and int(getattr(res, "retcode", 0)) == int(mt5.TRADE_RETCODE_DONE):
                     fill_px = float(getattr(res, "price", 0.0) or live_px)
+                    if is_market and planned_sl_dist > 0.0 and planned_tp_dist > 0.0:
+                        final_sl = round(fill_px - planned_sl_dist, digits) if order.side == Side.BUY else round(fill_px + planned_sl_dist, digits)
+                        final_tp = round(fill_px + planned_tp_dist, digits) if order.side == Side.BUY else round(fill_px - planned_tp_dist, digits)
+                    else:
+                        final_sl = send_sl
+                        final_tp = send_tp
                     slip = (fill_px - order.entry_price) if order.side == Side.BUY else (order.entry_price - fill_px)
                     self.record_broker_event(
                         BrokerExecutionEvent(
@@ -779,8 +940,8 @@ class DualBrokerExecutionRouter:
                             side=order.side.value,
                             lots=order.lots,
                             price=fill_px,
-                            stop_loss=order.stop_loss,
-                            take_profit=order.take_profit,
+                            stop_loss=final_sl,
+                            take_profit=final_tp,
                             venue="MT5",
                             status="FILLED",
                             details=f"Ticket #{res.order} | Retcode {res.retcode} (Done)",
@@ -793,8 +954,8 @@ class DualBrokerExecutionRouter:
                         lots=order.lots,
                         requested_entry=order.entry_price,
                         executed_price=fill_px,
-                        stop_loss=order.stop_loss,
-                        take_profit=order.take_profit,
+                        stop_loss=final_sl,
+                        take_profit=final_tp,
                         realized_slippage_price=float(slip),
                         realized_slippage_r=float(slip) / sl_dist,
                         venue="mt5",
@@ -873,6 +1034,63 @@ class DualBrokerExecutionRouter:
                 )
         return pips_saved, usd_saved
 
+    def prune_closed_shadow_positions(self) -> int:
+        """Remove Paper-Shadow positions already settled in `WalkForwardLedgerDB` so Circuit Breaker C never deadlocks."""
+        if self.ledger_db is None or not self._shadow_positions:
+            return 0
+        oids = [str(sp.get("order_id", "")) for sp in self._shadow_positions if sp.get("order_id")]
+        closed_ids = self.ledger_db.get_closed_order_ids(oids)
+        if not closed_ids:
+            return 0
+        before = len(self._shadow_positions)
+        self._shadow_positions = [
+            sp for sp in self._shadow_positions if str(sp.get("order_id", "")) not in closed_ids
+        ]
+        return before - len(self._shadow_positions)
+
+    def _persist_trade_open(self, order: ExecutionOrderRequest, receipt: ExecutionReceipt) -> None:
+        """Persist every confirmed FILLED or PAPER_SHADOW_FILLED execution into `trade_ledger` (`is_closed = 0`)."""
+        if self.ledger_db is None:
+            return
+        if receipt.status not in ("FILLED", "PAPER_SHADOW_FILLED"):
+            return
+        sl_dist = abs(float(receipt.executed_price or order.entry_price) - float(receipt.stop_loss))
+        targets = receipt.child_receipts if receipt.child_receipts else (receipt,)
+        for rec in targets:
+            if rec.status not in ("FILLED", "PAPER_SHADOW_FILLED"):
+                continue
+            exec_mode = (
+                SymbolExecutionMode.PAPER_SHADOW
+                if (rec.status == "PAPER_SHADOW_FILLED" or rec.venue == "PAPER_SHADOW" or order.force_paper_shadow)
+                else SymbolExecutionMode.ACTIVE
+            )
+            try:
+                self.ledger_db.record_trade_open(
+                    order_id=rec.order_id,
+                    symbol=rec.symbol,
+                    side=rec.side.value,
+                    lots=rec.lots,
+                    entry_price=rec.executed_price or order.entry_price,
+                    stop_loss=rec.stop_loss,
+                    take_profit=rec.take_profit,
+                    initial_one_r=sl_dist if sl_dist > 0.0 else abs(float(order.entry_price) - float(order.stop_loss)),
+                    predicted_net_r=order.predicted_net_r,
+                    regime=order.regime,
+                    venue=rec.winning_venue or rec.venue,
+                    execution_mode=exec_mode,
+                    dom_obi=order.dom_obi,
+                    ai_decision=order.ai_decision,
+                    ai_confidence=order.ai_confidence,
+                    ai_reason=order.ai_reason,
+                    realized_slippage_r=rec.realized_slippage_r,
+                    mesh_topology=rec.mesh_topology,
+                    sor_pips_saved=rec.sor_pips_saved,
+                    sor_usd_saved=rec.sor_usd_saved,
+                    timestamp_utc=rec.timestamp_utc,
+                )
+            except Exception as exc:
+                logger.debug("record_trade_open skipped for %s: %s", rec.order_id, exc)
+
     def execute_order(
         self,
         order: ExecutionOrderRequest,
@@ -883,7 +1101,101 @@ class DualBrokerExecutionRouter:
         vwap_slippage_price: float = 0.0,
         dom_analytics: DOMAnalytics | None = None,
     ) -> ExecutionReceipt:
-        """Validate all 6 circuit breakers and route order via the Apex Hydra Smart Order Router."""
+        """Validate all 6 circuit breakers, route order via Apex Hydra SOR, and persist open trade."""
+        receipt = self._execute_order_routed(
+            order=order,
+            closed_pnl_today_usd=closed_pnl_today_usd,
+            floating_pnl_usd=floating_pnl_usd,
+            open_positions=open_positions,
+            current_spread_price=current_spread_price,
+            vwap_slippage_price=vwap_slippage_price,
+            dom_analytics=dom_analytics,
+        )
+        self._persist_trade_open(order, receipt)
+        return receipt
+
+    def _get_min_lot(self, symbol: str) -> float:
+        """Resolve minimum tradable volume in lots across connected venues."""
+        norm_sym = symbol.upper().strip()
+        vals: list[float] = []
+        if self.feed_router.mt5.is_connected and mt5 is not None:
+            try:
+                res = self.feed_router.mt5.resolve_symbol(norm_sym) or norm_sym
+                info = mt5.symbol_info(res)
+                vmin = getattr(info, "volume_min", None) if info is not None else None
+                if isinstance(vmin, (int, float)) and not isinstance(vmin, bool) and float(vmin) > 0.0:
+                    vals.append(float(vmin))
+            except Exception as exc:
+                logger.debug("MT5 min_lot probe skipped for %s: %s", norm_sym, exc)
+        if hasattr(self.feed_router.ctrader, "_contract_specs"):
+            ct_spec = self.feed_router.ctrader._contract_specs.get(norm_sym)
+            if ct_spec is not None and float(ct_spec.min_volume_lots) > 0.0:
+                vals.append(float(ct_spec.min_volume_lots))
+        return max(vals) if vals else 0.01
+
+    def _compensate_close_mt5_leg(self, order_id: str, symbol: str, side: Side, lots: float) -> bool:
+        """Close an exposed MT5 split leg if the opposite split leg failed to fill."""
+        if mt5 is None or not self.feed_router.mt5.is_connected:
+            return False
+        resolved = self.feed_router.mt5.resolve_symbol(symbol) or symbol
+        tick = mt5.symbol_info_tick(resolved)
+        close_px = float(tick.bid if side == Side.BUY else tick.ask) if tick is not None else 0.0
+        pos_id = int(order_id) if order_id.isdigit() else 0
+        for fill_mode in dict.fromkeys(
+            [
+                self.detect_mt5_filling_mode(resolved),
+                int(mt5.ORDER_FILLING_IOC),
+                int(mt5.ORDER_FILLING_FOK),
+                int(mt5.ORDER_FILLING_RETURN),
+            ]
+        ):
+            req = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "position": pos_id,
+                "symbol": resolved,
+                "volume": float(lots),
+                "type": mt5.ORDER_TYPE_SELL if side == Side.BUY else mt5.ORDER_TYPE_BUY,
+                "price": close_px,
+                "deviation": 50,
+                "magic": 202611,
+                "comment": "APEX_SPLIT_ROLLBACK",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": fill_mode,
+            }
+            res = mt5.order_send(req)
+            if res is not None and int(getattr(res, "retcode", 0)) == int(mt5.TRADE_RETCODE_DONE):
+                return True
+        return False
+
+    def _compensate_close_ctrader_leg(self, symbol: str, order_id: str, lots: float) -> bool:
+        """Close an exposed cTrader split leg if the opposite split leg failed to fill."""
+        ct = self.feed_router.ctrader
+        if not ct.is_connected or not hasattr(ct, "close_position"):
+            return False
+        pos_id = 0
+        for pos in ct.get_open_positions() if hasattr(ct, "get_open_positions") else ():
+            if str(pos.get("symbol", "")).upper() == symbol.upper():
+                pos_id = int(pos.get("position_id", 0) or 0)
+                if pos_id > 0:
+                    break
+        if pos_id <= 0 and str(order_id).isdigit():
+            pos_id = int(order_id)
+        if pos_id <= 0:
+            return False
+        res = ct.close_position(position_id=pos_id, volume_lots=float(lots), symbol=symbol)
+        return bool(isinstance(res, dict) and res.get("ok"))
+
+    def _execute_order_routed(
+        self,
+        order: ExecutionOrderRequest,
+        closed_pnl_today_usd: float = 0.0,
+        floating_pnl_usd: float = 0.0,
+        open_positions: Sequence[PositionRiskSpec] = (),
+        current_spread_price: float = 0.0,
+        vwap_slippage_price: float = 0.0,
+        dom_analytics: DOMAnalytics | None = None,
+    ) -> ExecutionReceipt:
+        """Internal routing implementation called by `execute_order`."""
         sl_dist = max(abs(order.entry_price - order.stop_loss), 1e-12)
         nbbo = self.feed_router.evaluate_nbbo(
             symbol=order.symbol,
@@ -961,9 +1273,32 @@ class DualBrokerExecutionRouter:
                 sor_usd_saved=usd_saved,
             )
 
-        # 1. SPLIT_EXECUTION: 50/50 parallel risk split across cTrader + MT5
-        if topology == ResolvedMeshTopology.SPLIT_EXECUTION:
-            half_lots = round(max(0.01, float(order.lots) / 2.0), 2)
+        # Reject immediately when online venues fail margin / AutoTrading checks (never bypass live safety)
+        if topology != ResolvedMeshTopology.OFFLINE and nbbo.winning_venue.upper() == "NONE" and not order.force_paper_shadow:
+            return ExecutionReceipt(
+                order_id=f"blocked_{uuid.uuid4().hex[:10]}",
+                symbol=order.symbol.upper(),
+                side=order.side,
+                lots=order.lots,
+                requested_entry=order.entry_price,
+                executed_price=0.0,
+                stop_loss=order.stop_loss,
+                take_profit=order.take_profit,
+                realized_slippage_price=0.0,
+                realized_slippage_r=0.0,
+                venue="NONE",
+                status="REJECTED",
+                timestamp_utc=now_utc,
+                breaker_report=report,
+                message="Rejected: no broker venue passed AutoTrading & margin checks (winning_venue=NONE).",
+                winning_venue="NONE",
+                mesh_topology=topology.value,
+            )
+
+        # 1. SPLIT_EXECUTION: 50/50 parallel risk split only when order.lots >= 2.0 * min_lot
+        min_lot = self._get_min_lot(order.symbol)
+        if topology == ResolvedMeshTopology.SPLIT_EXECUTION and float(order.lots) >= 2.0 * min_lot:
+            half_lots = round(float(order.lots) / 2.0, 2)
             half_risk_pct = float(order.risk_pct) / 2.0
             half_risk_usd = float(order.risk_usd) / 2.0
             child_order = ExecutionOrderRequest(
@@ -979,7 +1314,7 @@ class DualBrokerExecutionRouter:
                 comment=f"{order.comment}_SPLIT",
                 force_paper_shadow=False,
             )
-            leg_ct = self._try_execute_ctrader(
+            live_ct = self._try_execute_ctrader(
                 child_order,
                 report,
                 vwap_slippage_price,
@@ -987,7 +1322,92 @@ class DualBrokerExecutionRouter:
                 now_utc,
                 winning_venue="ctrader",
                 mesh_topology=topology.value,
-            ) or self._execute_paper_shadow(
+            )
+            live_mt5 = self._try_execute_mt5(
+                child_order,
+                report,
+                vwap_slippage_price,
+                sl_dist,
+                now_utc,
+                winning_venue="mt5",
+                mesh_topology=topology.value,
+            )
+
+            # Never synthesize a shadow leg 2 against a live leg 1: compensate-close immediately
+            if live_ct is not None and live_mt5 is None:
+                rolled_back = self._compensate_close_ctrader_leg(order.symbol, live_ct.order_id, live_ct.lots)
+                return ExecutionReceipt(
+                    order_id=f"split_abort_{live_ct.order_id}",
+                    symbol=order.symbol.upper(),
+                    side=order.side,
+                    lots=order.lots,
+                    requested_entry=order.entry_price,
+                    executed_price=0.0,
+                    stop_loss=order.stop_loss,
+                    take_profit=order.take_profit,
+                    realized_slippage_price=0.0,
+                    realized_slippage_r=0.0,
+                    venue="SPLIT_CTRADER_MT5",
+                    status="REJECTED",
+                    timestamp_utc=now_utc,
+                    breaker_report=report,
+                    message=f"SPLIT_EXECUTION aborted: MT5 leg 2 failed; cTrader leg 1 close={rolled_back}.",
+                    winning_venue="NONE",
+                    mesh_topology=topology.value,
+                    child_receipts=(live_ct,),
+                )
+            if live_mt5 is not None and live_ct is None:
+                rolled_back = self._compensate_close_mt5_leg(live_mt5.order_id, order.symbol, live_mt5.side, live_mt5.lots)
+                return ExecutionReceipt(
+                    order_id=f"split_abort_{live_mt5.order_id}",
+                    symbol=order.symbol.upper(),
+                    side=order.side,
+                    lots=order.lots,
+                    requested_entry=order.entry_price,
+                    executed_price=0.0,
+                    stop_loss=order.stop_loss,
+                    take_profit=order.take_profit,
+                    realized_slippage_price=0.0,
+                    realized_slippage_r=0.0,
+                    venue="SPLIT_CTRADER_MT5",
+                    status="REJECTED",
+                    timestamp_utc=now_utc,
+                    breaker_report=report,
+                    message=f"SPLIT_EXECUTION aborted: cTrader leg 1 failed; MT5 leg 2 close={rolled_back}.",
+                    winning_venue="NONE",
+                    mesh_topology=topology.value,
+                    child_receipts=(live_mt5,),
+                )
+
+            if live_ct is not None and live_mt5 is not None:
+                avg_px = (live_ct.executed_price + live_mt5.executed_price) / 2.0
+                parent_id = f"split_{live_ct.order_id}_{live_mt5.order_id}"
+                pips_saved, usd_saved = self._record_sor_savings(parent_id, order.symbol, order.lots, nbbo)
+                return ExecutionReceipt(
+                    order_id=parent_id,
+                    symbol=order.symbol.upper(),
+                    side=order.side,
+                    lots=round(half_lots * 2.0, 2),
+                    requested_entry=order.entry_price,
+                    executed_price=avg_px,
+                    stop_loss=order.stop_loss,
+                    take_profit=order.take_profit,
+                    realized_slippage_price=vwap_slippage_price,
+                    realized_slippage_r=vwap_slippage_price / sl_dist,
+                    venue="SPLIT_CTRADER_MT5",
+                    status="FILLED",
+                    timestamp_utc=now_utc,
+                    breaker_report=report,
+                    message=f"Executed 50/50 SPLIT_EXECUTION across cTrader ({half_lots} lots) + MT5 ({half_lots} lots).",
+                    winning_venue="SPLIT_CTRADER_MT5",
+                    mesh_topology=topology.value,
+                    sor_pips_saved=pips_saved,
+                    sor_usd_saved=usd_saved,
+                    child_receipts=(live_ct, live_mt5),
+                )
+
+            # Both brokers offline -> coordinated Paper-Shadow simulation (without recording live SOR savings)
+            leg_ct = self._execute_paper_shadow(
                 child_order,
                 report,
                 vwap_slippage_price,
@@ -996,15 +1416,7 @@ class DualBrokerExecutionRouter:
                 winning_venue="ctrader",
                 mesh_topology=topology.value,
             )
-            leg_mt5 = self._try_execute_mt5(
-                child_order,
-                report,
-                vwap_slippage_price,
-                sl_dist,
-                now_utc,
-                winning_venue="mt5",
-                mesh_topology=topology.value,
-            ) or self._execute_paper_shadow(
+            leg_mt5 = self._execute_paper_shadow(
                 child_order,
                 report,
                 vwap_slippage_price,
@@ -1015,7 +1427,6 @@ class DualBrokerExecutionRouter:
             )
             avg_px = (leg_ct.executed_price + leg_mt5.executed_price) / 2.0
             parent_id = f"split_{leg_ct.order_id}_{leg_mt5.order_id}"
-            pips_saved, usd_saved = self._record_sor_savings(parent_id, order.symbol, order.lots, nbbo)
             return ExecutionReceipt(
                 order_id=parent_id,
                 symbol=order.symbol.upper(),
@@ -1028,14 +1439,14 @@ class DualBrokerExecutionRouter:
                 realized_slippage_price=vwap_slippage_price,
                 realized_slippage_r=vwap_slippage_price / sl_dist,
                 venue="SPLIT_CTRADER_MT5",
-                status="FILLED" if (leg_ct.status == "FILLED" or leg_mt5.status == "FILLED") else "PAPER_SHADOW_FILLED",
+                status="PAPER_SHADOW_FILLED",
                 timestamp_utc=now_utc,
                 breaker_report=report,
-                message=f"Executed 50/50 SPLIT_EXECUTION across cTrader ({half_lots} lots) + MT5 ({half_lots} lots).",
+                message=f"Simulated 50/50 SPLIT_EXECUTION Paper-Shadow ({half_lots} lots + {half_lots} lots).",
                 winning_venue="SPLIT_CTRADER_MT5",
                 mesh_topology=topology.value,
-                sor_pips_saved=pips_saved,
-                sor_usd_saved=usd_saved,
+                sor_pips_saved=0.0,
+                sor_usd_saved=0.0,
                 child_receipts=(leg_ct, leg_mt5),
             )
 
@@ -1085,14 +1496,19 @@ class DualBrokerExecutionRouter:
                 mesh_topology=topology.value,
             )
 
-        # 4. ACTIVE_ACTIVE_SOR: Smart Venue Selector routes to lowest effective_cost venue
-        pips_saved, usd_saved = self._record_sor_savings(
-            order_id=f"sor_{uuid.uuid4().hex[:10]}",
-            symbol=order.symbol,
-            lots=order.lots,
-            nbbo=nbbo,
-        )
+        # 4. ACTIVE_ACTIVE_SOR (or single-venue fallback when SPLIT_EXECUTION lot size < 2*min_lot)
         winner = nbbo.winning_venue.lower()
+        if winner not in ("ctrader", "mt5", "none"):
+            if nbbo.ctrader_quote and nbbo.mt5_quote:
+                winner = "ctrader" if nbbo.ctrader_quote.effective_cost_pips <= nbbo.mt5_quote.effective_cost_pips else "mt5"
+            elif nbbo.mt5_quote:
+                winner = "mt5"
+            else:
+                winner = "ctrader"
+
+        cand_pips = max(0.0, float(nbbo.pips_saved))
+        cand_usd = max(0.0, float(nbbo.usd_saved_per_lot) * float(order.lots))
+
         if winner == "ctrader":
             rec = self._try_execute_ctrader(
                 order,
@@ -1102,8 +1518,8 @@ class DualBrokerExecutionRouter:
                 now_utc,
                 winning_venue="ctrader",
                 mesh_topology=topology.value,
-                sor_pips_saved=pips_saved,
-                sor_usd_saved=usd_saved,
+                sor_pips_saved=cand_pips,
+                sor_usd_saved=cand_usd,
             ) or self._try_execute_mt5(
                 order,
                 report,
@@ -1112,10 +1528,12 @@ class DualBrokerExecutionRouter:
                 now_utc,
                 winning_venue="ctrader",
                 mesh_topology=topology.value,
-                sor_pips_saved=pips_saved,
-                sor_usd_saved=usd_saved,
+                sor_pips_saved=cand_pips,
+                sor_usd_saved=cand_usd,
             )
             if rec is not None:
+                if rec.status == "FILLED":
+                    self._record_sor_savings(order_id=rec.order_id, symbol=order.symbol, lots=order.lots, nbbo=nbbo)
                 return rec
         else:
             rec = self._try_execute_mt5(
@@ -1126,8 +1544,8 @@ class DualBrokerExecutionRouter:
                 now_utc,
                 winning_venue="mt5",
                 mesh_topology=topology.value,
-                sor_pips_saved=pips_saved,
-                sor_usd_saved=usd_saved,
+                sor_pips_saved=cand_pips,
+                sor_usd_saved=cand_usd,
             ) or self._try_execute_ctrader(
                 order,
                 report,
@@ -1136,23 +1554,25 @@ class DualBrokerExecutionRouter:
                 now_utc,
                 winning_venue="mt5",
                 mesh_topology=topology.value,
-                sor_pips_saved=pips_saved,
-                sor_usd_saved=usd_saved,
+                sor_pips_saved=cand_pips,
+                sor_usd_saved=cand_usd,
             )
             if rec is not None:
+                if rec.status == "FILLED":
+                    self._record_sor_savings(order_id=rec.order_id, symbol=order.symbol, lots=order.lots, nbbo=nbbo)
                 return rec
 
-        # Seamless Paper-Shadow fallback preserving winning_venue and SOR cost savings telemetry
+        # Seamless Paper-Shadow fallback WITHOUT claiming live SOR execution savings
         return self._execute_paper_shadow(
             order,
             report,
             vwap_slippage_price,
             sl_dist,
-            f"Seamless Paper-Shadow fallback [{topology.value} -> winner={nbbo.winning_venue.upper()}]",
-            winning_venue=nbbo.winning_venue,
+            f"Seamless Paper-Shadow fallback [{topology.value} -> winner={winner.upper()}]",
+            winning_venue=winner,
             mesh_topology=topology.value,
-            sor_pips_saved=pips_saved,
-            sor_usd_saved=usd_saved,
+            sor_pips_saved=0.0,
+            sor_usd_saved=0.0,
         )
 
     def _execute_paper_shadow(
@@ -1233,7 +1653,7 @@ class DualBrokerExecutionRouter:
         closed_shadow = len(self._shadow_positions)
         self._shadow_positions.clear()
 
-        if self.feed_router.mt5.is_connected:
+        if mt5 is not None and self.feed_router.mt5.is_connected:
             positions = mt5.positions_get()
             if positions:
                 for pos in positions:

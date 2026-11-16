@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -27,6 +28,8 @@ from typing import Any
 
 import numpy as np
 
+os.environ.setdefault("NUMBA_CACHE_DIR", str(Path(tempfile.gettempdir()) / "pocketbot_numba_cache"))
+
 logger = logging.getLogger(__name__)
 
 # Optional Numba LLVM AVX2/AVX-512 backend
@@ -34,6 +37,7 @@ try:
     import numba  # type: ignore[import-untyped]
     from numba import njit, prange  # type: ignore[import-untyped]
 
+    numba.config.CACHE_DIR = os.environ["NUMBA_CACHE_DIR"]
     _HAS_NUMBA = True
 except Exception:
     numba = None  # type: ignore[assignment]

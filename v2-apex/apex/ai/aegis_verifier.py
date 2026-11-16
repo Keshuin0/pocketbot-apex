@@ -26,11 +26,14 @@ import hashlib
 import json
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
 
 import z3
+
+_Z3_LOCK = threading.RLock()
 
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.models import Side
@@ -185,9 +188,9 @@ def _safe_float(val: Any) -> float | None:
     return out
 
 
-def _z3_real(val: float) -> z3.RatNumRef:
-    """Convert a Python float cleanly to an exact Z3 Real constant."""
-    return z3.RealVal(f"{float(val):.6f}")
+def _z3_real(val: float, ctx: z3.Context) -> z3.RatNumRef:
+    """Convert a Python float cleanly to an exact Z3 Real constant in `ctx`."""
+    return z3.RealVal(f"{float(val):.6f}", ctx=ctx)
 
 
 class AegisVerifier:
@@ -487,122 +490,125 @@ class AegisVerifier:
         )
         rollover_val = bool(telemetry.get("rollover_illiquidity_flag", False))
 
-        solver = z3.Solver()
-        solver.set("timeout", 50)
-
         dec_map = {"APPROVE": 1, "ABSTAIN": 0, "VETO": -1}
         dec_int = dec_map.get(str(raw_decision).upper().strip(), 0)
-        z_dec = z3.Int("decision")
-        solver.add(z_dec == dec_int)
 
-        z_net_r = z3.Real("timemachine_net_avg_R")
-        z_spread = z3.Real("spread_pct_of_sl")
-        z_vol = z3.Real("vol_pct")
-        z_shock = z3.Real("cross_asset_shock_z")
-        z_rollover = z3.Bool("rollover_illiquidity_flag")
+        with _Z3_LOCK:
+            ctx = z3.Context()
+            solver = z3.Solver(ctx=ctx)
+            solver.set("timeout", 50)
 
-        solver.add(z_net_r == _z3_real(net_r_val))
-        solver.add(z_spread == _z3_real(spread_val))
-        solver.add(z_vol == _z3_real(vol_val))
-        solver.add(z_shock == _z3_real(shock_val))
-        solver.add(z_rollover == z3.BoolVal(rollover_val))
+            z_dec = z3.Int("decision", ctx=ctx)
+            solver.add(z_dec == dec_int)
 
-        # Hard domain safety axioms: toxic setups CANNOT be APPROVED
-        solver.add(
-            z3.Implies(
-                z3.Or(
-                    z_net_r < z3.RealVal("0.10"),
-                    z_spread > z3.RealVal("15.0"),
-                    z3.And(z_rollover, z_vol > z3.RealVal("85.0")),
-                    z_shock > z3.RealVal("3.5"),
-                ),
-                z_dec != 1,
-            )
-        )
+            z_net_r = z3.Real("timemachine_net_avg_R", ctx=ctx)
+            z_spread = z3.Real("spread_pct_of_sl", ctx=ctx)
+            z_vol = z3.Real("vol_pct", ctx=ctx)
+            z_shock = z3.Real("cross_asset_shock_z", ctx=ctx)
+            z_rollover = z3.Bool("rollover_illiquidity_flag", ctx=ctx)
 
-        # Encode every valid cited inequality from the AI's proof-carrying AST
-        z_fields: dict[str, z3.ArithRef] = {
-            "timemachine_net_avg_R": z_net_r,
-            "spread_pct_of_sl": z_spread,
-            "vol_pct": z_vol,
-            "cross_asset_shock_z": z_shock,
-        }
-        for vc in verified_claims:
-            if not vc.valid:
-                continue
-            zf = z_fields.get(vc.field)
-            if zf is None:
-                extra_val = _safe_float(telemetry.get(vc.field))
-                if extra_val is None:
-                    lat_ms = (time.perf_counter() - t0) * 1000.0
-                    return False, round(lat_ms, 3), f"Z3_INVALID_TELEMETRY: non-finite {vc.field}"
-                zf = z3.Real(vc.field)
-                z_fields[vc.field] = zf
-                solver.add(zf == _z3_real(extra_val))
-            lim_val = _safe_float(vc.limit)
-            if lim_val is None:
-                lat_ms = (time.perf_counter() - t0) * 1000.0
-                return False, round(lat_ms, 3), f"Z3_INVALID_CLAIM_LIMIT: {vc.field}"
-            z_lim = _z3_real(lim_val)
-            if vc.op == "<":
-                solver.add(zf < z_lim)
-            elif vc.op == "<=":
-                solver.add(zf <= z_lim)
-            elif vc.op == "==":
-                solver.add(zf == z_lim)
-            elif vc.op == ">=":
-                solver.add(zf >= z_lim)
-            elif vc.op == ">":
-                solver.add(zf > z_lim)
+            solver.add(z_net_r == _z3_real(net_r_val, ctx))
+            solver.add(z_spread == _z3_real(spread_val, ctx))
+            solver.add(z_vol == _z3_real(vol_val, ctx))
+            solver.add(z_shock == _z3_real(shock_val, ctx))
+            solver.add(z_rollover == z3.BoolVal(rollover_val, ctx=ctx))
 
-        chk = solver.check()
-        if chk != z3.sat:
-            lat_ms = (time.perf_counter() - t0) * 1000.0
-            if chk == z3.unknown:
-                return False, round(lat_ms, 3), "Z3_UNKNOWN_TIMEOUT: solver timed out failing closed"
-            return (
-                False,
-                round(lat_ms, 3),
-                "Z3_UNSAT_HALLUCINATION: AI decision violates formal SMT safety axioms",
-            )
-
-        # Existential counterexample search over unbounded symbolic shock & slippage disturbances
-        if dec_int == 1:
-            effective_risk = max(0.0, risk_val * max(0.0, scale_val))
-            if budget_val <= 0.0 and effective_risk > 0.0:
-                lat_ms = (time.perf_counter() - t0) * 1000.0
-                return False, round(lat_ms, 3), "Z3_UNSAT_BUDGET_DEPLETED: remaining daily budget <= 0"
-
-            shock_cap = max(0.05, 0.25 + 0.15 * max(0.0, shock_val) + (0.35 if rollover_val else 0.0))
-            slip_cap = max(0.05, max(0.0, spread_val) / 100.0 * 2.0 + 0.05)
-
-            ce_solver = z3.Solver()
-            ce_solver.set("timeout", 50)
-            d_shock = z3.Real("d_shock")
-            eps_slip = z3.Real("eps_slip")
-            loss_expr = _z3_real(effective_risk) * (z3.RealVal("1.0") + d_shock + eps_slip)
-            ce_solver.add(
-                z3.Exists(
-                    [d_shock, eps_slip],
-                    z3.And(
-                        d_shock >= z3.RealVal("0"),
-                        d_shock <= _z3_real(shock_cap),
-                        eps_slip >= z3.RealVal("0"),
-                        eps_slip <= _z3_real(slip_cap),
-                        loss_expr > _z3_real(budget_val),
+            # Hard domain safety axioms: toxic setups CANNOT be APPROVED
+            solver.add(
+                z3.Implies(
+                    z3.Or(
+                        z_net_r < z3.RealVal("0.10", ctx=ctx),
+                        z_spread > z3.RealVal("15.0", ctx=ctx),
+                        z3.And(z_rollover, z_vol > z3.RealVal("85.0", ctx=ctx)),
+                        z_shock > z3.RealVal("3.5", ctx=ctx),
                     ),
+                    z_dec != 1,
                 )
             )
-            ce_chk = ce_solver.check()
-            if ce_chk != z3.unsat:
+
+            # Encode every valid cited inequality from the AI's proof-carrying AST
+            z_fields: dict[str, z3.ArithRef] = {
+                "timemachine_net_avg_R": z_net_r,
+                "spread_pct_of_sl": z_spread,
+                "vol_pct": z_vol,
+                "cross_asset_shock_z": z_shock,
+            }
+            for vc in verified_claims:
+                if not vc.valid:
+                    continue
+                zf = z_fields.get(vc.field)
+                if zf is None:
+                    extra_val = _safe_float(telemetry.get(vc.field))
+                    if extra_val is None:
+                        lat_ms = (time.perf_counter() - t0) * 1000.0
+                        return False, round(lat_ms, 3), f"Z3_INVALID_TELEMETRY: non-finite {vc.field}"
+                    zf = z3.Real(vc.field, ctx=ctx)
+                    z_fields[vc.field] = zf
+                    solver.add(zf == _z3_real(extra_val, ctx))
+                lim_val = _safe_float(vc.limit)
+                if lim_val is None:
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    return False, round(lat_ms, 3), f"Z3_INVALID_CLAIM_LIMIT: {vc.field}"
+                z_lim = _z3_real(lim_val, ctx)
+                if vc.op == "<":
+                    solver.add(zf < z_lim)
+                elif vc.op == "<=":
+                    solver.add(zf <= z_lim)
+                elif vc.op == "==":
+                    solver.add(zf == z_lim)
+                elif vc.op == ">=":
+                    solver.add(zf >= z_lim)
+                elif vc.op == ">":
+                    solver.add(zf > z_lim)
+
+            chk = solver.check()
+            if chk != z3.sat:
                 lat_ms = (time.perf_counter() - t0) * 1000.0
-                if ce_chk == z3.unknown:
-                    return False, round(lat_ms, 3), "Z3_UNKNOWN_TIMEOUT: counterexample proof timed out"
+                if chk == z3.unknown:
+                    return False, round(lat_ms, 3), "Z3_UNKNOWN_TIMEOUT: solver timed out failing closed"
                 return (
                     False,
                     round(lat_ms, 3),
-                    "Z3_COUNTEREXAMPLE_BUDGET_BREACH: Exists(d_shock, eps_slip) where Loss > remaining_daily_budget",
+                    "Z3_UNSAT_HALLUCINATION: AI decision violates formal SMT safety axioms",
                 )
+
+            # Existential counterexample search over unbounded symbolic shock & slippage disturbances
+            if dec_int == 1:
+                effective_risk = max(0.0, risk_val * max(0.0, scale_val))
+                if budget_val <= 0.0 and effective_risk > 0.0:
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    return False, round(lat_ms, 3), "Z3_UNSAT_BUDGET_DEPLETED: remaining daily budget <= 0"
+
+                shock_cap = max(0.05, 0.25 + 0.15 * max(0.0, shock_val) + (0.35 if rollover_val else 0.0))
+                slip_cap = max(0.05, max(0.0, spread_val) / 100.0 * 2.0 + 0.05)
+
+                ce_solver = z3.Solver(ctx=ctx)
+                ce_solver.set("timeout", 50)
+                d_shock = z3.Real("d_shock", ctx=ctx)
+                eps_slip = z3.Real("eps_slip", ctx=ctx)
+                loss_expr = _z3_real(effective_risk, ctx) * (z3.RealVal("1.0", ctx=ctx) + d_shock + eps_slip)
+                ce_solver.add(
+                    z3.Exists(
+                        [d_shock, eps_slip],
+                        z3.And(
+                            d_shock >= z3.RealVal("0", ctx=ctx),
+                            d_shock <= _z3_real(shock_cap, ctx),
+                            eps_slip >= z3.RealVal("0", ctx=ctx),
+                            eps_slip <= _z3_real(slip_cap, ctx),
+                            loss_expr > _z3_real(budget_val, ctx),
+                        ),
+                    )
+                )
+                ce_chk = ce_solver.check()
+                if ce_chk != z3.unsat:
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    if ce_chk == z3.unknown:
+                        return False, round(lat_ms, 3), "Z3_UNKNOWN_TIMEOUT: counterexample proof timed out"
+                    return (
+                        False,
+                        round(lat_ms, 3),
+                        "Z3_COUNTEREXAMPLE_BUDGET_BREACH: Exists(d_shock, eps_slip) where Loss > remaining_daily_budget",
+                    )
 
         lat_ms = (time.perf_counter() - t0) * 1000.0
         return True, round(lat_ms, 3), f"Z3 SAT ({lat_ms:.2f}ms)"
@@ -636,6 +642,9 @@ class AegisVerifier:
         entry_price: float | None = None,
         sl_old: float | None = None,
         sl_new: float | None = None,
+        mark_price: float | None = None,
+        tp_old: float | None = None,
+        tp_new: float | None = None,
     ) -> tuple[bool, float, str]:
         """Shield 8: Formal Z3 SMT proof for in-flight actions (HOLD vs EARLY_EXIT vs RATCHET)."""
         t0 = time.perf_counter()
@@ -663,100 +672,148 @@ class AegisVerifier:
         is_early_exit = action_norm == "EARLY_EXIT"
         is_hold_or_ratchet = action_norm in ("HOLD", "RATCHET", "RATCHET_SLTP")
 
-        solver = z3.Solver()
-        solver.set("timeout", 50)
+        with _Z3_LOCK:
+            ctx = z3.Context()
+            solver = z3.Solver(ctx=ctx)
+            solver.set("timeout", 50)
 
-        z_exit = z3.Bool("is_early_exit")
-        z_hold_or_ratchet = z3.Bool("is_hold_or_ratchet")
-        z_bars = z3.Int("bars_held")
-        z_min_bars = z3.Int("min_hold_bars")
-        z_move_atr = z3.Real("abs_move_atr")
-        z_shock = z3.Real("cross_asset_shock_z")
-        z_fwd_ev = z3.Real("forward_ev_r")
-        z_curr_r = z3.Real("current_r")
-        z_signals = z3.Int("invalidation_signals")
-        z_zombie = z3.Bool("is_zombie_decay")
-        z_weekend = z3.Bool("is_weekend_close")
+            z_exit = z3.Bool("is_early_exit", ctx=ctx)
+            z_hold_or_ratchet = z3.Bool("is_hold_or_ratchet", ctx=ctx)
+            z_bars = z3.Int("bars_held", ctx=ctx)
+            z_min_bars = z3.Int("min_hold_bars", ctx=ctx)
+            z_move_atr = z3.Real("abs_move_atr", ctx=ctx)
+            z_shock = z3.Real("cross_asset_shock_z", ctx=ctx)
+            z_fwd_ev = z3.Real("forward_ev_r", ctx=ctx)
+            z_curr_r = z3.Real("current_r", ctx=ctx)
+            z_signals = z3.Int("invalidation_signals", ctx=ctx)
+            z_zombie = z3.Bool("is_zombie_decay", ctx=ctx)
+            z_weekend = z3.Bool("is_weekend_close", ctx=ctx)
 
-        solver.add(z_exit == z3.BoolVal(is_early_exit))
-        solver.add(z_hold_or_ratchet == z3.BoolVal(is_hold_or_ratchet))
-        solver.add(z_bars == bars_i)
-        solver.add(z_min_bars == min_bars_i)
-        solver.add(z_move_atr == _z3_real(move_val))
-        solver.add(z_shock == _z3_real(shock_val))
-        solver.add(z_fwd_ev == _z3_real(ev_val))
-        solver.add(z_curr_r == _z3_real(curr_val))
-        solver.add(z_signals == sigs_i)
-        solver.add(z_zombie == z3.BoolVal(bool(is_zombie_decay)))
-        solver.add(z_weekend == z3.BoolVal(bool(is_weekend_close)))
+            solver.add(z_exit == z3.BoolVal(is_early_exit, ctx=ctx))
+            solver.add(z_hold_or_ratchet == z3.BoolVal(is_hold_or_ratchet, ctx=ctx))
+            solver.add(z_bars == bars_i)
+            solver.add(z_min_bars == min_bars_i)
+            solver.add(z_move_atr == _z3_real(move_val, ctx))
+            solver.add(z_shock == _z3_real(shock_val, ctx))
+            solver.add(z_fwd_ev == _z3_real(ev_val, ctx))
+            solver.add(z_curr_r == _z3_real(curr_val, ctx))
+            solver.add(z_signals == sigs_i)
+            solver.add(z_zombie == z3.BoolVal(bool(is_zombie_decay), ctx=ctx))
+            solver.add(z_weekend == z3.BoolVal(bool(is_weekend_close), ctx=ctx))
 
-        # Shock/Weekend emergency mandate: HOLD and RATCHET are UNSAT under extreme shock or weekend close
-        solver.add(z3.Implies(z3.Or(z_shock > z3.RealVal("4.2"), z_weekend), z3.Not(z_hold_or_ratchet)))
-
-        # Grace lock invariant: cannot early-exit during grace window & noise cone unless flash-crash or weekend shield
-        grace_locked = z3.And(
-            z_bars < z_min_bars,
-            z_move_atr <= z3.RealVal("0.65"),
-            z_shock <= z3.RealVal("4.2"),
-            z3.Not(z_weekend),
-        )
-        solver.add(z3.Implies(grace_locked, z3.Not(z_exit)))
-
-        # Thesis-invalidation early exit invariant
-        valid_exit_basis = z3.Or(
-            z_shock > z3.RealVal("4.2"),
-            z_weekend,
-            z3.And(z_zombie, z_fwd_ev <= z3.RealVal("0.0")),
-            z3.And(z_fwd_ev < z3.RealVal("-0.25"), z_signals >= 3),
-        )
-        solver.add(z3.Implies(z_exit, valid_exit_basis))
-
-        chk = solver.check()
-        if chk != z3.sat:
-            lat_ms = (time.perf_counter() - t0) * 1000.0
-            if chk == z3.unknown:
-                return False, round(lat_ms, 3), "Z3_SHIELD8_UNKNOWN_TIMEOUT"
-            return (
-                False,
-                round(lat_ms, 3),
-                f"Z3_SHIELD8_UNSAT: {action_norm} blocked (bars={bars_i}/{min_bars_i}, "
-                f"move_atr={move_val:.2f}, fwd_ev={ev_val:+.2f}R, sigs={sigs_i}, shock={shock_val:.2f}, weekend={is_weekend_close})",
+            # Shock/Weekend emergency mandate: HOLD and RATCHET are UNSAT under extreme shock or weekend close
+            solver.add(
+                z3.Implies(
+                    z3.Or(z_shock > z3.RealVal("4.2", ctx=ctx), z_weekend),
+                    z3.Not(z_hold_or_ratchet),
+                )
             )
 
-        # Symbolic Ratchet Stop-Loss Dominance Proof when SL transition is supplied
-        if sl_old is not None and sl_new is not None:
-            s_old = _safe_float(sl_old)
-            s_new = _safe_float(sl_new)
-            if s_old is None or s_new is None or s_old <= 0.0 or s_new <= 0.0:
-                lat_ms = (time.perf_counter() - t0) * 1000.0
-                return False, round(lat_ms, 3), "Z3_SHIELD8_INVALID_SL: non-positive or non-finite SL"
-            side_up = str(side).upper().strip()
-            e_val = _safe_float(entry_price)
-            if e_val is None:
-                e_val = (s_old + 1.0) if side_up == "BUY" else max(s_old - 1.0, 0.0001)
+            # Grace lock invariant: cannot early-exit during grace window & noise cone unless flash-crash or weekend shield
+            grace_locked = z3.And(
+                z_bars < z_min_bars,
+                z_move_atr <= z3.RealVal("0.65", ctx=ctx),
+                z_shock <= z3.RealVal("4.2", ctx=ctx),
+                z3.Not(z_weekend),
+            )
+            solver.add(z3.Implies(grace_locked, z3.Not(z_exit)))
 
-            dom_solver = z3.Solver()
-            dom_solver.set("timeout", 50)
-            p_t = z3.Real("P_T")
-            z_entry = _z3_real(e_val)
-            z_sl_old = _z3_real(s_old)
-            z_sl_new = _z3_real(s_new)
-            if side_up == "BUY":
-                pnl_new = z3.If(p_t <= z_sl_new, z_sl_new - z_entry, p_t - z_entry)
-                pnl_old = z3.If(p_t <= z_sl_old, z_sl_old - z_entry, p_t - z_entry)
-                dom_solver.add(z3.Exists([p_t], z3.And(p_t > z3.RealVal("0"), p_t <= z_sl_old, pnl_new < pnl_old)))
-            else:
-                pnl_new = z3.If(p_t >= z_sl_new, z_entry - z_sl_new, z_entry - p_t)
-                pnl_old = z3.If(p_t >= z_sl_old, z_entry - z_sl_old, z_entry - p_t)
-                dom_solver.add(z3.Exists([p_t], z3.And(p_t > z3.RealVal("0"), p_t >= z_sl_old, pnl_new < pnl_old)))
-            dom_chk = dom_solver.check()
-            if dom_chk != z3.unsat:
+            # Thesis-invalidation early exit invariant
+            valid_exit_basis = z3.Or(
+                z_shock > z3.RealVal("4.2", ctx=ctx),
+                z_weekend,
+                z3.And(z_zombie, z_fwd_ev <= z3.RealVal("0.0", ctx=ctx)),
+                z3.And(z_fwd_ev < z3.RealVal("-0.25", ctx=ctx), z_signals >= 3),
+            )
+            solver.add(z3.Implies(z_exit, valid_exit_basis))
+
+            chk = solver.check()
+            if chk != z3.sat:
                 lat_ms = (time.perf_counter() - t0) * 1000.0
+                if chk == z3.unknown:
+                    return False, round(lat_ms, 3), "Z3_SHIELD8_UNKNOWN_TIMEOUT"
                 return (
                     False,
                     round(lat_ms, 3),
-                    f"Z3_SHIELD8_RATCHET_UNSAT: Exists P_T where widened SL ({s_old}->{s_new}) yields worse stop PnL",
+                    f"Z3_SHIELD8_UNSAT: {action_norm} blocked (bars={bars_i}/{min_bars_i}, "
+                    f"move_atr={move_val:.2f}, fwd_ev={ev_val:+.2f}R, sigs={sigs_i}, shock={shock_val:.2f}, weekend={is_weekend_close})",
                 )
+
+            # Symbolic Ratchet Stop-Loss Dominance Proof when SL transition is supplied
+            if sl_old is not None and sl_new is not None:
+                s_old = _safe_float(sl_old)
+                s_new = _safe_float(sl_new)
+                if s_old is None or s_new is None or s_old <= 0.0 or s_new <= 0.0:
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    return False, round(lat_ms, 3), "Z3_SHIELD8_INVALID_SL: non-positive or non-finite SL"
+                side_up = str(side).upper().strip()
+                e_val = _safe_float(entry_price)
+                if e_val is None:
+                    e_val = (s_old + 1.0) if side_up == "BUY" else max(s_old - 1.0, 0.0001)
+
+                dom_solver = z3.Solver(ctx=ctx)
+                dom_solver.set("timeout", 50)
+                p_t = z3.Real("P_T", ctx=ctx)
+                z_entry = _z3_real(e_val, ctx)
+                z_sl_old = _z3_real(s_old, ctx)
+                z_sl_new = _z3_real(s_new, ctx)
+                if side_up == "BUY":
+                    pnl_new = z3.If(p_t <= z_sl_new, z_sl_new - z_entry, p_t - z_entry)
+                    pnl_old = z3.If(p_t <= z_sl_old, z_sl_old - z_entry, p_t - z_entry)
+                    dom_solver.add(
+                        z3.Exists([p_t], z3.And(p_t > z3.RealVal("0", ctx=ctx), p_t <= z_sl_old, pnl_new < pnl_old))
+                    )
+                else:
+                    pnl_new = z3.If(p_t >= z_sl_new, z_entry - z_sl_new, z_entry - p_t)
+                    pnl_old = z3.If(p_t >= z_sl_old, z_entry - z_sl_old, z_entry - p_t)
+                    dom_solver.add(
+                        z3.Exists([p_t], z3.And(p_t > z3.RealVal("0", ctx=ctx), p_t >= z_sl_old, pnl_new < pnl_old))
+                    )
+                dom_chk = dom_solver.check()
+                if dom_chk != z3.unsat:
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    return (
+                        False,
+                        round(lat_ms, 3),
+                        f"Z3_SHIELD8_RATCHET_UNSAT: Exists P_T where widened SL ({s_old}->{s_new}) yields worse stop PnL",
+                    )
+
+                # Mark-price & TP boundary axioms: SL cannot cross mark_price and TP must stay validly bounded
+                m_val = _safe_float(mark_price)
+                if m_val is not None and m_val > 0.0 and action_norm in ("RATCHET", "RATCHET_SLTP"):
+                    invalid_mark_sl = (s_new >= m_val) if side_up == "BUY" else (s_new <= m_val)
+                    if invalid_mark_sl:
+                        lat_ms = (time.perf_counter() - t0) * 1000.0
+                        return (
+                            False,
+                            round(lat_ms, 3),
+                            f"Z3_SHIELD8_MARK_UNSAT: new SL ({s_new}) crosses live mark ({m_val})",
+                        )
+
+            t_new = _safe_float(tp_new) if tp_new is not None else None
+            if t_new is not None:
+                side_up = str(side).upper().strip()
+                e_val = _safe_float(entry_price)
+                m_val = _safe_float(mark_price)
+                t_old = _safe_float(tp_old) if tp_old is not None else None
+                if t_new <= 0.0:
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    return False, round(lat_ms, 3), "Z3_SHIELD8_TP_UNSAT: non-positive TP"
+                tp_solver = z3.Solver(ctx=ctx)
+                tp_solver.set("timeout", 50)
+                z_tp = _z3_real(t_new, ctx)
+                if e_val is not None and e_val > 0.0:
+                    z_e = _z3_real(e_val, ctx)
+                    tp_solver.add(z_tp > z_e if side_up == "BUY" else z_tp < z_e)
+                if m_val is not None and m_val > 0.0 and action_norm in ("RATCHET", "RATCHET_SLTP"):
+                    z_m = _z3_real(m_val, ctx)
+                    tp_solver.add(z_tp > z_m if side_up == "BUY" else z_tp < z_m)
+                if t_old is not None and t_old > 0.0 and e_val is not None and e_val > 0.0:
+                    max_tp_dist = max(abs(t_old - e_val) * 3.0, abs(float(sl_old or e_val) - e_val) * 6.0, 1e-6)
+                    tp_solver.add(z3.If(z_tp >= _z3_real(e_val, ctx), z_tp - _z3_real(e_val, ctx), _z3_real(e_val, ctx) - z_tp) <= _z3_real(max_tp_dist, ctx))
+                if tp_solver.check() != z3.sat:
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    return False, round(lat_ms, 3), f"Z3_SHIELD8_TP_UNSAT: invalid TP bound ({t_new})"
 
         lat_ms = (time.perf_counter() - t0) * 1000.0
         return (

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>PocketBot Apex v2.5.1 — Live Institutional Cockpit</title>
+  <title>PocketBot Apex __APEX_VERSION__ — Live Institutional Cockpit</title>
   <style>
     :root {
       --bg: #070b14;
@@ -138,7 +138,7 @@
 <body>
   <header class="header">
     <div class="brand">
-      <h1>POCKETBOT APEX v2.7</h1>
+      <h1 id="brand-title">POCKETBOT APEX __APEX_VERSION__</h1>
       <span class="pill" id="mode-pill">DEMO LOCKED</span>
       <span class="pill"><span class="dot" id="ws-dot"></span><span id="ws-status">Connecting...</span></span>
     </div>
@@ -205,7 +205,7 @@
       <div class="panel-title">
         <span>Live 0.01-Lot MT5 Lifecycle Drill <span id="drill-sym-badge"></span></span>
         <span>
-          <button class="badge" id="btn-drill-xray" style="display:none;cursor:pointer;border:1px solid #38bdf8;background:#0f172a;color:#38bdf8;margin-right:6px;" onclick="openXrayModal('drill')">11-Agent X-Ray</button>
+          <button class="badge" id="btn-drill-xray" style="display:none;cursor:pointer;border:1px solid #38bdf8;background:#0f172a;color:#38bdf8;margin-right:6px;" data-xray-source="drill">11-Agent X-Ray</button>
           <span class="badge" id="drill-status">IDLE</span>
         </span>
       </div>
@@ -216,7 +216,7 @@
       <div class="panel-title">
         <span>Historical Market Replay (11-Agent + In-Flight) <span id="replay-sym-badge"></span></span>
         <span>
-          <button class="badge" id="btn-replay-xray" style="display:none;cursor:pointer;border:1px solid #38bdf8;background:#0f172a;color:#38bdf8;margin-right:6px;" onclick="openXrayModal('replay')">11-Agent X-Ray</button>
+          <button class="badge" id="btn-replay-xray" style="display:none;cursor:pointer;border:1px solid #38bdf8;background:#0f172a;color:#38bdf8;margin-right:6px;" data-xray-source="replay">11-Agent X-Ray</button>
           <span class="badge" id="replay-status">IDLE</span>
         </span>
       </div>
@@ -245,6 +245,14 @@
       </table>
     </div>
   </div>
+
+  <section class="panel" id="pending-confirm-panel" style="display:none;border-color:#f59e0b;">
+    <div class="panel-title">
+      <span>Pending Manual Confirmations (--mode confirm)</span>
+      <span class="badge" id="pending-confirm-count">0 awaiting</span>
+    </div>
+    <div id="pending-confirm-list" style="display:flex;flex-direction:column;gap:8px;"></div>
+  </section>
 
   <section class="panel">
     <div class="panel-title">
@@ -319,6 +327,14 @@
 
     function esc(s) {
       return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function pxDigits(symbol, px) {
+      const s = String(symbol || '').toUpperCase();
+      const val = Math.abs(Number(px || 0));
+      if (/JPY/.test(s)) return 3;
+      if (/XAU|XAG|BTC|ETH|US30|US500|NAS100|GER40|UK100/.test(s) || val >= 50) return 2;
+      return 5;
     }
 
     function setSort(key) {
@@ -445,6 +461,10 @@
       const clean = { ...s };
       delete clean.csrf_token;
 
+      if (s.display_version) {
+        const bt = document.getElementById('brand-title');
+        if (bt) bt.textContent = `POCKETBOT APEX ${s.display_version}`;
+      }
       document.getElementById('mode-pill').textContent = (s.run_mode || 'DEMO').toUpperCase();
       const cf = s.compute_fabric || {};
       if (cf.active_backend) {
@@ -539,11 +559,12 @@
           const nr = Number(t.net_r || 0);
           const pnlUsd = Number(t.pnl_cad ?? t.pnl_usd ?? 0);
           const cls = nr >= 0 ? 'pos' : 'neg';
+          const digits = pxDigits(t.symbol, t.entry_price ?? t.entry ?? 0);
           return `<tr>
             <td><strong>${esc(t.symbol || '')}</strong></td>
             <td>${esc(t.side || '')}</td>
-            <td class="num">${Number(t.entry_price ?? t.entry ?? 0).toFixed(4)}</td>
-            <td class="num">${Number(t.exit_price ?? t.exit ?? 0).toFixed(4)}</td>
+            <td class="num">${Number(t.entry_price ?? t.entry ?? 0).toFixed(digits)}</td>
+            <td class="num">${Number(t.exit_price ?? t.exit ?? 0).toFixed(digits)}</td>
             <td class="num ${cls}">${nr >= 0 ? '+' : ''}${nr.toFixed(2)}R</td>
             <td class="num ${cls}">${pnlUsd >= 0 ? '+' : ''}${pnlUsd.toFixed(2)}</td>
             <td class="muted">${esc(t.exit_reason || '')}</td>
@@ -551,6 +572,37 @@
         }).join('');
       } else {
         rtWrap.style.display = 'none';
+      }
+
+      // Pending manual confirmations (--mode confirm)
+      const pendingList = s.pending_confirmations || [];
+      const pendingPanel = document.getElementById('pending-confirm-panel');
+      const pendingBody = document.getElementById('pending-confirm-list');
+      const pendingCnt = document.getElementById('pending-confirm-count');
+      if (pendingPanel && pendingBody && pendingCnt) {
+        if (!pendingList.length) {
+          pendingPanel.style.display = 'none';
+          pendingBody.innerHTML = '';
+        } else {
+          pendingPanel.style.display = 'block';
+          pendingCnt.textContent = `${pendingList.length} awaiting`;
+          pendingBody.innerHTML = pendingList.map(item => {
+            const d = pxDigits(item.symbol, item.entry_price);
+            const cid = esc(item.confirm_id || '');
+            return `<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px;background:#0b1220;border:1px solid #334155;border-radius:6px;">
+              <div>
+                <strong>${esc(item.symbol)}</strong> [${esc(item.side)}] ${Number(item.lots || 0).toFixed(2)} lots
+                @ ${Number(item.entry_price || 0).toFixed(d)}
+                (SL=${Number(item.stop_loss || 0).toFixed(d)}, TP=${Number(item.take_profit || 0).toFixed(d)},
+                netR=${Number(item.net_avg_r || 0).toFixed(2)}R, risk=${Number(item.risk_pct || 0).toFixed(2)}%)
+              </div>
+              <div style="display:flex;gap:6px;">
+                <button class="btn-cyan" data-confirm-id="${cid}" data-confirm-decision="APPROVE">Approve</button>
+                <button class="btn-danger" data-confirm-id="${cid}" data-confirm-decision="REJECT">Reject</button>
+              </div>
+            </div>`;
+          }).join('');
+        }
       }
 
       // Open positions
@@ -568,15 +620,16 @@
             pct = Math.max(0, Math.min(100, ((curPx - sl) / (tp - sl)) * 100));
           }
           const stage = esc(p.ratchet_stage || (p.grace_locked ? 'GRACE_LOCK' : 'ACTIVE'));
-          const fwdProb = Number(p.forward_prob_tp || 50).toFixed(0);
+          const fwdProb = Number(p.forward_prob_tp ?? 50).toFixed(0);
           const mfe = Number(p.mfe_r || 0).toFixed(2);
           const mae = Number(p.mae_r || 0).toFixed(2);
+          const d = pxDigits(p.symbol, p.entry_price || curPx);
           return `<tr>
             <td><strong>${esc(p.symbol)}</strong></td>
             <td>${esc(p.side)}</td>
             <td class="num">${Number(p.lots || 0).toFixed(2)}</td>
-            <td class="num">${Number(p.entry_price || 0).toFixed(5)}</td>
-            <td class="num">${sl.toFixed(4)} / ${tp.toFixed(4)}</td>
+            <td class="num">${Number(p.entry_price || 0).toFixed(d)}</td>
+            <td class="num">${sl.toFixed(d)} / ${tp.toFixed(d)}</td>
             <td class="num ${fp >= 0 ? 'pos' : 'neg'}">${fp >= 0 ? '+' : ''}${fp.toFixed(2)} ${cur}</td>
             <td><span class="badge">${stage}</span> P(TP): ${fwdProb}% | MFE/MAE: ${mfe}R / ${mae}R</td>
             <td><div class="progress-wrap"><div class="progress-fill" style="width:${pct.toFixed(1)}%"></div></div></td>
@@ -608,11 +661,12 @@
           const vStr = String(r.ai_verdict || 'IDLE');
           const vBadge = vStr.startsWith('APPROVE') ? 'badge-approve' : (vStr.startsWith('VETO') ? 'badge-veto' : 'badge-idle');
           const sideTag = r.side ? ` <span class="muted">(${esc(r.side)})</span>` : '';
-          const rowClick = r.pipeline_trace ? ` style="cursor:pointer" title="Click for 11-Agent X-Ray Scorecard" onclick="openXrayModal('row_${esc(r.symbol)}')"` : '';
+          const rowClick = r.pipeline_trace ? ` style="cursor:pointer" title="Click for 11-Agent X-Ray Scorecard" data-xray-source="row_${esc(r.symbol)}"` : '';
+          const d = pxDigits(r.symbol, r.bid);
           return `<tr class="${cls}"${rowClick}>
             <td><strong>${esc(r.symbol)}</strong>${sideTag}</td>
             <td class="muted">${esc(r.timeframe)}</td>
-            <td class="num">${Number(r.bid).toFixed(r.bid < 10 ? 5 : 2)} / ${Number(r.ask).toFixed(r.bid < 10 ? 5 : 2)}</td>
+            <td class="num">${Number(r.bid).toFixed(d)} / ${Number(r.ask).toFixed(d)}</td>
             <td class="num">${Number(r.spread_pips).toFixed(1)}p</td>
             <td>${esc(r.best_venue)}</td>
             <td>${esc(r.regime)}</td>
@@ -635,12 +689,13 @@
         evBody.innerHTML = evs.slice(-10).map(e => {
           const st = String(e.status || '');
           const stCls = st.includes('FILLED') || st.includes('SETTLED') ? 'pos' : (st.includes('VETO') || st.includes('BLOCK') || st.includes('REJECT') ? 'neg' : 'warn');
+          const d = pxDigits(e.symbol, e.price);
           return `<tr>
             <td class="muted">${esc(e.timestamp_str)}</td>
             <td><strong>${esc(e.symbol)}</strong></td>
             <td>${esc(e.side)}</td>
             <td class="num">${Number(e.lots || 0).toFixed(2)}</td>
-            <td>${Number(e.price || 0).toFixed(4)} | ${Number(e.stop_loss || 0).toFixed(4)} | ${Number(e.take_profit || 0).toFixed(4)}</td>
+            <td>${Number(e.price || 0).toFixed(d)} | ${Number(e.stop_loss || 0).toFixed(d)} | ${Number(e.take_profit || 0).toFixed(d)}</td>
             <td class="${stCls}">${esc(e.venue)} ${esc(st)}</td>
             <td class="muted">${esc(e.details)}</td>
           </tr>`;
@@ -649,6 +704,22 @@
 
       document.getElementById('last-update').textContent = 'Updated: ' + new Date().toLocaleTimeString();
     }
+
+    document.addEventListener('click', (ev) => {
+      if (!ev.target || !ev.target.closest) return;
+      const xrayEl = ev.target.closest('[data-xray-source]');
+      if (xrayEl) {
+        const src = xrayEl.getAttribute('data-xray-source');
+        if (src) openXrayModal(src);
+        return;
+      }
+      const confirmBtn = ev.target.closest('[data-confirm-id][data-confirm-decision]');
+      if (confirmBtn) {
+        const cid = confirmBtn.getAttribute('data-confirm-id');
+        const dec = confirmBtn.getAttribute('data-confirm-decision');
+        if (cid && dec) sendControl('confirm', { confirm_id: cid, decision: dec });
+      }
+    });
 
     function connectWS() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';

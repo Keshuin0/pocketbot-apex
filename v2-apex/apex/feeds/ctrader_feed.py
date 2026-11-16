@@ -708,6 +708,21 @@ class CTraderOpenApiFeed:
                 self.refresh_token = str(extracted.refreshToken)
             logger.info("cTrader Open API access token refreshed over Protobuf TCP.")
 
+    def _start_reactor_thread(self) -> None:
+        """Start the Twisted reactor in a background daemon thread if not already running."""
+        try:
+            from twisted.internet import reactor
+
+            if not getattr(reactor, "running", False):
+                t = threading.Thread(
+                    target=lambda: reactor.run(installSignalHandlers=False),
+                    daemon=True,
+                    name="cTrader-TwistedReactor",
+                )
+                t.start()
+        except Exception as exc:
+            logger.debug("Twisted reactor thread start skipped: %s", exc)
+
     def start(self) -> None:
         """Initialize the Twisted Protobuf TLS TCP client and authenticate."""
         verify_live_unlock(self.is_live)
@@ -721,6 +736,7 @@ class CTraderOpenApiFeed:
         self._client.setDisconnectedCallback(self._on_disconnected)
         self._client.setMessageReceivedCallback(self._on_message_received)
         self._client.startService()
+        self._start_reactor_thread()
 
     def stop(self) -> None:
         """Stop the cTrader TCP client service."""
@@ -1315,11 +1331,41 @@ class CTraderOpenApiFeed:
         with self._lock:
             return [dict(v) for v in self._open_positions.values()]
 
-    def send_new_order(self, req: oa_msg.ProtoOANewOrderReq, timeout: float = 3.0) -> dict[str, object]:
+    def send_new_order(
+        self,
+        req: oa_msg.ProtoOANewOrderReq | None = None,
+        timeout: float = 3.0,
+        *,
+        symbol: str = "",
+        side: Side = Side.BUY,
+        volume_lots: float = 0.01,
+        stop_loss: float = 0.0,
+        take_profit: float = 0.0,
+    ) -> dict[str, object]:
         """Dispatch ``ProtoOANewOrderReq`` thread-safely and await execution confirmation when live."""
         self._ensure_runtime_buffers()
         if not self.is_connected or self._client is None:
-            return {"ok": False, "status": "REJECTED", "error_code": "CTRADER_OFFLINE"}
+            return {"ok": False, "status": "TIMEOUT_OR_OFFLINE", "error_code": "CTRADER_OFFLINE"}
+        if req is None:
+            if not symbol:
+                return {"ok": False, "status": "REJECTED", "error_code": "MISSING_ORDER_REQUEST"}
+            resolved = self.resolve_symbol(symbol) or symbol.upper()
+            sid = self._symbol_name_to_id.get(resolved) or self._symbol_name_to_id.get(symbol.upper())
+            if sid is None:
+                return {"ok": False, "status": "REJECTED", "error_code": f"UNRESOLVED_SYMBOL:{symbol}"}
+            spec = self._contract_specs.get(resolved) or self._contract_specs.get(symbol.upper())
+            lot_units = spec.lot_size if spec else 100_000.0
+            req = oa_msg.ProtoOANewOrderReq()
+            req.ctidTraderAccountId = int(self.account_id)
+            req.symbolId = int(sid)
+            req.orderType = oa_model.ProtoOAOrderType.MARKET
+            req.tradeSide = oa_model.ProtoOATradeSide.BUY if side == Side.BUY else oa_model.ProtoOATradeSide.SELL
+            req.volume = max(1, int(round(float(volume_lots) * float(lot_units) * CTRADER_VOLUME_CENTS_PER_UNIT)))
+            if stop_loss > 0.0:
+                req.stopLoss = float(stop_loss)
+            if take_profit > 0.0:
+                req.takeProfit = float(take_profit)
+            req.clientOrderId = f"apex_{int(time.time() * 1000)}"
 
         wire_req = oa_msg.ProtoOANewOrderReq()
         wire_req.CopyFrom(req)
@@ -1349,15 +1395,13 @@ class CTraderOpenApiFeed:
         with self._lock:
             self._execution_waiters.pop(client_oid, None)
 
-        # In live Twisted operation without execution confirmation, fail closed instead of faking a fill
-        if reactor_alive:
-            return {
-                "ok": False,
-                "status": "REJECTED",
-                "error_code": "CTRADER_EXECUTION_TIMEOUT",
-                "order_id": client_oid,
-            }
-        return {"ok": True, "status": "FILLED", "order_id": client_oid}
+        # Fail closed unless Twisted execution event explicitly confirmed fill/rejection
+        return {
+            "ok": False,
+            "status": "TIMEOUT_OR_OFFLINE",
+            "error_code": "CTRADER_EXECUTION_TIMEOUT" if reactor_alive else "CTRADER_REACTOR_OFFLINE",
+            "order_id": client_oid,
+        }
 
     def amend_position_sltp(
         self,
@@ -1402,7 +1446,12 @@ class CTraderOpenApiFeed:
 
         with self._lock:
             self._execution_waiters.pop(key, None)
-        return {"ok": True, "status": "AMENDED", "position_id": int(position_id)}
+        return {
+            "ok": False,
+            "status": "TIMEOUT_OR_OFFLINE",
+            "error_code": "CTRADER_AMEND_TIMEOUT" if reactor_alive else "CTRADER_REACTOR_OFFLINE",
+            "position_id": int(position_id),
+        }
 
     def close_position(
         self,
@@ -1452,5 +1501,9 @@ class CTraderOpenApiFeed:
 
         with self._lock:
             self._execution_waiters.pop(key, None)
-            self._open_positions.pop(int(position_id), None)
-        return {"ok": True, "status": "CLOSED", "position_id": int(position_id)}
+        return {
+            "ok": False,
+            "status": "TIMEOUT_OR_OFFLINE",
+            "error_code": "CTRADER_CLOSE_TIMEOUT" if reactor_alive else "CTRADER_REACTOR_OFFLINE",
+            "position_id": int(position_id),
+        }

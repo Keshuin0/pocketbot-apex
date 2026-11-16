@@ -513,10 +513,10 @@ def run_live_lifecycle_drill(
     )
 
     summary_msg = (
-        f"Drill COMPLETE on {symbol}: Ticket #{pos_ticket} | SLTP={sltp_retcode} | "
+        f"Drill COMPLETED on {symbol}: Ticket #{pos_ticket} | SLTP={sltp_retcode} | "
         f"Close={close_retcode} (Deal #{close_deal_id}) | Realized={realized_pnl:+.2f} {currency}"
     )
-    _emit("COMPLETE", summary_msg, symbol=symbol, ticket=pos_ticket, floating_pnl=realized_pnl, trace=trace_dict)
+    _emit("COMPLETED", summary_msg, symbol=symbol, ticket=pos_ticket, floating_pnl=realized_pnl, trace=trace_dict)
 
     return DrillResult(
         ok=(close_retcode == done_code),

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 import threading
+import zlib
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -114,6 +115,11 @@ class TimeMachineV2Result:
     recommended_risk_pct: float
     recommended_risk_usd: float
     account_equity_usd: float
+
+    @property
+    def net_avg_r(self) -> float:
+        """Lowercase alias for `net_avg_R`."""
+        return self.net_avg_R
 
 
 class BlockBootstrapTimeMachine:
@@ -375,6 +381,7 @@ class BlockBootstrapTimeMachine:
         horizon_bars: int = 48,
         cost_model: TimeMachineCostModel | None = None,
         block_weights: np.ndarray | None = None,
+        bar_ts: float = 0.0,
     ) -> TimeMachineV2Result:
         """Run Stationary Block-Bootstrap paths and deduct round-trip costs on every path."""
         if bar_ratios.ndim != 2 or bar_ratios.shape[1] != 4 or len(bar_ratios) < 5:
@@ -397,14 +404,17 @@ class BlockBootstrapTimeMachine:
         cal_mult = max(0.5, min(3.0, float(getattr(cm, "slippage_calibration_multiplier", 1.0))))
         calibrated_slip = max(0.0, float(cm.vwap_slippage_price)) * cal_mult
         commission_r = max(0.0, float(cm.commission_per_lot_round_turn_usd)) / max(float(cm.risk_per_lot_usd), 1e-9)
-        spread_slip_r = (max(0.0, float(cm.spread_price)) + calibrated_slip) / one_r_dist
+        asym_on = bool(getattr(cm, "asymmetric_barriers", False)) and cm.spread_price > 0.0
+        # When asymmetric_barriers models bid-ask spread in barrier geometry, do NOT subtract spread_price a second time
+        spread_cost_px = 0.0 if asym_on else max(0.0, float(cm.spread_price))
+        spread_slip_r = (spread_cost_px + calibrated_slip) / one_r_dist
         round_trip_cost_r = commission_r + spread_slip_r
 
         # Optional asymmetric Bid/Ask barrier geometry:
         # BUY entered at Ask0 with SL/TP on Bid_t: SL distance tightens by S_t/2, TP distance widens by S_t/2
         eff_stop = float(stop_price)
         eff_target = float(target_price)
-        if bool(getattr(cm, "asymmetric_barriers", False)) and cm.spread_price > 0.0:
+        if asym_on:
             half_s = 0.5 * float(cm.spread_price)
             eff_sl_dist = max(one_r_dist - half_s, 1e-9)
             eff_tp_dist = target_dist + half_s
@@ -416,13 +426,23 @@ class BlockBootstrapTimeMachine:
                 eff_target = float(entry_price) - eff_tp_dist
         target_r = float(target_dist / one_r_dist)
 
-        rng = np.random.default_rng(self.seed)
-        idx_matrix = self.generate_stationary_block_indices(
-            pool_length=len(bar_ratios),
-            horizon_bars=int(horizon_bars),
-            rng=rng,
-            block_weights=block_weights,
+        eff_seed = (
+            (int(self.seed) ^ zlib.crc32(f"{symbol.upper()}:{int(round(float(bar_ts)))}".encode("utf-8"))) & 0x7FFFFFFF
+            if float(bar_ts) > 0.0
+            else int(self.seed)
         )
+        rng = np.random.default_rng(eff_seed)
+        prev_seed = self.seed
+        self.seed = eff_seed
+        try:
+            idx_matrix = self.generate_stationary_block_indices(
+                pool_length=len(bar_ratios),
+                horizon_bars=int(horizon_bars),
+                rng=rng,
+                block_weights=block_weights,
+            )
+        finally:
+            self.seed = prev_seed
 
         # Vectorized 3D [1, N, H] path evaluation via HyperionComputeFabric (GPU / Numba LLVM / NumPy)
         sampled_high_ratios = bar_ratios[idx_matrix, 1][np.newaxis, :, :]
@@ -514,6 +534,7 @@ class BlockBootstrapTimeMachine:
             current_er=current_er,
             current_vol_pct=current_vol_pct,
         )
+        bar_ts = float(candles[-1].timestamp_utc) if candles else 0.0
         return self.simulate_from_ratios(
             symbol=symbol,
             side=side,
@@ -524,4 +545,5 @@ class BlockBootstrapTimeMachine:
             horizon_bars=horizon_bars,
             cost_model=cost_model,
             block_weights=block_weights,
+            bar_ts=bar_ts,
         )

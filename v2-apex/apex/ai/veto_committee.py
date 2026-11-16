@@ -34,8 +34,10 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -286,7 +288,9 @@ class AIVetoCommittee:
 
         self._cached_agy_path: str | None = None
         self._cached_agy_auth_ok: bool | None = None
-        self._verdict_cache: dict[tuple[str, str, str, int], AIVetoDecision] = {}
+        self._verdict_cache: OrderedDict[tuple[str, str, str, int], AIVetoDecision] = OrderedDict()
+        self._verdict_cache_maxsize: int = 512
+        self._verdict_cache_lock = threading.RLock()
         self._agy_consecutive_failures: int = 0
         self._agy_cooldown_until_utc: float = 0.0
         self.min_net_avg_R: float = 0.10
@@ -1368,8 +1372,17 @@ class AIVetoCommittee:
             self._agy_cooldown_until_utc = time.time() + 600.0
             raise RuntimeError("All agy_pro model families are quarantined/exhausted; falling back to pure_math + Z3")
         last_exc: Exception | None = None
+        cascade_budget_s = min(90.0, max(float(timeout_int) * 2.5, 45.0))
+        cascade_deadline = time.perf_counter() + cascade_budget_s
 
-        for model_id in candidate_models:
+        for idx, model_id in enumerate(candidate_models):
+            remaining_budget = cascade_deadline - time.perf_counter()
+            if idx > 0 and remaining_budget < 6.0:
+                last_exc = RuntimeError(
+                    f"agy_pro cascade wall-clock budget ({cascade_budget_s:.0f}s) exhausted before trying {model_id}"
+                )
+                break
+            attempt_timeout = min(float(timeout_int) + 4.0, max(6.0, remaining_budget))
             t0 = time.perf_counter()
 
             def _build_cmd(p_txt: str, mid: str = model_id) -> list[str]:
@@ -1389,14 +1402,14 @@ class AIVetoCommittee:
                     cmd.extend(["--effort", "low"])
                 return cmd
 
-            def _invoke_agy(p_txt: str, mid: str = model_id) -> str:
+            def _invoke_agy(p_txt: str, mid: str = model_id, sub_timeout: float = attempt_timeout) -> str:
                 proc = subprocess.run(
                     _build_cmd(p_txt, mid),
                     cwd=iso_dir,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
-                    timeout=float(timeout_int) + 4.0,
+                    timeout=sub_timeout,
                     encoding="utf-8",
                     errors="replace",
                 )
@@ -1479,11 +1492,20 @@ class AIVetoCommittee:
             self._agy_cooldown_until_utc = time.time() + 600.0
             raise RuntimeError("All agy_pro model families are quarantined/exhausted; falling back to pure_math + Z3")
         last_exc: Exception | None = None
+        cascade_budget_s = min(90.0, max(float(timeout_int) * 2.5, 45.0))
+        cascade_deadline = time.perf_counter() + cascade_budget_s
 
-        for model_id in candidate_models:
+        for idx, model_id in enumerate(candidate_models):
+            remaining_budget = cascade_deadline - time.perf_counter()
+            if idx > 0 and remaining_budget < 6.0:
+                last_exc = RuntimeError(
+                    f"agy_pro async cascade wall-clock budget ({cascade_budget_s:.0f}s) exhausted before {model_id}"
+                )
+                break
+            attempt_timeout = min(float(timeout_int) + 4.0, max(6.0, remaining_budget))
             t0 = time.perf_counter()
 
-            async def _invoke_agy_async(p_txt: str, mid: str = model_id) -> str:
+            async def _invoke_agy_async(p_txt: str, mid: str = model_id, sub_timeout: float = attempt_timeout) -> str:
                 cmd = [
                     agy_exe,
                     "-p",
@@ -1508,7 +1530,7 @@ class AIVetoCommittee:
                 try:
                     raw_out, raw_err = await asyncio.wait_for(
                         proc.communicate(),
-                        timeout=float(timeout_int) + 4.0,
+                        timeout=sub_timeout,
                     )
                 except asyncio.TimeoutError as exc:
                     try:
@@ -1615,17 +1637,34 @@ class AIVetoCommittee:
             cascade_path=tuple(cascade_path),
         )
 
+    def _get_cached_verdict(self, cache_key: tuple[str, str, str, int]) -> AIVetoDecision | None:
+        with self._verdict_cache_lock:
+            decision = self._verdict_cache.get(cache_key)
+            if decision is not None:
+                self._verdict_cache.move_to_end(cache_key)
+            return decision
+
+    def _set_cached_verdict(self, cache_key: tuple[str, str, str, int], decision: AIVetoDecision) -> None:
+        with self._verdict_cache_lock:
+            self._verdict_cache[cache_key] = decision
+            self._verdict_cache.move_to_end(cache_key)
+            max_entries = max(1, int(getattr(self, "_verdict_cache_maxsize", 512)))
+            while len(self._verdict_cache) > max_entries:
+                self._verdict_cache.popitem(last=False)
+
     def evaluate_sync(self, ctx: CandidateSetupAuditContext) -> AIVetoDecision:
         """Hot-reload `.env` & `config/apex_config.json`, then execute the configured 3-tier waterfall."""
         bar_ts = int(ctx.bar_timestamp)
         side_str = ctx.side.value if hasattr(ctx.side, "value") else str(ctx.side).upper()
         cache_key = (ctx.symbol.upper(), side_str, ctx.timeframe.upper(), bar_ts)
-        if bar_ts > 0 and cache_key in self._verdict_cache:
-            return self._verdict_cache[cache_key]
+        if bar_ts > 0:
+            cached = self._get_cached_verdict(cache_key)
+            if cached is not None:
+                return cached
 
         decision = self._evaluate_sync_impl(ctx)
         if bar_ts > 0:
-            self._verdict_cache[cache_key] = decision
+            self._set_cached_verdict(cache_key, decision)
         return decision
 
     def _evaluate_sync_impl(self, ctx: CandidateSetupAuditContext) -> AIVetoDecision:
@@ -1697,12 +1736,14 @@ class AIVetoCommittee:
         bar_ts = int(ctx.bar_timestamp)
         side_str = ctx.side.value if hasattr(ctx.side, "value") else str(ctx.side).upper()
         cache_key = (ctx.symbol.upper(), side_str, ctx.timeframe.upper(), bar_ts)
-        if bar_ts > 0 and cache_key in self._verdict_cache:
-            return self._verdict_cache[cache_key]
+        if bar_ts > 0:
+            cached = self._get_cached_verdict(cache_key)
+            if cached is not None:
+                return cached
 
         decision = await self._evaluate_async_impl(ctx)
         if bar_ts > 0:
-            self._verdict_cache[cache_key] = decision
+            self._set_cached_verdict(cache_key, decision)
         return decision
 
     async def _evaluate_async_impl(self, ctx: CandidateSetupAuditContext) -> AIVetoDecision:

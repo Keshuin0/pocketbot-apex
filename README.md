@@ -148,10 +148,10 @@ flowchart TD
 | **Friction Control** | Fixed spread filter | VWAP Depth Slippage Model + Liquidity Wall Detection |
 | **Monte Carlo Engine** | Deterministic 2R Expectancy Model | 10,000-Path Stationary Block-Bootstrap Time Machine v2 |
 | **Portfolio Shield** | Fixed 0.5% ($50) risk cap | Expanded Correlation Shield (251-symbol factor exposure cap) |
-| **AI Risk Committee** | None ($0 token cost) | 3-Tier Waterfall + Apex Aegis 7-Shield Z3 SMT Firewall + Circadian Sleep-Wake Consolidation |
-| **Telemetry & UI** | Console logging & command-line stats | WebSocket Chrome App Cockpit (`v2.4`) + Rich TUI + 100x Replay + Telegram Remote |
-| **Database & Ledger** | JSON flat files (`orders.json`) | SQLite Auto-Quarantine Ledger (`WalkForwardLedgerDB`) |
-| **Portability** | 1-Click portable `.bat` launchers | 1-Click portable `.bat` launchers + USB ready |
+| **AI Risk Committee** | None ($0 token cost) | 3-Tier Waterfall + Apex Aegis 8-Shield Z3 SMT Firewall + Circadian Sleep-Wake Consolidation |
+| **Telemetry & UI** | Console logging & command-line stats | Hardened WebSocket Chrome App Cockpit (`v3.2.0 OMEGA`) + Adaptive Rich TUI + Causal Replay + Telegram Remote |
+| **Database & Ledger** | JSON flat files (`orders.json`) | Thread-Safe SQLite WAL Auto-Quarantine Ledger (`WalkForwardLedgerDB`) |
+| **Portability** | 1-Click portable `.bat` launchers | 1-Click portable `.bat` launchers + USB ready (config-preserving GitHub updater) |
 
 ---
 
@@ -162,9 +162,9 @@ You do **not** need any coding experience to use PocketBot Apex.
 1. **Download the Release:**
    Download `PocketBot_Apex_v2_Portable_Windows.zip` from [GitHub Releases](https://github.com/Keshuin0/pocketbot-apex/releases) and extract it anywhere on your computer (or USB pendrive).
 2. **Run First-Time Setup:**
-   Open the folder and double-click `0_FIRST_TIME_SETUP.bat`. It automatically verifies your system, installs 64-bit Python 3.12, creates a local `.venv`, installs all quantitative libraries (including `z3-solver` and `aiohttp`), runs 72 automated verification tests, and checks your MT5 connection.
+   Open the folder and double-click `0_FIRST_TIME_SETUP.bat`. It automatically verifies your system, installs 64-bit Python 3.12, creates a local `.venv`, installs all quantitative libraries (including `z3-solver` and `aiohttp`), runs all **119** automated verification tests (`test_phase20_omega_v3_2_full_consolidation.py`), and checks your MT5 connection.
 3. **Start Autonomous Trading, Web Cockpit, or Live Drill:**
-   Double-click `2_START_APEX_AUTO_DEMO.bat` for hands-free autonomous trading + Chrome App Cockpit, `4_APEX_LIVE_DASHBOARD.bat` to launch the live `v2.4` WebSocket Chrome App Cockpit + 100x Historical Replay, `8_REFRESH_AI_BRAIN.bat` for 1-click Circadian Sleep-Wake Consolidation, or `9_TEST_FULL_LIFECYCLE_NOW.bat` for a 60s live `0.01`-lot MT5 Demo lifecycle drill!
+   Double-click `2_START_APEX_AUTO_DEMO.bat` for hands-free autonomous trading + Chrome App Cockpit (`v3.2.0 OMEGA`), `4_APEX_LIVE_DASHBOARD.bat` to launch the WebSocket Chrome App Cockpit + Causal Historical Replay, `8_REFRESH_AI_BRAIN.bat` for 1-click Circadian Sleep-Wake Consolidation, or `9_TEST_FULL_LIFECYCLE_NOW.bat` for a 60s live `0.01`-lot MT5 Demo lifecycle drill!
 
 ---
 

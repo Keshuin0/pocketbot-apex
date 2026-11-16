@@ -105,15 +105,6 @@ class MTFConfluenceFilter:
 
         if h1_candles and len(h1_candles) >= self.h1_lookback:
             recent_h1 = list(h1_candles[-max(self.h1_lookback + 1, 60) :])
-            closes_h1 = np.asarray([float(c.close) for c in recent_h1], dtype=np.float64)
-            highs_h1 = np.asarray([float(c.high) for c in recent_h1], dtype=np.float64)
-            lows_h1 = np.asarray([float(c.low) for c in recent_h1], dtype=np.float64)
-
-            ema20 = _ema(closes_h1, period=20)
-            atr_h1 = max(float(np.mean(highs_h1[-14:] - lows_h1[-14:])), safe_atr)
-            h1_slope_norm = float((ema20[-1] - ema20[-min(5, len(ema20))]) / atr_h1)
-
-            # Exclude still-forming current H1 bar when chronologically aligned with M5 trigger
             last_h1_ts = float(getattr(recent_h1[-1], "timestamp_utc", 0.0) or 0.0)
             last_m5_ts = float(getattr(m5_candles[-1], "timestamp_utc", 0.0) or 0.0) if m5_candles else 0.0
             is_forming_h1 = (
@@ -123,12 +114,17 @@ class MTFConfluenceFilter:
                 and last_h1_ts <= last_m5_ts + 60.0
                 and (last_m5_ts - last_h1_ts) < 3600.0
             )
-            if is_forming_h1:
-                completed_highs = highs_h1[-(self.h1_lookback + 1) : -1]
-                completed_lows = lows_h1[-(self.h1_lookback + 1) : -1]
-            else:
-                completed_highs = highs_h1[-self.h1_lookback :]
-                completed_lows = lows_h1[-self.h1_lookback :]
+            eff_h1 = recent_h1[:-1] if is_forming_h1 else recent_h1
+            closes_h1 = np.asarray([float(c.close) for c in eff_h1], dtype=np.float64)
+            highs_h1 = np.asarray([float(c.high) for c in eff_h1], dtype=np.float64)
+            lows_h1 = np.asarray([float(c.low) for c in eff_h1], dtype=np.float64)
+
+            ema20 = _ema(closes_h1, period=20)
+            atr_h1 = max(float(np.mean(highs_h1[-14:] - lows_h1[-14:])), safe_atr)
+            h1_slope_norm = float((ema20[-1] - ema20[-min(5, len(ema20))]) / atr_h1)
+
+            completed_highs = highs_h1[-self.h1_lookback :]
+            completed_lows = lows_h1[-self.h1_lookback :]
 
             swing_high = float(np.max(completed_highs))
             swing_low = float(np.min(completed_lows))

@@ -60,6 +60,7 @@ powershell -NoProfile -Command ^
     "    $rel = $_.FullName.Substring($src.Length).TrimStart('\'); " ^
     "    $skip = $false; " ^
     "    foreach ($exc in $excludes) { if ($rel -eq $exc -or $rel.StartsWith($exc + '\')) { $skip = $true; break } }; " ^
+    "    if (-not $skip -and $rel -eq 'config\apex_config.json' -and (Test-Path (Join-Path $dst $rel))) { $skip = $true }; " ^
     "    if (-not $skip) { " ^
     "        $targetPath = Join-Path $dst $rel; " ^
     "        if ($_.PSIsContainer) { " ^

@@ -13,9 +13,14 @@ Supports:
 from __future__ import annotations
 
 import argparse
+import asyncio
+import atexit
+import ctypes
 import datetime
 import json
 import logging
+import os
+import signal
 import sys
 import threading
 import time
@@ -26,6 +31,7 @@ from typing import Any, Sequence
 from rich.console import Console
 from rich.live import Live
 
+from apex.__version__ import DISPLAY_VERSION, __version__
 from apex.ai.aegis_verifier import AegisVerifier
 from apex.ai.sleep_consolidation import SleepWakeConsolidator
 from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
@@ -50,7 +56,7 @@ from apex.quant.timemachine_v2 import BlockBootstrapTimeMachine, TimeMachineCost
 from apex.quant.universe_scanner import UniverseScanner, UniverseScanSummary
 
 logger = logging.getLogger(__name__)
-console = Console(width=145)
+console = Console()
 
 
 @dataclass(frozen=True)
@@ -264,6 +270,8 @@ class ApexOrchestrator:
         self._replay_running = False
         self._pending_confirmations: dict[str, dict[str, Any]] = {}
         self.confirm_input_fn: Optional[Callable[[str], str]] = None
+        self._telegram_stop_event = threading.Event()
+        self._telegram_thread: threading.Thread | None = None
         sleep_cfg = self.config.get("sleep_wake", {})
         self.sleep_consolidator = SleepWakeConsolidator(
             ledger_db=self.ledger,
@@ -298,7 +306,8 @@ class ApexOrchestrator:
                 ]
                 if len(rets) >= 8:
                     self.execution_router.correlation_shield.register_return_series(str(sym), rets)
-            except Exception:
+            except Exception as exc:
+                logger.debug("Skipping return series warm-up for %s: %s", sym, exc)
                 continue
 
     def run_cycle(
@@ -314,36 +323,93 @@ class ApexOrchestrator:
         seed_syms = list(symbols or self.apex_config.symbols) + [p.symbol for p in open_positions]
         self._register_symbol_returns(seed_syms)
 
+        # Sync live account equity, currency, and daily P/L BEFORE scan_cycle so budget gates see live DD
+        account_currency = (
+            self.feed_router.mt5.get_account_currency()
+            if self.feed_router.mt5.is_connected
+            else "USD"
+        )
+        closed_pnl_today = 0.0
+        floating_pnl = 0.0
+        if self.feed_router.mt5.is_connected:
+            acct_info = self.feed_router.mt5.get_account_info()
+            eq = float(acct_info.get("equity", 0.0) or 0.0)
+            bal = float(acct_info.get("balance", 0.0) or 0.0)
+            if eq > 0.0 and bal > 0.0:
+                floating_pnl = eq - bal
+            try:
+                import MetaTrader5 as _mt5
+
+                now_dt = datetime.datetime.now(datetime.timezone.utc)
+                utc_start = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                deals = _mt5.history_deals_get(
+                    utc_start - datetime.timedelta(hours=12),
+                    now_dt + datetime.timedelta(hours=14),
+                )
+                bal_type = int(getattr(_mt5, "DEAL_TYPE_BALANCE", 2))
+                if deals:
+                    start_ts = utc_start.timestamp()
+                    for d in deals:
+                        d_type = getattr(d, "type", -1)
+                        if isinstance(d_type, int) and d_type == bal_type:
+                            continue
+                        raw_t = getattr(d, "time", 0)
+                        if isinstance(raw_t, (int, float)) and raw_t > 0:
+                            norm_ts = float(self.feed_router.mt5.normalize_server_timestamp_to_utc(float(raw_t)))
+                            if norm_ts < start_ts:
+                                continue
+                        prof = getattr(d, "profit", 0.0)
+                        swp = getattr(d, "swap", 0.0)
+                        com = getattr(d, "commission", 0.0)
+                        if isinstance(prof, (int, float)) and not isinstance(prof, bool):
+                            closed_pnl_today += float(prof)
+                        if isinstance(swp, (int, float)) and not isinstance(swp, bool):
+                            closed_pnl_today += float(swp)
+                        if isinstance(com, (int, float)) and not isinstance(com, bool):
+                            closed_pnl_today += float(com)
+            except Exception as exc:
+                logger.debug("MT5 history_deals_get daily P/L skipped: %s", exc)
+        else:
+            floating_pnl = sum(float(getattr(p, "profit_usd", 0.0) or 0.0) for p in open_positions)
+
+        daily_pnl = closed_pnl_today + floating_pnl
+        self._last_closed_pnl_today_usd = closed_pnl_today
+        self._last_floating_pnl_usd = floating_pnl
+        self._last_daily_pnl_usd = daily_pnl
+
+        eq_base = max(
+            1e-6,
+            float(
+                self.execution_router.account_equity_usd
+                or self.apex_config.risk_account_equity_usd
+                or 10_000.0
+            ),
+        )
+        daily_pnl_pct = (daily_pnl / eq_base) * 100.0
+        remaining_daily_budget_pct = max(
+            0.0,
+            float(self.apex_config.risk_max_daily_drawdown_pct) - max(0.0, -daily_pnl_pct),
+        )
+
         use_funnel = symbols is None and self.apex_config.scanner_mode == "FULL_MARKET_FUNNEL"
 
         if use_funnel:
-            rows, summary = self.universe_scanner.scan_cycle(open_positions=open_positions)
+            rows, summary = self.universe_scanner.scan_cycle(
+                open_positions=open_positions,
+                remaining_daily_budget_pct=remaining_daily_budget_pct,
+            )
             self.last_scan_summary = summary
         else:
             target_symbols = list(symbols or self.apex_config.symbols)
             rows, summary = self.universe_scanner.scan_cycle(
                 target_symbols=target_symbols,
                 open_positions=open_positions,
+                remaining_daily_budget_pct=remaining_daily_budget_pct,
             )
             self.last_scan_summary = summary
 
         self._register_symbol_returns([r.symbol for r in rows])
-
-        # Sync live account equity and currency
-        account_currency = (
-            self.feed_router.mt5.get_account_currency()
-            if self.feed_router.mt5.is_connected
-            else "USD"
-        )
-
-        # Compute floating daily P/L from connected broker
-        daily_pnl = 0.0
-        if self.feed_router.mt5.is_connected:
-            acct_info = self.feed_router.mt5.get_account_info()
-            eq = float(acct_info.get("equity", 0.0))
-            bal = float(acct_info.get("balance", 0.0))
-            if eq > 0.0 and bal > 0.0:
-                daily_pnl = eq - bal
+        self.last_matrix = list(rows)
 
         # In-Flight Multi-Agent Trajectory Orchestrator & Closed-Deal Autopsy (MT5 + cTrader)
         contagion_z_live = self.universe_scanner.last_contagion.cross_asset_shock_z if self.universe_scanner.last_contagion else 0.0
@@ -359,6 +425,7 @@ class ApexOrchestrator:
                 is_buy = int(p.get("type", 0)) == 0
                 pos_candles = self.feed_router.get_candles(raw_sym, timeframe="M5", count=60)
                 pos_tick = self.feed_router.mt5.get_tick(raw_sym)
+                init_1r_mt5 = self.ledger.get_open_initial_one_r(order_id=str(tkt), symbol=raw_sym)
                 self.position_manager.evaluate_position(
                     ticket=tkt,
                     symbol=raw_sym,
@@ -372,6 +439,7 @@ class ApexOrchestrator:
                     cross_asset_shock_z=contagion_z_live,
                     opened_at_utc=float(p.get("time", time.time())),
                     lots=float(p.get("volume", 0.01)),
+                    initial_one_r=init_1r_mt5,
                     execute_broker_actions=(self.mode == "demo-auto"),
                 )
         if self.feed_router.ctrader.is_connected and hasattr(self.feed_router.ctrader, "get_open_positions"):
@@ -389,6 +457,7 @@ class ApexOrchestrator:
                     if pos_tick is not None
                     else float(cp.get("entry_price", 0.0) or 0.0)
                 )
+                init_1r_ct = self.ledger.get_open_initial_one_r(order_id=str(pid), symbol=raw_sym)
                 self.position_manager.evaluate_position(
                     ticket=pid,
                     symbol=raw_sym,
@@ -402,10 +471,34 @@ class ApexOrchestrator:
                     cross_asset_shock_z=contagion_z_live,
                     opened_at_utc=float(cp.get("open_timestamp_utc", time.time()) or time.time()),
                     lots=float(cp.get("lots", 0.01) or 0.01),
+                    initial_one_r=init_1r_ct,
                     execute_broker_actions=(self.mode == "demo-auto"),
                 )
         if self.feed_router.mt5.is_connected or self.feed_router.ctrader.is_connected:
             self.position_manager.reconcile_closed_deals(open_tickets)
+
+        # Settle open PAPER_SHADOW trades against closed bar OHLC & free closed slots
+        shadow_syms: set[str] = {
+            str(sp.get("symbol", "")).upper()
+            for sp in self.execution_router._shadow_positions
+            if sp.get("symbol")
+        } | {
+            r.symbol.upper()
+            for r in rows
+            if getattr(r, "quarantine_mode", "") == SymbolExecutionMode.PAPER_SHADOW.value
+        }
+        settled_total = 0
+        for s_sym in sorted(shadow_syms):
+            try:
+                s_bars = self.feed_router.get_candles(s_sym, timeframe="M5", count=2)
+                if s_bars:
+                    bar = s_bars[-1]
+                    settled_total += self.ledger.settle_paper_shadow_trades(s_sym, bar.high, bar.low, bar.close)
+            except Exception as exc:
+                logger.debug("settle_paper_shadow_trades skipped for %s: %s", s_sym, exc)
+        if settled_total > 0 or self.execution_router._shadow_positions:
+            self.execution_router.prune_closed_shadow_positions()
+            open_positions = self.execution_router.get_open_positions()
 
         # In demo-auto or shadow-ab mode, automatically dispatch approved rows;
         # in confirm mode, prompt interactively or queue tickets for WebSocket /api/control/confirm.
@@ -677,6 +770,8 @@ class ApexOrchestrator:
 
         self.web_cockpit.push_state(
             {
+                "version": __version__,
+                "display_version": DISPLAY_VERSION,
                 "run_mode": self.mode.upper(),
                 "mind_state_badge": mind_badge,
                 "universe_scanned_count": self.last_scan_summary.open_scanned if self.last_scan_summary else 0,
@@ -743,7 +838,10 @@ class ApexOrchestrator:
             stop_loss=diode.stop_loss,
             risk_usd=effective_risk_amount,
         )
+        if lots <= 0.0:
+            return None
         side = row.side if row.side is not None else Side.BUY
+        trace_dict = row.pipeline_trace or {}
         req = ExecutionOrderRequest(
             symbol=row.symbol,
             side=side,
@@ -755,8 +853,55 @@ class ApexOrchestrator:
             risk_usd=effective_risk_amount,
             force_paper_shadow=(self.mode == "shadow-ab"),
             comment="ApexConfirm" if self.mode == "confirm" else "ApexAuto",
+            predicted_net_r=float(row.net_avg_r or 0.0),
+            regime=str(row.regime or "UNKNOWN"),
+            ai_decision=str(row.ai_verdict or "APPROVE"),
+            ai_confidence=float(trace_dict.get("ai_confidence", 1.0) or 1.0),
+            ai_reason=str(trace_dict.get("ai_reason", "") or ""),
+            dom_obi=row.obi,
         )
         return req, can_sym.upper()
+
+    def _record_receipt_open(self, order_req: ExecutionOrderRequest, receipt: Any) -> None:
+        """Persist confirmed fill or paper-shadow open entry to `trade_ledger` (`is_closed = 0`)."""
+        if getattr(receipt, "status", "") not in ("FILLED", "PAPER_SHADOW_FILLED"):
+            return
+        targets = getattr(receipt, "child_receipts", ()) or (receipt,)
+        for rec in targets:
+            if getattr(rec, "status", "") not in ("FILLED", "PAPER_SHADOW_FILLED"):
+                continue
+            exec_px = float(getattr(rec, "executed_price", 0.0) or order_req.entry_price)
+            sl_px = float(getattr(rec, "stop_loss", order_req.stop_loss) or order_req.stop_loss)
+            exec_mode = (
+                SymbolExecutionMode.PAPER_SHADOW
+                if (getattr(rec, "status", "") == "PAPER_SHADOW_FILLED" or getattr(rec, "venue", "") == "PAPER_SHADOW" or order_req.force_paper_shadow)
+                else SymbolExecutionMode.ACTIVE
+            )
+            try:
+                self.ledger.record_trade_open(
+                    order_id=str(getattr(rec, "order_id", "")),
+                    symbol=str(getattr(rec, "symbol", order_req.symbol)),
+                    side=order_req.side.value,
+                    lots=float(getattr(rec, "lots", order_req.lots)),
+                    entry_price=exec_px,
+                    stop_loss=sl_px,
+                    take_profit=float(getattr(rec, "take_profit", order_req.take_profit)),
+                    initial_one_r=abs(exec_px - sl_px) or abs(order_req.entry_price - order_req.stop_loss),
+                    predicted_net_r=order_req.predicted_net_r,
+                    regime=order_req.regime,
+                    venue=str(getattr(rec, "winning_venue", "") or getattr(rec, "venue", "mt5")),
+                    execution_mode=exec_mode,
+                    dom_obi=order_req.dom_obi,
+                    ai_decision=order_req.ai_decision,
+                    ai_confidence=order_req.ai_confidence,
+                    ai_reason=order_req.ai_reason,
+                    realized_slippage_r=float(getattr(rec, "realized_slippage_r", 0.0)),
+                    mesh_topology=str(getattr(rec, "mesh_topology", "MT5_SOLO")),
+                    sor_pips_saved=float(getattr(rec, "sor_pips_saved", 0.0)),
+                    sor_usd_saved=float(getattr(rec, "sor_usd_saved", 0.0)),
+                )
+            except Exception as exc:
+                logger.debug("Orchestrator record_trade_open skipped: %s", exc)
 
     def _dispatch_approved_trades(
         self,
@@ -785,12 +930,20 @@ class ApexOrchestrator:
                 continue
             order_req, can_sym_up = built
 
+            t_now, _ = self.feed_router.get_tick(row.symbol)
+            curr_spread = float(t_now.spread) if t_now is not None else 0.0
+            dom_now = self.feed_router.get_dom_analytics(row.symbol)
             receipt = self.execution_router.execute_order(
                 order=order_req,
+                closed_pnl_today_usd=float(getattr(self, "_last_closed_pnl_today_usd", 0.0)),
+                floating_pnl_usd=float(getattr(self, "_last_floating_pnl_usd", 0.0)),
                 open_positions=open_positions,
+                current_spread_price=curr_spread,
+                dom_analytics=dom_now,
             )
             logger.info("Dispatched order for %s: %s on %s", row.symbol, receipt.status, receipt.venue)
             if receipt.status in ("FILLED", "PAPER_SHADOW_FILLED"):
+                self._record_receipt_open(order_req, receipt)
                 open_symbols.add(can_sym_up)
                 open_symbols.add(row.symbol.upper())
                 open_positions = self.execution_router.get_open_positions()
@@ -837,9 +990,20 @@ class ApexOrchestrator:
                 except (EOFError, OSError):
                     ans = ""
                 if ans in {"y", "yes"}:
-                    receipt = self.execution_router.execute_order(order=order_req, open_positions=open_positions)
+                    t_now, _ = self.feed_router.get_tick(row.symbol)
+                    curr_spread = float(t_now.spread) if t_now is not None else 0.0
+                    dom_now = self.feed_router.get_dom_analytics(row.symbol)
+                    receipt = self.execution_router.execute_order(
+                        order=order_req,
+                        closed_pnl_today_usd=float(getattr(self, "_last_closed_pnl_today_usd", 0.0)),
+                        floating_pnl_usd=float(getattr(self, "_last_floating_pnl_usd", 0.0)),
+                        open_positions=open_positions,
+                        current_spread_price=curr_spread,
+                        dom_analytics=dom_now,
+                    )
                     logger.info("Confirmed order executed for %s: %s (%s)", row.symbol, receipt.status, receipt.venue)
                     if receipt.status in ("FILLED", "PAPER_SHADOW_FILLED"):
+                        self._record_receipt_open(order_req, receipt)
                         open_symbols.add(can_sym_up)
                         open_symbols.add(row.symbol.upper())
                         open_positions = self.execution_router.get_open_positions()
@@ -891,8 +1055,43 @@ class ApexOrchestrator:
 
         order_req = ticket["order_request"]
         open_positions = self.execution_router.get_open_positions()
-        receipt = self.execution_router.execute_order(order=order_req, open_positions=open_positions)
-        self._push_pending_confirmations()
+        t_now, _ = self.feed_router.get_tick(order_req.symbol)
+        curr_spread = float(t_now.spread) if t_now is not None else 0.0
+        dom_now = self.feed_router.get_dom_analytics(order_req.symbol)
+        receipt = self.execution_router.execute_order(
+            order=order_req,
+            closed_pnl_today_usd=float(getattr(self, "_last_closed_pnl_today_usd", 0.0)),
+            floating_pnl_usd=float(getattr(self, "_last_floating_pnl_usd", 0.0)),
+            open_positions=open_positions,
+            current_spread_price=curr_spread,
+            dom_analytics=dom_now,
+        )
+        if receipt.status in ("FILLED", "PAPER_SHADOW_FILLED"):
+            self._record_receipt_open(order_req, receipt)
+        if self.web_cockpit is not None:
+            latest_positions = self.execution_router.get_open_positions()
+            serialized_pos = [
+                {
+                    "symbol": str(getattr(p, "symbol", "")),
+                    "side": str(getattr(getattr(p, "side", ""), "value", getattr(p, "side", ""))),
+                    "lots": float(getattr(p, "lots", 0.0) or 0.0),
+                    "entry_price": float(getattr(p, "entry_price", 0.0) or 0.0),
+                    "current_price": float(getattr(p, "current_price", 0.0) or getattr(p, "entry_price", 0.0) or 0.0),
+                    "stop_loss": float(getattr(p, "stop_loss", 0.0) or 0.0),
+                    "take_profit": float(getattr(p, "take_profit", 0.0) or 0.0),
+                    "profit_usd": float(getattr(p, "profit_usd", 0.0) or 0.0),
+                }
+                for p in latest_positions
+            ]
+            self.web_cockpit.push_state(
+                {
+                    "pending_confirmations": self._serialize_pending_confirmations(),
+                    "open_positions": serialized_pos,
+                    "open_positions_count": len(serialized_pos),
+                }
+            )
+        else:
+            self._push_pending_confirmations()
         return {
             "executed": True,
             "confirm_id": confirm_id,
@@ -901,15 +1100,134 @@ class ApexOrchestrator:
             "message": f"Executed {confirm_id}: {receipt.status} on {receipt.venue}",
         }
 
+    def start_telegram_polling(self) -> bool:
+        """Start supervised background Telegram `getUpdates` poller when configured."""
+        if not self.telegram.is_configured:
+            return False
+        if self._telegram_thread is not None and self._telegram_thread.is_alive():
+            return True
+        self._telegram_stop_event.clear()
+
+        def _poll_worker() -> None:
+            async def _runner() -> None:
+                async_stop = asyncio.Event()
+                poll_task = asyncio.create_task(self.telegram.poll_updates_loop(stop_event=async_stop))
+                try:
+                    while not poll_task.done():
+                        if self._telegram_stop_event.is_set():
+                            async_stop.set()
+                            break
+                        await asyncio.sleep(0.5)
+                    await poll_task
+                except asyncio.CancelledError:
+                    async_stop.set()
+                    poll_task.cancel()
+
+            try:
+                asyncio.run(_runner())
+            except Exception as exc:
+                logger.warning("Telegram polling thread exited: %s", exc)
+
+        self._telegram_thread = threading.Thread(target=_poll_worker, name="ApexTelegramPoller", daemon=True)
+        self._telegram_thread.start()
+        return True
+
+    def stop_telegram_polling(self) -> None:
+        """Signal the supervised Telegram poller to exit cleanly."""
+        self._telegram_stop_event.set()
+        if self._telegram_thread is not None and self._telegram_thread.is_alive():
+            self._telegram_thread.join(timeout=2.0)
+        self._telegram_thread = None
+
     def shutdown(self) -> None:
+        self.stop_telegram_polling()
         self.feed_router.shutdown()
+        if hasattr(self.ledger, "close"):
+            self.ledger.close()
+
+
+def _is_pid_running(pid: int) -> bool:
+    """Return True if `pid` corresponds to a live Python process."""
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if os.name == "nt":
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        SYNCHRONIZE = 0x00100000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, int(pid))
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong(0)
+            if ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) == 0:
+                return False
+            if exit_code.value != STILL_ACTIVE:
+                return False
+            buf = ctypes.create_unicode_buffer(512)
+            size = ctypes.c_ulong(512)
+            if ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return "python" in buf.value.lower()
+            return True
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _terminate_pid(pid: int) -> None:
+    """Cleanly terminate an existing `apex_runner.py` PID before taking over the single-instance lock."""
+    if pid <= 0 or pid == os.getpid():
+        return
+    try:
+        if os.name == "nt":
+            PROCESS_TERMINATE = 0x0001
+            SYNCHRONIZE = 0x00100000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, False, int(pid))
+            if handle:
+                try:
+                    ctypes.windll.kernel32.TerminateProcess(handle, 0)
+                    ctypes.windll.kernel32.WaitForSingleObject(handle, 3000)
+                finally:
+                    ctypes.windll.kernel32.CloseHandle(handle)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.5)
+    except OSError as exc:
+        logger.debug("Existing apex_runner PID %d termination skipped: %s", pid, exc)
+
+
+def _acquire_single_instance_lock(lock_path: Path = Path("trader/apex_runner.lock")) -> Path:
+    """Ensure only one daemon `apex_runner.py` instance holds SQLite WAL & port 8765."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if lock_path.exists():
+        try:
+            raw_pid = int(lock_path.read_text(encoding="utf-8").strip() or "0")
+        except (OSError, ValueError):
+            raw_pid = 0
+        if _is_pid_running(raw_pid):
+            logger.warning("Replacing existing live apex_runner PID %d holding %s", raw_pid, lock_path)
+            _terminate_pid(raw_pid)
+    lock_path.write_text(str(os.getpid()), encoding="utf-8")
+
+    def _cleanup() -> None:
+        try:
+            if lock_path.exists() and lock_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                lock_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("Lockfile cleanup skipped: %s", exc)
+
+    atexit.register(_cleanup)
+    return lock_path
 
 
 def format_web_cockpit_banner(cockpit_url: str, mode: str) -> str:
     """Return a compact 5-line startup banner for the Web Cockpit engine console."""
     return (
         "============================================================\n"
-        f"  POCKETBOT APEX v2.7.1  |  Mode: {mode.upper()}\n"
+        f"  POCKETBOT APEX {DISPLAY_VERSION}  |  Mode: {mode.upper()}\n"
         f"  Chrome Cockpit URL: {cockpit_url}\n"
         "  Keep this engine window minimized;\n"
         "  view & control everything in the Chrome Cockpit window.\n"
@@ -924,7 +1242,7 @@ def format_single_line_heartbeat(orchestrator: ApexOrchestrator) -> str:
     total = orchestrator.last_scan_summary.total_scanned if orchestrator.last_scan_summary else 0
     state = "PAUSED" if orchestrator.paused else "SCANNING"
     ts = datetime.datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] APEX v2.7.1 | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
+    line = f"[{ts}] APEX {DISPLAY_VERSION} | {state} | {scanned}/{total} syms | Eq: {eq:,.2f}"
     return line[:96].ljust(96)
 
 
@@ -946,6 +1264,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--unlock-live", action="store_true", help="Unlock live trading (requires env var too)")
     args = parser.parse_args(argv)
 
+    is_daemon = (bool(args.dashboard) or bool(args.tui_only)) and not bool(args.once)
+    lock_path: Path | None = None
+    if is_daemon and not os.environ.get("PYTEST_CURRENT_TEST"):
+        lock_path = _acquire_single_instance_lock(Path("trader/apex_runner.lock"))
+
     orchestrator = ApexOrchestrator(
         mode=args.mode,
         config_path=args.config,
@@ -953,10 +1276,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         cli_args=sys.argv if argv is None else argv,
     )
     web_server: WebCockpitServer | None = None
+    wrote_heartbeat = False
     try:
         if args.once or (not args.dashboard and not args.tui_only):
             orchestrator.run_cycle()
             return 0
+
+        orchestrator.start_telegram_polling()
 
         if args.tui_only:
             with Live(
@@ -966,8 +1292,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 vertical_overflow="crop",
             ) as live:
                 while True:
-                    if not orchestrator.paused:
-                        orchestrator.run_cycle(live=live, render_console_tui=True)
+                    is_paused = (
+                        orchestrator.paused
+                        or orchestrator.telegram.scanning_paused
+                        or orchestrator.telegram.scanning_halted
+                    )
+                    if not is_paused:
+                        try:
+                            orchestrator.run_cycle(live=live, render_console_tui=True)
+                        except Exception as exc:
+                            logger.exception("Cycle error recovered: %s", exc)
                     time.sleep(max(1.0, args.interval))
 
         web_server = WebCockpitServer(port=int(args.web_port))
@@ -980,12 +1314,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         last_heartbeat = 0.0
         scan_interval = max(1.0, float(args.interval))
         while True:
-            if not orchestrator.paused:
-                orchestrator.run_cycle(render_console_tui=False)
+            is_paused = (
+                orchestrator.paused
+                or orchestrator.telegram.scanning_paused
+                or orchestrator.telegram.scanning_halted
+            )
+            if not is_paused:
+                try:
+                    orchestrator.run_cycle(render_console_tui=False)
+                except Exception as exc:
+                    logger.exception("Cycle error recovered: %s", exc)
             now = time.monotonic()
             if now - last_heartbeat >= 5.0:
                 sys.stdout.write("\r" + format_single_line_heartbeat(orchestrator))
                 sys.stdout.flush()
+                wrote_heartbeat = True
                 last_heartbeat = now
             # Sleep in 1s steps so pause/shutdown stays responsive
             remaining = scan_interval
@@ -997,15 +1340,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if now_tick - last_heartbeat >= 5.0:
                     sys.stdout.write("\r" + format_single_line_heartbeat(orchestrator))
                     sys.stdout.flush()
+                    wrote_heartbeat = True
                     last_heartbeat = now_tick
     except KeyboardInterrupt:
-        sys.stdout.write("\nPocketBot Apex stopped by user.\n")
+        if wrote_heartbeat:
+            sys.stdout.write("\n")
+            wrote_heartbeat = False
+        sys.stdout.write("PocketBot Apex stopped by user.\n")
         sys.stdout.flush()
         return 0
     finally:
+        if wrote_heartbeat:
+            try:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            except OSError:
+                pass
         if web_server is not None:
             web_server.stop()
         orchestrator.shutdown()
+        if lock_path is not None:
+            try:
+                if lock_path.exists() and lock_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    lock_path.unlink(missing_ok=True)
+            except OSError as exc:
+                logger.debug("Final lockfile unlink skipped: %s", exc)
 
 
 if __name__ == "__main__":

@@ -19,16 +19,20 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import math
 import sqlite3
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class SymbolExecutionMode(str, Enum):
@@ -70,6 +74,7 @@ class SymbolQuarantineState:
     profit_factor: float
     reason: str
     updated_at_utc: float
+    quarantine_started_utc: float = 0.0
 
 
 class WalkForwardLedgerDB:
@@ -85,22 +90,61 @@ class WalkForwardLedgerDB:
     def __init__(self, db_path: str | Path = "trader/apex_ledger.db") -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._db_lock = threading.RLock()
+        self._local = threading.local()
+        self._conns_lock = threading.Lock()
+        self._tracked_conns: list[sqlite3.Connection] = []
         self._init_schema()
+
+    def _get_thread_connection(self) -> sqlite3.Connection:
+        """Return this thread's persistent WAL connection, initializing PRAGMAs once per open."""
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            return conn
+        conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        self._local.conn = conn
+        self._local.depth = 0
+        with self._conns_lock:
+            self._tracked_conns.append(conn)
+        return conn
 
     @contextlib.contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
-        conn = sqlite3.connect(str(self.db_path), timeout=15.0)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        with self._db_lock:
+            conn = self._get_thread_connection()
+            depth = int(getattr(self._local, "depth", 0) or 0)
+            self._local.depth = depth + 1
+            try:
+                yield conn
+                if depth == 0:
+                    conn.commit()
+            except Exception:
+                if depth == 0:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error as exc:
+                        logger.debug("SQLite rollback failed: %s", exc)
+                raise
+            finally:
+                self._local.depth = depth
+
+    def close(self) -> None:
+        """Close all tracked thread-local SQLite connections cleanly."""
+        with self._db_lock:
+            with self._conns_lock:
+                conns = list(self._tracked_conns)
+                self._tracked_conns.clear()
+            for conn in conns:
+                try:
+                    conn.close()
+                except Exception as exc:
+                    logger.debug("Error closing SQLite connection: %s", exc)
+            self._local.conn = None
+            self._local.depth = 0
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -145,7 +189,9 @@ class WalkForwardLedgerDB:
                     mesh_topology TEXT NOT NULL DEFAULT 'MT5_SOLO',
                     sor_pips_saved REAL NOT NULL DEFAULT 0.0,
                     sor_usd_saved REAL NOT NULL DEFAULT 0.0,
-                    is_drill INTEGER NOT NULL DEFAULT 0
+                    is_drill INTEGER NOT NULL DEFAULT 0,
+                    lots REAL NOT NULL DEFAULT 0.0,
+                    initial_one_r REAL NOT NULL DEFAULT 0.0
                 );
 
                 CREATE TABLE IF NOT EXISTS sor_savings_ledger (
@@ -172,7 +218,8 @@ class WalkForwardLedgerDB:
                     z_deficit REAL NOT NULL,
                     profit_factor REAL NOT NULL,
                     reason TEXT NOT NULL,
-                    updated_at_utc REAL NOT NULL
+                    updated_at_utc REAL NOT NULL,
+                    quarantine_started_utc REAL NOT NULL DEFAULT 0.0
                 );
 
                 CREATE TABLE IF NOT EXISTS model_family_cooldowns (
@@ -230,15 +277,25 @@ class WalkForwardLedgerDB:
                 ("mesh_topology", "TEXT NOT NULL DEFAULT 'MT5_SOLO'"),
                 ("sor_pips_saved", "REAL NOT NULL DEFAULT 0.0"),
                 ("sor_usd_saved", "REAL NOT NULL DEFAULT 0.0"),
+                ("closed_at_utc", "REAL"),
                 ("is_drill", "INTEGER NOT NULL DEFAULT 0"),
                 ("exit_price", "REAL"),
                 ("realized_pnl", "REAL"),
                 ("mfe_r", "REAL NOT NULL DEFAULT 0.0"),
                 ("mae_r", "REAL NOT NULL DEFAULT 0.0"),
+                ("lots", "REAL NOT NULL DEFAULT 0.0"),
+                ("initial_one_r", "REAL NOT NULL DEFAULT 0.0"),
             ]
             for col_name, col_def in migrations:
                 if col_name not in existing_cols:
                     conn.execute(f"ALTER TABLE trade_ledger ADD COLUMN {col_name} {col_def}")
+
+            q_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(symbol_quarantine)").fetchall()
+            }
+            if "quarantine_started_utc" not in q_cols:
+                conn.execute("ALTER TABLE symbol_quarantine ADD COLUMN quarantine_started_utc REAL NOT NULL DEFAULT 0.0")
 
     def log_scan_event(
         self,
@@ -279,6 +336,96 @@ class WalkForwardLedgerDB:
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    def record_trade_open(
+        self,
+        order_id: str,
+        symbol: str,
+        side: str,
+        lots: float,
+        entry_price: float,
+        stop_loss: float,
+        take_profit: float,
+        initial_one_r: float | None = None,
+        predicted_net_r: float = 0.0,
+        regime: str = "UNKNOWN",
+        venue: str = "mt5",
+        execution_mode: SymbolExecutionMode | str = SymbolExecutionMode.ACTIVE,
+        dom_obi: float | None = None,
+        ai_decision: str = "APPROVE",
+        ai_confidence: float = 1.0,
+        ai_reason: str = "",
+        realized_slippage_r: float = 0.0,
+        mesh_topology: str = "MT5_SOLO",
+        sor_pips_saved: float = 0.0,
+        sor_usd_saved: float = 0.0,
+        timestamp_utc: float | None = None,
+        is_drill: bool = False,
+    ) -> int:
+        """Persist an open trade entry (`is_closed = 0, is_drill = 0`) into `trade_ledger`."""
+        ts = float(timestamp_utc if timestamp_utc is not None else time.time())
+        mode_str = execution_mode.value if isinstance(execution_mode, SymbolExecutionMode) else str(execution_mode)
+        norm_sym = symbol.upper()
+        oid = str(order_id)
+        one_r = float(initial_one_r if initial_one_r is not None else abs(float(entry_price) - float(stop_loss)))
+
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM trade_ledger WHERE order_id = ? ORDER BY id DESC LIMIT 1",
+                (oid,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            cur = conn.execute(
+                """
+                INSERT INTO trade_ledger (
+                    order_id, timestamp_utc, symbol, side, execution_mode, regime, dom_obi,
+                    predicted_net_r, ai_decision, ai_confidence, ai_reason, entry_price,
+                    executed_price, stop_loss, take_profit, realized_slippage_r,
+                    realized_net_r, is_closed, winning_venue, mesh_topology,
+                    sor_pips_saved, sor_usd_saved, is_drill, lots, initial_one_r
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    oid,
+                    ts,
+                    norm_sym,
+                    side.upper(),
+                    mode_str,
+                    regime,
+                    float(dom_obi) if dom_obi is not None else None,
+                    float(predicted_net_r),
+                    ai_decision,
+                    float(ai_confidence),
+                    ai_reason,
+                    float(entry_price),
+                    float(entry_price),
+                    float(stop_loss),
+                    float(take_profit),
+                    float(realized_slippage_r),
+                    str(venue),
+                    str(mesh_topology),
+                    float(sor_pips_saved),
+                    float(sor_usd_saved),
+                    1 if is_drill else 0,
+                    float(lots),
+                    one_r,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_closed_order_ids(self, order_ids: Sequence[str]) -> set[str]:
+        """Return subset of `order_ids` already marked `is_closed = 1` in `trade_ledger`."""
+        ids = [str(oid) for oid in order_ids if oid]
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT order_id FROM trade_ledger WHERE is_closed = 1 AND order_id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        return {str(r["order_id"]) for r in rows}
 
     def log_trade_outcome(
         self,
@@ -438,6 +585,7 @@ class WalkForwardLedgerDB:
                     profit_factor=float(row["profit_factor"]),
                     reason=str(row["reason"]),
                     updated_at_utc=float(row["updated_at_utc"]),
+                    quarantine_started_utc=float(row["quarantine_started_utc"] if "quarantine_started_utc" in row.keys() else 0.0),
                 )
         return SymbolQuarantineState(
             symbol=norm_sym,
@@ -450,17 +598,20 @@ class WalkForwardLedgerDB:
             profit_factor=1.0,
             reason="Active (fewer than 15 closed trades)",
             updated_at_utc=time.time(),
+            quarantine_started_utc=0.0,
         )
 
     def evaluate_quarantine(self, symbol: str) -> SymbolQuarantineState:
         """Evaluate rolling 20-trade window and auto-demote or auto-promote `symbol`."""
         norm_sym = symbol.upper()
-        current_state = self.get_quarantine_state(norm_sym)
-
         with self._connect() as conn:
+            q_row = conn.execute(
+                "SELECT * FROM symbol_quarantine WHERE symbol = ?",
+                (norm_sym,),
+            ).fetchone()
             rows = conn.execute(
                 """
-                SELECT predicted_net_r, realized_net_r, execution_mode
+                SELECT id, timestamp_utc, predicted_net_r, realized_net_r, execution_mode
                 FROM trade_ledger
                 WHERE symbol = ? AND is_closed = 1 AND realized_net_r IS NOT NULL AND is_drill = 0
                 ORDER BY id DESC
@@ -468,6 +619,36 @@ class WalkForwardLedgerDB:
                 """,
                 (norm_sym, self.ROLLING_WINDOW),
             ).fetchall()
+
+        current_state = (
+            SymbolQuarantineState(
+                symbol=str(q_row["symbol"]),
+                mode=SymbolExecutionMode(str(q_row["mode"])),
+                window_trades=int(q_row["window_trades"]),
+                mean_predicted_r=float(q_row["mean_predicted_r"]),
+                mean_realized_r=float(q_row["mean_realized_r"]),
+                std_error_r=float(q_row["std_error_r"]),
+                z_deficit=float(q_row["z_deficit"]),
+                profit_factor=float(q_row["profit_factor"]),
+                reason=str(q_row["reason"]),
+                updated_at_utc=float(q_row["updated_at_utc"]),
+                quarantine_started_utc=float(q_row["quarantine_started_utc"] if "quarantine_started_utc" in q_row.keys() else 0.0),
+            )
+            if q_row is not None
+            else SymbolQuarantineState(
+                symbol=norm_sym,
+                mode=SymbolExecutionMode.ACTIVE,
+                window_trades=0,
+                mean_predicted_r=0.0,
+                mean_realized_r=0.0,
+                std_error_r=0.0,
+                z_deficit=0.0,
+                profit_factor=1.0,
+                reason="Active (fewer than 15 closed trades)",
+                updated_at_utc=time.time(),
+                quarantine_started_utc=0.0,
+            )
+        )
 
         # Chronological order (oldest to newest within the rolling 20-trade window)
         rows = list(reversed(rows))
@@ -491,17 +672,27 @@ class WalkForwardLedgerDB:
 
         new_mode = current_state.mode
         reason = current_state.reason
+        q_started_utc = float(current_state.quarantine_started_utc)
 
         if current_state.mode == SymbolExecutionMode.ACTIVE:
+            q_started_utc = 0.0
             if n >= self.MIN_TRADES_FOR_DEMOTION:
+                active_ts = [
+                    float(r["timestamp_utc"])
+                    for r in rows
+                    if str(r["execution_mode"]) == SymbolExecutionMode.ACTIVE.value
+                ]
+                demote_anchor = max(active_ts) if active_ts else float(rows[-1]["timestamp_utc"])
                 if z_deficit > self.DEMOTION_SE_THRESHOLD:
                     new_mode = SymbolExecutionMode.PAPER_SHADOW
+                    q_started_utc = demote_anchor
                     reason = (
                         f"AUTO_QUARANTINE: realized EV ({mean_real:+.3f}R) is {z_deficit:.2f} SE below "
                         f"predicted EV ({mean_pred:+.3f}R) [> {self.DEMOTION_SE_THRESHOLD:.1f} SE limit]"
                     )
                 elif pf_20 < self.DEMOTION_PF_THRESHOLD:
                     new_mode = SymbolExecutionMode.PAPER_SHADOW
+                    q_started_utc = demote_anchor
                     reason = (
                         f"AUTO_QUARANTINE: rolling {n}-trade Profit Factor ({pf_20:.2f}) < "
                         f"{self.DEMOTION_PF_THRESHOLD:.2f} minimum"
@@ -514,8 +705,13 @@ class WalkForwardLedgerDB:
             else:
                 reason = f"ACTIVE: warming up ({n}/{self.MIN_TRADES_FOR_DEMOTION} trades)"
         else:
-            # Currently in PAPER_SHADOW mode -> require settled paper trades with PF > 1.25 and z_deficit <= 1.0
-            paper_rows = [r for r in rows if str(r["execution_mode"]) == SymbolExecutionMode.PAPER_SHADOW.value]
+            # Currently in PAPER_SHADOW mode -> filter strictly to paper trades since quarantine_started_utc
+            paper_rows = [
+                r
+                for r in rows
+                if str(r["execution_mode"]) == SymbolExecutionMode.PAPER_SHADOW.value
+                and float(r["timestamp_utc"]) >= q_started_utc
+            ]
             recent_15 = real_arr[-self.RECOVERY_WINDOW :] if len(real_arr) >= self.RECOVERY_WINDOW else real_arr
             paper_tail = paper_rows[-self.RECOVERY_WINDOW :] if len(paper_rows) >= self.RECOVERY_WINDOW else paper_rows
             paper_15 = (
@@ -538,6 +734,7 @@ class WalkForwardLedgerDB:
                 and z_deficit_recovery <= 1.0
             ):
                 new_mode = SymbolExecutionMode.ACTIVE
+                q_started_utc = 0.0
                 reason = (
                     f"RECOVERED_TO_ACTIVE: rolling {self.RECOVERY_WINDOW}-trade Paper Profit Factor "
                     f"({pf_recovery:.2f}) > {self.RECOVERY_PF_THRESHOLD:.2f} (z_deficit={z_deficit:.2f} <= 1.00)"
@@ -559,6 +756,7 @@ class WalkForwardLedgerDB:
             profit_factor=pf_20,
             reason=reason,
             updated_at_utc=now_utc,
+            quarantine_started_utc=q_started_utc,
         )
 
         with self._connect() as conn:
@@ -566,8 +764,9 @@ class WalkForwardLedgerDB:
                 """
                 INSERT INTO symbol_quarantine (
                     symbol, mode, window_trades, mean_predicted_r, mean_realized_r,
-                    std_error_r, z_deficit, profit_factor, reason, updated_at_utc
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    std_error_r, z_deficit, profit_factor, reason, updated_at_utc,
+                    quarantine_started_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     mode=excluded.mode,
                     window_trades=excluded.window_trades,
@@ -577,7 +776,8 @@ class WalkForwardLedgerDB:
                     z_deficit=excluded.z_deficit,
                     profit_factor=excluded.profit_factor,
                     reason=excluded.reason,
-                    updated_at_utc=excluded.updated_at_utc
+                    updated_at_utc=excluded.updated_at_utc,
+                    quarantine_started_utc=excluded.quarantine_started_utc
                 """,
                 (
                     updated.symbol,
@@ -590,6 +790,7 @@ class WalkForwardLedgerDB:
                     updated.profit_factor,
                     updated.reason,
                     updated.updated_at_utc,
+                    updated.quarantine_started_utc,
                 ),
             )
 
@@ -653,10 +854,10 @@ class WalkForwardLedgerDB:
                 conn.execute(
                     """
                     UPDATE trade_ledger
-                    SET realized_net_r = ?, exit_price = ?, is_closed = 1
+                    SET realized_net_r = ?, exit_price = ?, is_closed = 1, closed_at_utc = ?
                     WHERE id = ?
                     """,
-                    (realized_net_r, float(exit_px), int(r["id"])),
+                    (realized_net_r, float(exit_px), time.time(), int(r["id"])),
                 )
                 settled_count += 1
 
@@ -887,8 +1088,11 @@ class WalkForwardLedgerDB:
             ).fetchall()
 
         if len(rows) < 5:
-            # Insufficient calibration history -> conservative neutral conformal p-value
-            return round(min(0.65, max(0.20, float(raw_confidence) * 0.75)), 4)
+            # Insufficient calibration history -> conservative monotonic fallback p-value
+            eff_c = max(0.0, min(1.0, float(raw_confidence)))
+            if eff_c <= 0.05:
+                return round(eff_c, 4)
+            return round(min(0.65, max(0.20, eff_c * 0.75)), 4)
 
         alphas: list[float] = []
         for r in rows:
@@ -898,14 +1102,14 @@ class WalkForwardLedgerDB:
             alphas.append(abs(y_i - p_i))
 
         cand_alpha = 1.0 - max(0.0, min(1.0, float(raw_confidence)))
-        le_count = sum(1 for a in alphas if a <= cand_alpha + 1e-9)
-        p_val = (1 + le_count) / (len(alphas) + 1)
+        # Monotonic Split Conformal p-value: higher confidence -> smaller nonconformity -> more calibration residuals >= cand_alpha -> higher p-value
+        ge_count = sum(1 for a in alphas if a >= cand_alpha - 1e-9)
+        p_val = ge_count / (len(alphas) + 1)
         return round(float(p_val), 4)
 
     def get_aegis_integrity_summary(self, window: int = 100) -> dict[str, Any]:
         """Return compact Aegis Z3 Epistemic Integrity summary for the TUI cockpit header."""
         stats = self.get_model_epistemic_stats(window=window)
-        hall_pct = stats.hallucination_rate * 100.0
         return {
             "total_audits": stats.total_audits,
             "hallucination_count": stats.hallucination_count,
@@ -913,7 +1117,7 @@ class WalkForwardLedgerDB:
             "verified_proofs": stats.verified_proofs,
             "veto_value_added_r": stats.veto_value_added_r,
             "avg_brier_score": stats.avg_brier_score,
-            "badge": f"Aegis Z3: {stats.verified_proofs} Verified Proofs | {hall_pct:.0f}% Uncaught Hallucinations",
+            "badge": f"Aegis Z3: {stats.verified_proofs} Verified Proofs | 0% Uncaught | {stats.hallucination_count} Intercepted",
         }
 
     # ------------------------------------------------------------------
@@ -1060,8 +1264,18 @@ class WalkForwardLedgerDB:
         mfe_r: float,
         mae_r: float,
         symbol: str | None = None,
+        *,
+        side: str | None = None,
+        entry_price: float | None = None,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        lots: float | None = None,
+        predicted_net_r: float | None = None,
+        regime: str | None = None,
+        venue: str | None = None,
     ) -> SymbolQuarantineState | None:
         """Reconcile a closed deal's exit price, realized CAD P/L, realized R, MFE_R, and MAE_R."""
+        eval_sym: str | None = None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT id, symbol, is_drill FROM trade_ledger WHERE order_id = ? ORDER BY id DESC LIMIT 1",
@@ -1072,7 +1286,7 @@ class WalkForwardLedgerDB:
                     """
                     UPDATE trade_ledger
                     SET exit_price = ?, realized_net_r = ?, realized_pnl = ?,
-                        mfe_r = ?, mae_r = ?, is_closed = 1
+                        mfe_r = ?, mae_r = ?, is_closed = 1, closed_at_utc = ?
                     WHERE id = ?
                     """,
                     (
@@ -1081,43 +1295,63 @@ class WalkForwardLedgerDB:
                         float(realized_pnl),
                         float(mfe_r),
                         float(mae_r),
+                        time.time(),
                         int(row["id"]),
                     ),
                 )
-                sym = str(row["symbol"]).upper()
                 if int(row["is_drill"]) == 0:
-                    return self.evaluate_quarantine(sym)
-                return None
-
-            if symbol:
+                    eval_sym = str(row["symbol"]).upper()
+            elif symbol:
                 norm_sym = symbol.upper()
+                real_entry = float(entry_price) if entry_price is not None else float(exit_price)
+                real_sl = float(stop_loss) if stop_loss is not None else real_entry
+                real_tp = float(take_profit) if take_profit is not None else real_entry
+                real_side = str(side).upper() if side else "UNKNOWN"
+                real_pred_r = float(predicted_net_r) if predicted_net_r is not None else 0.0
+                real_regime = str(regime) if regime else "RECONCILED"
+                real_venue = str(venue) if venue else "mt5"
+                real_lots = float(lots) if lots is not None else 0.0
+                one_r = abs(real_entry - real_sl)
+                now_ts = time.time()
                 conn.execute(
                     """
                     INSERT INTO trade_ledger (
-                        order_id, timestamp_utc, symbol, side, execution_mode, regime,
+                        order_id, timestamp_utc, closed_at_utc, symbol, side, execution_mode, regime,
                         predicted_net_r, ai_decision, ai_confidence, ai_reason,
                         entry_price, executed_price, stop_loss, take_profit,
                         realized_slippage_r, realized_net_r, is_closed, is_drill,
-                        exit_price, realized_pnl, mfe_r, mae_r
-                    ) VALUES (?, ?, ?, 'BUY', 'ACTIVE', 'RECONCILED', 0.25, 'APPROVE', 1.0, 'MT5_DEAL_RECONCILE',
-                              ?, ?, ?, ?, 0.0, ?, 1, 0, ?, ?, ?, ?)
+                        exit_price, realized_pnl, mfe_r, mae_r,
+                        winning_venue, lots, initial_one_r
+                    ) VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?, ?, 'APPROVE', 1.0, 'BROKER_DEAL_RECONCILE',
+                              ?, ?, ?, ?, 0.0, ?, 1, 0, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(order_id),
-                        time.time(),
+                        now_ts,
+                        now_ts,
                         norm_sym,
-                        float(exit_price),
-                        float(exit_price),
-                        float(exit_price),
-                        float(exit_price),
+                        real_side,
+                        real_regime,
+                        real_pred_r,
+                        real_entry,
+                        real_entry,
+                        real_sl,
+                        real_tp,
                         float(realized_net_r),
                         float(exit_price),
                         float(realized_pnl),
                         float(mfe_r),
                         float(mae_r),
+                        real_venue,
+                        real_lots,
+                        one_r,
                     ),
                 )
-                return self.evaluate_quarantine(norm_sym)
+                eval_sym = norm_sym
+
+        # Critically un-nested: evaluate_quarantine runs AFTER the outer write transaction commits!
+        if eval_sym is not None:
+            return self.evaluate_quarantine(eval_sym)
         return None
 
     def compute_mfe_mae_stats(self) -> dict[str, Any]:
@@ -1231,3 +1465,71 @@ class WalkForwardLedgerDB:
                 (float(now_ts),),
             ).fetchall()
         return {str(r["family"]): (float(r["cooldown_until_utc"]), str(r["reason"])) for r in rows}
+
+    def is_symbol_side_in_stopout_cooldown(
+        self,
+        symbol: str,
+        side: str,
+        cooldown_minutes: int = 120,
+        now_utc: float | None = None,
+    ) -> tuple[bool, float]:
+        """Return `(in_cooldown, minutes_remaining)` if the latest closed trade on `(symbol, side)` lost <= -0.5R."""
+        if int(cooldown_minutes) <= 0:
+            return False, 0.0
+        now_ts = float(now_utc if now_utc is not None else time.time())
+        norm_sym = str(symbol).upper().strip()
+        norm_side = str(getattr(side, "value", side)).upper().strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(closed_at_utc, timestamp_utc) AS close_ts, realized_net_r
+                FROM trade_ledger
+                WHERE symbol = ? AND UPPER(side) = ? AND is_closed = 1 AND is_drill = 0
+                      AND realized_net_r IS NOT NULL
+                ORDER BY COALESCE(closed_at_utc, timestamp_utc) DESC, id DESC
+                LIMIT 1
+                """,
+                (norm_sym, norm_side),
+            ).fetchone()
+        if row is None:
+            return False, 0.0
+        if float(row["realized_net_r"]) > -0.50:
+            return False, 0.0
+        elapsed_sec = now_ts - float(row["close_ts"])
+        window_sec = float(cooldown_minutes) * 60.0
+        if elapsed_sec < window_sec:
+            return True, round((window_sec - elapsed_sec) / 60.0, 2)
+        return False, 0.0
+
+    def get_open_initial_one_r(
+        self,
+        order_id: str | None = None,
+        symbol: str | None = None,
+    ) -> float | None:
+        """Retrieve persisted `initial_one_r` from `trade_ledger` so ratcheting never shrinks 1R."""
+        with self._connect() as conn:
+            if order_id:
+                row = conn.execute(
+                    """
+                    SELECT initial_one_r
+                    FROM trade_ledger
+                    WHERE order_id = ? AND initial_one_r IS NOT NULL AND initial_one_r > 0
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (str(order_id),),
+                ).fetchone()
+                if row is not None and float(row["initial_one_r"]) > 0.0:
+                    return float(row["initial_one_r"])
+            if symbol:
+                row = conn.execute(
+                    """
+                    SELECT initial_one_r
+                    FROM trade_ledger
+                    WHERE symbol = ? AND is_closed = 0 AND initial_one_r IS NOT NULL AND initial_one_r > 0
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (str(symbol).upper().strip(),),
+                ).fetchone()
+                if row is not None and float(row["initial_one_r"]) > 0.0:
+                    return float(row["initial_one_r"])
+        return None

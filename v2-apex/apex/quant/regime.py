@@ -264,19 +264,40 @@ def compute_adx_series(
     return adx
 
 
+@dataclass(frozen=True, slots=True)
+class HawkesBranchingParameters:
+    """Stationary dual-timescale Hawkes branching parameters (alpha < beta strictly)."""
+
+    alpha_fast: float = 0.35
+    beta_fast: float = 0.65
+    alpha_slow: float = 0.08
+    beta_slow: float = 0.16
+    mu: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.alpha_fast >= self.beta_fast or self.alpha_slow >= self.beta_slow:
+            raise ValueError("Hawkes branching parameters must satisfy alpha < beta for stationarity.")
+
+
 def compute_hawkes_intensity_ratio(
     closes: Sequence[float] | np.ndarray,
     highs: Sequence[float] | np.ndarray | None = None,
     lows: Sequence[float] | np.ndarray | None = None,
     tick_rates: Sequence[float] | None = None,
-    alpha: float = 0.55,
-    beta_fast: float = 0.45,
-    beta_slow: float = 0.08,
+    alpha: float | None = None,
+    beta_fast: float = 0.65,
+    beta_slow: float = 0.16,
+    params: HawkesBranchingParameters | None = None,
 ) -> float:
-    """Compute univariate exponential Hawkes arrival-intensity acceleration ratio (lambda_fast / lambda_slow).
+    """Compute stationary univariate exponential Hawkes intensity ratio (lambda_fast / lambda_slow).
 
-    Returns > 1.0 when impulse range expansions or tick bursts exhibit self-exciting clustering.
+    Strictly enforces subcritical branching (`alpha_fast / beta_fast < 1.0` and `alpha_slow / beta_slow < 1.0`).
     """
+    p = params if params is not None else HawkesBranchingParameters()
+    eff_beta_fast = float(beta_fast) if params is None else float(p.beta_fast)
+    eff_beta_slow = float(beta_slow) if params is None else float(p.beta_slow)
+    eff_alpha_fast = min(float(alpha if alpha is not None else p.alpha_fast), 0.95 * eff_beta_fast)
+    eff_alpha_slow = min(float(alpha * 0.20 if alpha is not None else p.alpha_slow), 0.95 * eff_beta_slow)
     if tick_rates is not None and len(tick_rates) >= 6:
         arr = np.asarray(tick_rates, dtype=np.float64)
         base = max(float(np.median(arr[:-1])), 1e-6)
@@ -295,14 +316,14 @@ def compute_hawkes_intensity_ratio(
     n = len(events)
     if n < 5:
         return 1.0
-    mu = 0.25
+    mu = float(p.mu)
     lam_fast = mu
     lam_slow = mu
-    d_fast = math.exp(-beta_fast)
-    d_slow = math.exp(-beta_slow)
+    d_fast = math.exp(-eff_beta_fast)
+    d_slow = math.exp(-eff_beta_slow)
     for ev in events:
-        lam_fast = mu + (lam_fast - mu) * d_fast + alpha * float(ev)
-        lam_slow = mu + (lam_slow - mu) * d_slow + alpha * 0.25 * float(ev)
+        lam_fast = mu + (lam_fast - mu) * d_fast + eff_alpha_fast * float(ev)
+        lam_slow = mu + (lam_slow - mu) * d_slow + eff_alpha_slow * float(ev)
     return float(np.clip(lam_fast / max(lam_slow, 1e-9), 0.5, 5.0))
 
 

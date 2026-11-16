@@ -86,7 +86,9 @@
   "risk": {
     "require_hard_sl_tp": true,
     "max_risk_per_trade_pct": 0.5,
-    "max_daily_drawdown_pct": 2.0
+    "max_daily_drawdown_pct": 2.0,
+    "max_concurrent_positions": 2,
+    "stopout_cooldown_minutes": 120
   },
   "sleep_wake": {
     "enabled": true,
