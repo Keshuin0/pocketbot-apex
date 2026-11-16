@@ -190,7 +190,11 @@ class DualBrokerExecutionRouter:
                 side = Side.BUY if is_buy else Side.SELL
                 vol = float(p.get("volume", 0.01))
                 entry_px = float(p.get("price_open", 0.0))
+                curr_px = float(p.get("price_current", entry_px) or entry_px)
                 sl_px = float(p.get("sl", 0.0))
+                tp_px = float(p.get("tp", 0.0))
+                profit_usd = float(p.get("profit", 0.0) or 0.0)
+                ticket = int(p.get("ticket", 0) or 0)
                 sl_dist = abs(entry_px - sl_px) if sl_px > 0.0 else 0.0
                 risk_usd = 50.0
                 if sl_dist > 0.0:
@@ -207,16 +211,68 @@ class DualBrokerExecutionRouter:
                         side=side,
                         risk_pct=risk_pct,
                         risk_usd=risk_usd,
+                        lots=vol,
+                        entry_price=entry_px,
+                        current_price=curr_px,
+                        stop_loss=sl_px,
+                        take_profit=tp_px,
+                        profit_usd=profit_usd,
+                        ticket=ticket,
+                        venue="mt5",
+                    )
+                )
+
+        if self.feed_router.ctrader.is_connected and hasattr(self.feed_router.ctrader, "get_open_positions"):
+            for cp in self.feed_router.ctrader.get_open_positions():
+                can_sym = str(cp.get("canonical_symbol") or cp.get("symbol") or "").upper()
+                if not can_sym:
+                    continue
+                side = Side.BUY if str(cp.get("side", "BUY")).upper() == "BUY" else Side.SELL
+                entry_px = float(cp.get("entry_price", 0.0) or 0.0)
+                curr_px = float(cp.get("current_price", entry_px) or entry_px)
+                sl_px = float(cp.get("stop_loss", 0.0) or 0.0)
+                tp_px = float(cp.get("take_profit", 0.0) or 0.0)
+                lots = float(cp.get("lots", 0.01) or 0.01)
+                profit_usd = float(cp.get("profit_usd", 0.0) or 0.0)
+                ticket = int(cp.get("position_id", cp.get("ticket", 0)) or 0)
+                spec = self.feed_router.ctrader.get_contract_spec(can_sym)
+                lot_units = spec.lot_size if spec else 100_000.0
+                sl_dist = abs(entry_px - sl_px) if (entry_px > 0.0 and sl_px > 0.0) else 0.0
+                risk_usd = (sl_dist * lot_units * lots) if sl_dist > 0.0 else 50.0
+                risk_pct = (risk_usd / self.account_equity_usd * 100.0) if self.account_equity_usd > 0.0 else 0.5
+                specs.append(
+                    PositionRiskSpec(
+                        symbol=can_sym,
+                        side=side,
+                        risk_pct=risk_pct,
+                        risk_usd=risk_usd,
+                        lots=lots,
+                        entry_price=entry_px,
+                        current_price=curr_px,
+                        stop_loss=sl_px,
+                        take_profit=tp_px,
+                        profit_usd=profit_usd,
+                        ticket=ticket,
+                        venue="ctrader",
                     )
                 )
 
         for sp in self._shadow_positions:
+            entry_px = float(sp.get("entry_price", 0.0) or 0.0)
             specs.append(
                 PositionRiskSpec(
                     symbol=str(sp.get("symbol", "")),
                     side=Side.BUY if str(sp.get("side", "")).upper() == "BUY" else Side.SELL,
-                    risk_pct=0.5,
-                    risk_usd=50.0,
+                    risk_pct=float(sp.get("risk_pct", 0.5) or 0.5),
+                    risk_usd=float(sp.get("risk_usd", 50.0) or 50.0),
+                    lots=float(sp.get("lots", 0.01) or 0.01),
+                    entry_price=entry_px,
+                    current_price=float(sp.get("current_price", entry_px) or entry_px),
+                    stop_loss=float(sp.get("stop_loss", 0.0) or 0.0),
+                    take_profit=float(sp.get("take_profit", 0.0) or 0.0),
+                    profit_usd=float(sp.get("profit_usd", 0.0) or 0.0),
+                    ticket=int(sp.get("ticket", 0) or 0),
+                    venue="paper_shadow",
                 )
             )
         return specs
@@ -227,9 +283,14 @@ class DualBrokerExecutionRouter:
         for p in self.get_open_positions():
             can = p.symbol.upper()
             open_syms.add(can)
-            raw = self.feed_router.mt5.resolve_symbol(can) if self.feed_router.mt5.is_connected else None
-            if raw:
-                open_syms.add(raw.upper())
+            if self.feed_router.mt5.is_connected:
+                raw = self.feed_router.mt5.resolve_symbol(can)
+                if raw:
+                    open_syms.add(raw.upper())
+            if self.feed_router.ctrader.is_connected:
+                ct_raw = self.feed_router.ctrader.resolve_symbol(can)
+                if ct_raw:
+                    open_syms.add(ct_raw.upper())
         for sp in self._shadow_positions:
             open_syms.add(str(sp.get("symbol", "")).upper())
         return open_syms
@@ -256,8 +317,11 @@ class DualBrokerExecutionRouter:
                 loss_per_lot = sl_dist * spec.lot_size
                 lots_raw = float(risk_usd) / loss_per_lot if loss_per_lot > 0.0 else spec.min_volume_lots
                 step = spec.step_volume_lots if spec.step_volume_lots > 0 else 0.01
-                snapped = round(lots_raw / step) * step
-                return max(spec.min_volume_lots, min(spec.max_volume_lots, round(snapped, 2)))
+                steps = math.floor((lots_raw / step) + 1e-9)
+                snapped = steps * step
+                step_decimals = max(0, min(8, int(round(-math.log10(step))))) if 0.0 < step < 1.0 else 0
+                rounded = round(snapped, step_decimals)
+                return max(spec.min_volume_lots, min(spec.max_volume_lots, rounded))
         return 0.01
 
     @property
@@ -492,8 +556,8 @@ class DualBrokerExecutionRouter:
             # scaled by 100,000 (1e-5 price units) AND absolute stopLoss / takeProfit
             sl_dist = abs(float(order.entry_price) - float(order.stop_loss))
             tp_dist = abs(float(order.take_profit) - float(order.entry_price))
-            req.relativeStopLoss = int(round(sl_dist * CTRADER_PRICE_SCALE))
-            req.relativeTakeProfit = int(round(tp_dist * CTRADER_PRICE_SCALE))
+            req.relativeStopLoss = max(1, int(round(sl_dist * CTRADER_PRICE_SCALE)))
+            req.relativeTakeProfit = max(1, int(round(tp_dist * CTRADER_PRICE_SCALE)))
             req.stopLoss = float(order.stop_loss)
             req.takeProfit = float(order.take_profit)
 
@@ -528,10 +592,11 @@ class DualBrokerExecutionRouter:
         """Attempt wire dispatch to cTrader Open API if connected and symbol is mapped."""
         ct = self.feed_router.ctrader
         norm_sym = order.symbol.upper()
-        if ct.is_connected and norm_sym in ct._symbol_name_to_id:
+        resolved_sym = ct.resolve_symbol(norm_sym) or norm_sym
+        sid = ct._symbol_name_to_id.get(resolved_sym) or ct._symbol_name_to_id.get(norm_sym)
+        if ct.is_connected and sid is not None:
             try:
-                sid = ct._symbol_name_to_id[norm_sym]
-                spec = ct._contract_specs.get(norm_sym)
+                spec = ct._contract_specs.get(resolved_sym) or ct._contract_specs.get(norm_sym)
                 lot_units = spec.lot_size if spec else 100_000.0
                 req = self.build_ctrader_Order_req(
                     account_id=ct.account_id,
@@ -539,13 +604,40 @@ class DualBrokerExecutionRouter:
                     order=order,
                     lot_size_units=lot_units,
                 )
-                if ct._client is not None:
+                send_res: dict[str, object] = {"ok": True, "order_id": req.clientOrderId}
+                if hasattr(ct, "send_new_order"):
+                    maybe_res = ct.send_new_order(req)
+                    if isinstance(maybe_res, dict):
+                        send_res = maybe_res
+                elif ct._client is not None:
                     ct._client.send(req)
-                exec_price = (
-                    order.entry_price + vwap_slippage_price
-                    if order.side == Side.BUY
-                    else order.entry_price - vwap_slippage_price
-                )
+
+                if not bool(send_res.get("ok", True)):
+                    err_detail = str(send_res.get("error_code") or "cTrader order rejected")
+                    self.record_broker_event(
+                        BrokerExecutionEvent(
+                            timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
+                            symbol=norm_sym,
+                            side=order.side.value,
+                            lots=order.lots,
+                            price=order.entry_price,
+                            stop_loss=order.stop_loss,
+                            take_profit=order.take_profit,
+                            venue="CTRADER",
+                            status="REJECTED",
+                            details=err_detail[:60],
+                        )
+                    )
+                    return None
+
+                exec_price = float(send_res.get("executed_price") or 0.0)
+                if exec_price <= 0.0:
+                    exec_price = (
+                        order.entry_price + vwap_slippage_price
+                        if order.side == Side.BUY
+                        else order.entry_price - vwap_slippage_price
+                    )
+                receipt_oid = str(send_res.get("order_id") or req.clientOrderId)
                 self.record_broker_event(
                     BrokerExecutionEvent(
                         timestamp_str=datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S"),
@@ -557,11 +649,11 @@ class DualBrokerExecutionRouter:
                         take_profit=order.take_profit,
                         venue="CTRADER",
                         status="FILLED",
-                        details=f"Order {req.clientOrderId[:8]} | Sent [{mesh_topology}]",
+                        details=f"Order {receipt_oid[:10]} | Sent [{mesh_topology}]",
                     )
                 )
                 return ExecutionReceipt(
-                    order_id=req.clientOrderId,
+                    order_id=receipt_oid,
                     symbol=norm_sym,
                     side=order.side,
                     lots=order.lots,
@@ -1150,22 +1242,44 @@ class DualBrokerExecutionRouter:
                     is_buy = int(pos.type) == int(mt5.ORDER_TYPE_BUY)
                     tick = mt5.symbol_info_tick(sym)
                     close_px = float(tick.bid if is_buy else tick.ask) if tick else float(pos.price_current)
-                    req = {
-                        "action": mt5.TRADE_ACTION_DEAL,
-                        "position": int(pos.ticket),
-                        "symbol": sym,
-                        "volume": vol,
-                        "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
-                        "price": close_px,
-                        "deviation": 50,
-                        "magic": 202611,
-                        "comment": "APEX_PANIC_FLATTEN",
-                        "type_time": mt5.ORDER_TIME_GTC,
-                        "type_filling": self.detect_mt5_filling_mode(sym),
-                    }
-                    res = mt5.order_send(req)
-                    if res is not None and int(getattr(res, "retcode", 0)) == int(mt5.TRADE_RETCODE_DONE):
-                        closed_mt5 += 1
+                    for fill_mode in dict.fromkeys(
+                        [
+                            self.detect_mt5_filling_mode(sym),
+                            int(mt5.ORDER_FILLING_IOC),
+                            int(mt5.ORDER_FILLING_FOK),
+                            int(mt5.ORDER_FILLING_RETURN),
+                        ]
+                    ):
+                        req = {
+                            "action": mt5.TRADE_ACTION_DEAL,
+                            "position": int(pos.ticket),
+                            "symbol": sym,
+                            "volume": vol,
+                            "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+                            "price": close_px,
+                            "deviation": 50,
+                            "magic": 202611,
+                            "comment": "APEX_PANIC_FLATTEN",
+                            "type_time": mt5.ORDER_TIME_GTC,
+                            "type_filling": fill_mode,
+                        }
+                        res = mt5.order_send(req)
+                        if res is not None and int(getattr(res, "retcode", 0)) == int(mt5.TRADE_RETCODE_DONE):
+                            closed_mt5 += 1
+                            break
+
+        if self.feed_router.ctrader.is_connected and hasattr(self.feed_router.ctrader, "get_open_positions"):
+            for cpos in list(self.feed_router.ctrader.get_open_positions()):
+                pid = int(cpos.get("position_id", 0) or 0)
+                if pid <= 0:
+                    continue
+                close_res = self.feed_router.ctrader.close_position(
+                    position_id=pid,
+                    volume_lots=float(cpos.get("lots", 0.01) or 0.01),
+                    symbol=str(cpos.get("symbol", "")),
+                )
+                if isinstance(close_res, dict) and close_res.get("ok"):
+                    closed_ctrader += 1
 
         return {
             "mt5_closed": closed_mt5,

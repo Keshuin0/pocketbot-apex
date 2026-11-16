@@ -48,6 +48,8 @@ SECRET_PATTERNS = [
     (re.compile(r"AIzaSy[A-Za-z0-9_-]{33}"), "Google AI / Gemini API Key"),
     (re.compile(r"\b[0-9]{8,10}:[A-Za-z0-9_-]{35}\b"), "Telegram Bot Token"),
     (re.compile(r"ghp_[A-Za-z0-9]{36}"), "GitHub Personal Access Token"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS Access Key ID"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "PEM Private Key Header"),
 ]
 
 PRIVATE_PATH_PATTERNS = [
@@ -56,7 +58,7 @@ PRIVATE_PATH_PATTERNS = [
 ]
 
 # Disallow personal emails; allow @users.noreply.github.com, @example.com, @domain.com
-EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b")
+EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,7}\b")
 ALLOWED_EMAIL_DOMAINS = ("@users.noreply.github.com", "@example.com", "@google.com", "@spotware.com", "@metaquotes.net")
 
 
@@ -66,14 +68,14 @@ def audit_repository() -> int:
     scanned_files_count = 0
 
     for root, dirs, files in os.walk(REPO_ROOT):
-        # Filter prohibited directories
-        dirs[:] = [d for d in dirs if d not in PROHIBITED_DIRS and d != ".git"]
-
-        # Check for prohibited directory presence
+        # Check for prohibited directories BEFORE pruning so os.walk does not recurse into them
         rel_root = Path(root).relative_to(REPO_ROOT)
         for d in dirs:
             if d in PROHIBITED_DIRS:
                 violations.append(f"Prohibited directory present: {rel_root / d}")
+
+        # Prune prohibited directories and .git from further traversal
+        dirs[:] = [d for d in dirs if d not in PROHIBITED_DIRS and d != ".git"]
 
         for file in files:
             file_path = Path(root) / file
@@ -91,11 +93,16 @@ def audit_repository() -> int:
 
             scanned_files_count += 1
 
-            # 2. Check batch file line endings (MUST be CRLF)
-            if file_path.suffix.lower() in (".bat", ".cmd"):
+            # 2. Check batch & PowerShell launcher line endings (MUST be CRLF) and UTF-8 encoding
+            if file_path.suffix.lower() in (".bat", ".cmd", ".ps1"):
                 raw = file_path.read_bytes()
-                if b"\n" in raw and b"\r\n" not in raw:
-                    violations.append(f"Batch file has LF line endings (MUST be CRLF): {rel_path}")
+                if b"\n" in raw.replace(b"\r\n", b""):
+                    violations.append(f"Script file has LF line endings (MUST be CRLF): {rel_path}")
+                if file_path.suffix.lower() == ".ps1":
+                    try:
+                        raw.decode("utf-8-sig")
+                    except UnicodeDecodeError:
+                        violations.append(f"PowerShell script is not valid UTF-8: {rel_path}")
 
             # 3. Text file content scanning
             # Skip binary / PDF / DOCX

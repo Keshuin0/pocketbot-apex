@@ -54,6 +54,11 @@ _EXTERNAL_NEWS_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 _NUMBER_TOKEN_RE = re.compile(r"(?<![A-Za-z_])[-+]?\d+(?:\.\d+)?(?![A-Za-z_])")
+_STRUCTURAL_COUNT_RE = re.compile(
+    r"\b\d+(?:\s+(?:verified|atomic|bull|bear|grounded|valid|active|open|closed))*\s+"
+    r"(?:claims?|shields?|axioms?|signals?|checks?|factors?|rules?|tiers?|steps?|bars?|positions?)\b",
+    re.IGNORECASE,
+)
 
 _APPROVE_CONTRADICTION_RE = re.compile(
     r"\b(?:must\s+veto|should\s+veto|veto\s+this|reject\s+this|do\s+not\s+enter|hallucination\s+detected)\b",
@@ -167,6 +172,19 @@ def _eval_op(lhs: float, op: str, rhs: float) -> bool:
     return False
 
 
+def _safe_float(val: Any) -> float | None:
+    """Convert non-bool numeric input to finite float; return None on invalid/NaN/Inf."""
+    if isinstance(val, bool) or val is None:
+        return None
+    try:
+        out = float(val)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(out) or math.isinf(out):
+        return None
+    return out
+
+
 def _z3_real(val: float) -> z3.RatNumRef:
     """Convert a Python float cleanly to an exact Z3 Real constant."""
     return z3.RealVal(f"{float(val):.6f}")
@@ -177,6 +195,7 @@ class AegisVerifier:
 
     NUMERIC_TOLERANCE: float = 1e-4
     MIN_ABSTAIN_CONFIDENCE: float = 0.35
+    CONFORMAL_ALPHA_TARGET: float = 0.20
 
     def __init__(
         self,
@@ -200,14 +219,27 @@ class AegisVerifier:
         sl_price: float,
         tp_price: float,
         max_risk_pct: float = _MAX_DIODE_RISK_PCT,
+        conformal_p_value: float | None = None,
+        conformal_alpha_target: float = 0.20,
     ) -> DiodeEnforcementResult:
         """Enforce subtract-only authority diode invariants in code."""
         dec = str(ai_decision or "ABSTAIN").upper().strip()
         if dec not in ("APPROVE", "VETO", "ABSTAIN"):
             dec = "VETO"
 
-        mult = max(0.0, min(1.0, float(requested_risk_multiplier)))
-        base_risk = max(0.0, min(float(recommended_risk_pct), float(max_risk_pct)))
+        req_mult = _safe_float(requested_risk_multiplier)
+        mult = max(0.0, min(1.0, req_mult if req_mult is not None else 0.0))
+        if conformal_p_value is not None:
+            conf_p = _safe_float(conformal_p_value)
+            if conf_p is None:
+                mult *= 0.25
+            else:
+                alpha_t = max(1e-6, float(conformal_alpha_target))
+                conformal_scale = max(0.25, min(1.0, conf_p / alpha_t))
+                mult = round(mult * conformal_scale, 4)
+
+        rec_r = _safe_float(recommended_risk_pct)
+        base_risk = max(0.0, min(rec_r if rec_r is not None else 0.0, float(max_risk_pct)))
 
         if not quant_approved:
             return DiodeEnforcementResult(
@@ -412,17 +444,54 @@ class AegisVerifier:
         telemetry: dict[str, Any],
         raw_decision: str,
         verified_claims: list[AtomicClaimResult],
+        risk_scale: float = 1.0,
     ) -> tuple[bool, float, str]:
-        """Encode telemetry, cited inequalities, and hard safety axioms into z3.Solver().
+        """Encode telemetry, cited inequalities, and symbolic counterexamples into Z3.
 
-        Returns `(is_sat, latency_ms, detail)`. If `z3.unsat`, the AI committed a
-        logical/axiom hallucination (e.g., true numbers + contradictory APPROVE).
+        Returns `(is_sat, latency_ms, detail)`. If `z3.unsat`, `z3.unknown`, invalid
+        numeric telemetry, or an existential worst-case drawdown counterexample
+        `Exists([d_shock, eps_slip], Loss > remaining_daily_budget)` is satisfiable,
+        fails closed (`False`).
         """
         t0 = time.perf_counter()
+
+        net_r_val = _safe_float(telemetry.get("timemachine_net_avg_R", 0.0))
+        spread_val = _safe_float(telemetry.get("spread_pct_of_sl", 0.0))
+        vol_val = _safe_float(telemetry.get("vol_pct", 0.0))
+        shock_val = _safe_float(telemetry.get("cross_asset_shock_z", 0.0))
+        risk_val = _safe_float(telemetry.get("recommended_risk_pct", 0.50))
+        budget_val = _safe_float(telemetry.get("remaining_daily_budget_pct", 3.0))
+        scale_val = _safe_float(telemetry.get("risk_scale", risk_scale))
+
+        for name, val in (
+            ("timemachine_net_avg_R", net_r_val),
+            ("spread_pct_of_sl", spread_val),
+            ("vol_pct", vol_val),
+            ("cross_asset_shock_z", shock_val),
+            ("recommended_risk_pct", risk_val),
+            ("remaining_daily_budget_pct", budget_val),
+            ("risk_scale", scale_val),
+        ):
+            if val is None:
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                return False, round(lat_ms, 3), f"Z3_INVALID_TELEMETRY: non-finite {name}"
+
+        assert (
+            net_r_val is not None
+            and spread_val is not None
+            and vol_val is not None
+            and shock_val is not None
+            and risk_val is not None
+            and budget_val is not None
+            and scale_val is not None
+        )
+        rollover_val = bool(telemetry.get("rollover_illiquidity_flag", False))
+
         solver = z3.Solver()
+        solver.set("timeout", 50)
 
         dec_map = {"APPROVE": 1, "ABSTAIN": 0, "VETO": -1}
-        dec_int = dec_map.get(raw_decision.upper().strip(), 0)
+        dec_int = dec_map.get(str(raw_decision).upper().strip(), 0)
         z_dec = z3.Int("decision")
         solver.add(z_dec == dec_int)
 
@@ -432,11 +501,11 @@ class AegisVerifier:
         z_shock = z3.Real("cross_asset_shock_z")
         z_rollover = z3.Bool("rollover_illiquidity_flag")
 
-        solver.add(z_net_r == _z3_real(float(telemetry.get("timemachine_net_avg_R", 0.0))))
-        solver.add(z_spread == _z3_real(float(telemetry.get("spread_pct_of_sl", 0.0))))
-        solver.add(z_vol == _z3_real(float(telemetry.get("vol_pct", 0.0))))
-        solver.add(z_shock == _z3_real(float(telemetry.get("cross_asset_shock_z", 0.0))))
-        solver.add(z_rollover == z3.BoolVal(bool(telemetry.get("rollover_illiquidity_flag", False))))
+        solver.add(z_net_r == _z3_real(net_r_val))
+        solver.add(z_spread == _z3_real(spread_val))
+        solver.add(z_vol == _z3_real(vol_val))
+        solver.add(z_shock == _z3_real(shock_val))
+        solver.add(z_rollover == z3.BoolVal(rollover_val))
 
         # Hard domain safety axioms: toxic setups CANNOT be APPROVED
         solver.add(
@@ -463,10 +532,18 @@ class AegisVerifier:
                 continue
             zf = z_fields.get(vc.field)
             if zf is None:
+                extra_val = _safe_float(telemetry.get(vc.field))
+                if extra_val is None:
+                    lat_ms = (time.perf_counter() - t0) * 1000.0
+                    return False, round(lat_ms, 3), f"Z3_INVALID_TELEMETRY: non-finite {vc.field}"
                 zf = z3.Real(vc.field)
                 z_fields[vc.field] = zf
-                solver.add(zf == _z3_real(float(telemetry[vc.field])))
-            z_lim = _z3_real(vc.limit)
+                solver.add(zf == _z3_real(extra_val))
+            lim_val = _safe_float(vc.limit)
+            if lim_val is None:
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                return False, round(lat_ms, 3), f"Z3_INVALID_CLAIM_LIMIT: {vc.field}"
+            z_lim = _z3_real(lim_val)
             if vc.op == "<":
                 solver.add(zf < z_lim)
             elif vc.op == "<=":
@@ -479,23 +556,65 @@ class AegisVerifier:
                 solver.add(zf > z_lim)
 
         chk = solver.check()
-        lat_ms = (time.perf_counter() - t0) * 1000.0
-        if chk == z3.unsat:
+        if chk != z3.sat:
+            lat_ms = (time.perf_counter() - t0) * 1000.0
+            if chk == z3.unknown:
+                return False, round(lat_ms, 3), "Z3_UNKNOWN_TIMEOUT: solver timed out failing closed"
             return (
                 False,
                 round(lat_ms, 3),
                 "Z3_UNSAT_HALLUCINATION: AI decision violates formal SMT safety axioms",
             )
+
+        # Existential counterexample search over unbounded symbolic shock & slippage disturbances
+        if dec_int == 1:
+            effective_risk = max(0.0, risk_val * max(0.0, scale_val))
+            if budget_val <= 0.0 and effective_risk > 0.0:
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                return False, round(lat_ms, 3), "Z3_UNSAT_BUDGET_DEPLETED: remaining daily budget <= 0"
+
+            shock_cap = max(0.05, 0.25 + 0.15 * max(0.0, shock_val) + (0.35 if rollover_val else 0.0))
+            slip_cap = max(0.05, max(0.0, spread_val) / 100.0 * 2.0 + 0.05)
+
+            ce_solver = z3.Solver()
+            ce_solver.set("timeout", 50)
+            d_shock = z3.Real("d_shock")
+            eps_slip = z3.Real("eps_slip")
+            loss_expr = _z3_real(effective_risk) * (z3.RealVal("1.0") + d_shock + eps_slip)
+            ce_solver.add(
+                z3.Exists(
+                    [d_shock, eps_slip],
+                    z3.And(
+                        d_shock >= z3.RealVal("0"),
+                        d_shock <= _z3_real(shock_cap),
+                        eps_slip >= z3.RealVal("0"),
+                        eps_slip <= _z3_real(slip_cap),
+                        loss_expr > _z3_real(budget_val),
+                    ),
+                )
+            )
+            ce_chk = ce_solver.check()
+            if ce_chk != z3.unsat:
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                if ce_chk == z3.unknown:
+                    return False, round(lat_ms, 3), "Z3_UNKNOWN_TIMEOUT: counterexample proof timed out"
+                return (
+                    False,
+                    round(lat_ms, 3),
+                    "Z3_COUNTEREXAMPLE_BUDGET_BREACH: Exists(d_shock, eps_slip) where Loss > remaining_daily_budget",
+                )
+
+        lat_ms = (time.perf_counter() - t0) * 1000.0
         return True, round(lat_ms, 3), f"Z3 SAT ({lat_ms:.2f}ms)"
 
     @staticmethod
     def z3_pure_math_axiom_gate(telemetry: dict[str, Any]) -> tuple[str, str]:
         """Deterministic Z3-backed safety gate for pure_math fallback."""
-        is_sat, lat_ms, _ = AegisVerifier.verify_z3_smt_axioms(telemetry, "APPROVE", [])
+        is_sat, lat_ms, detail = AegisVerifier.verify_z3_smt_axioms(telemetry, "APPROVE", [])
         if not is_sat:
             return (
                 "VETO",
-                f"Z3 Axiom Gate VETO ({lat_ms:.2f}ms): net_avg_R={telemetry.get('timemachine_net_avg_R')}, "
+                f"Z3 Axiom Gate VETO ({lat_ms:.2f}ms, {detail}): net_avg_R={telemetry.get('timemachine_net_avg_R')}, "
                 f"spread={telemetry.get('spread_pct_of_sl')}%, shock_z={telemetry.get('cross_asset_shock_z')}",
             )
         return "APPROVE", f"Z3 Axiom Gate SAT ({lat_ms:.2f}ms)"
@@ -513,15 +632,42 @@ class AegisVerifier:
         invalidation_signals: int,
         is_zombie_decay: bool = False,
         is_weekend_close: bool = False,
+        side: str = "BUY",
+        entry_price: float | None = None,
+        sl_old: float | None = None,
+        sl_new: float | None = None,
     ) -> tuple[bool, float, str]:
-        """Shield 8: Formal Z3 SMT proof for in-flight position actions (HOLD vs EARLY_EXIT vs RATCHET)."""
+        """Shield 8: Formal Z3 SMT proof for in-flight actions (HOLD vs EARLY_EXIT vs RATCHET)."""
         t0 = time.perf_counter()
-        solver = z3.Solver()
 
-        action_norm = proposed_action.upper().strip()
+        move_val = _safe_float(abs_move_atr)
+        shock_val = _safe_float(cross_asset_shock_z)
+        ev_val = _safe_float(forward_ev_r)
+        curr_val = _safe_float(current_r)
+        if any(v is None for v in (move_val, shock_val, ev_val, curr_val)) or any(
+            isinstance(iv, bool) for iv in (bars_held, min_hold_bars, invalidation_signals)
+        ):
+            lat_ms = (time.perf_counter() - t0) * 1000.0
+            return False, round(lat_ms, 3), "Z3_SHIELD8_INVALID_INPUT: non-finite trajectory telemetry"
+
+        assert move_val is not None and shock_val is not None and ev_val is not None and curr_val is not None
+        try:
+            bars_i = int(bars_held)
+            min_bars_i = int(min_hold_bars)
+            sigs_i = int(invalidation_signals)
+        except (TypeError, ValueError):
+            lat_ms = (time.perf_counter() - t0) * 1000.0
+            return False, round(lat_ms, 3), "Z3_SHIELD8_INVALID_INT: integer field invalid"
+
+        action_norm = str(proposed_action).upper().strip()
         is_early_exit = action_norm == "EARLY_EXIT"
+        is_hold_or_ratchet = action_norm in ("HOLD", "RATCHET", "RATCHET_SLTP")
+
+        solver = z3.Solver()
+        solver.set("timeout", 50)
 
         z_exit = z3.Bool("is_early_exit")
+        z_hold_or_ratchet = z3.Bool("is_hold_or_ratchet")
         z_bars = z3.Int("bars_held")
         z_min_bars = z3.Int("min_hold_bars")
         z_move_atr = z3.Real("abs_move_atr")
@@ -533,17 +679,21 @@ class AegisVerifier:
         z_weekend = z3.Bool("is_weekend_close")
 
         solver.add(z_exit == z3.BoolVal(is_early_exit))
-        solver.add(z_bars == int(bars_held))
-        solver.add(z_min_bars == int(min_hold_bars))
-        solver.add(z_move_atr == _z3_real(float(abs_move_atr)))
-        solver.add(z_shock == _z3_real(float(cross_asset_shock_z)))
-        solver.add(z_fwd_ev == _z3_real(float(forward_ev_r)))
-        solver.add(z_curr_r == _z3_real(float(current_r)))
-        solver.add(z_signals == int(invalidation_signals))
+        solver.add(z_hold_or_ratchet == z3.BoolVal(is_hold_or_ratchet))
+        solver.add(z_bars == bars_i)
+        solver.add(z_min_bars == min_bars_i)
+        solver.add(z_move_atr == _z3_real(move_val))
+        solver.add(z_shock == _z3_real(shock_val))
+        solver.add(z_fwd_ev == _z3_real(ev_val))
+        solver.add(z_curr_r == _z3_real(curr_val))
+        solver.add(z_signals == sigs_i)
         solver.add(z_zombie == z3.BoolVal(bool(is_zombie_decay)))
         solver.add(z_weekend == z3.BoolVal(bool(is_weekend_close)))
 
-        # Grace lock invariant: cannot early-exit during grace window & noise cone unless extreme flash-crash (Z > 4.2) or weekend shield
+        # Shock/Weekend emergency mandate: HOLD and RATCHET are UNSAT under extreme shock or weekend close
+        solver.add(z3.Implies(z3.Or(z_shock > z3.RealVal("4.2"), z_weekend), z3.Not(z_hold_or_ratchet)))
+
+        # Grace lock invariant: cannot early-exit during grace window & noise cone unless flash-crash or weekend shield
         grace_locked = z3.And(
             z_bars < z_min_bars,
             z_move_atr <= z3.RealVal("0.65"),
@@ -552,8 +702,7 @@ class AegisVerifier:
         )
         solver.add(z3.Implies(grace_locked, z3.Not(z_exit)))
 
-        # Thesis-invalidation early exit invariant: EV_hold < EV_exit_now (-0.25R floor) & >=3 signals,
-        # OR flash-crash shock Z > 4.2, OR zombie time-decay, OR Friday weekend-gap shield
+        # Thesis-invalidation early exit invariant
         valid_exit_basis = z3.Or(
             z_shock > z3.RealVal("4.2"),
             z_weekend,
@@ -563,18 +712,57 @@ class AegisVerifier:
         solver.add(z3.Implies(z_exit, valid_exit_basis))
 
         chk = solver.check()
-        lat_ms = (time.perf_counter() - t0) * 1000.0
-        if chk == z3.unsat:
+        if chk != z3.sat:
+            lat_ms = (time.perf_counter() - t0) * 1000.0
+            if chk == z3.unknown:
+                return False, round(lat_ms, 3), "Z3_SHIELD8_UNKNOWN_TIMEOUT"
             return (
                 False,
                 round(lat_ms, 3),
-                f"Z3_SHIELD8_UNSAT: {action_norm} blocked (bars={bars_held}/{min_hold_bars}, "
-                f"move_atr={abs_move_atr:.2f}, fwd_ev={forward_ev_r:+.2f}R, sigs={invalidation_signals})",
+                f"Z3_SHIELD8_UNSAT: {action_norm} blocked (bars={bars_i}/{min_bars_i}, "
+                f"move_atr={move_val:.2f}, fwd_ev={ev_val:+.2f}R, sigs={sigs_i}, shock={shock_val:.2f}, weekend={is_weekend_close})",
             )
+
+        # Symbolic Ratchet Stop-Loss Dominance Proof when SL transition is supplied
+        if sl_old is not None and sl_new is not None:
+            s_old = _safe_float(sl_old)
+            s_new = _safe_float(sl_new)
+            if s_old is None or s_new is None or s_old <= 0.0 or s_new <= 0.0:
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                return False, round(lat_ms, 3), "Z3_SHIELD8_INVALID_SL: non-positive or non-finite SL"
+            side_up = str(side).upper().strip()
+            e_val = _safe_float(entry_price)
+            if e_val is None:
+                e_val = (s_old + 1.0) if side_up == "BUY" else max(s_old - 1.0, 0.0001)
+
+            dom_solver = z3.Solver()
+            dom_solver.set("timeout", 50)
+            p_t = z3.Real("P_T")
+            z_entry = _z3_real(e_val)
+            z_sl_old = _z3_real(s_old)
+            z_sl_new = _z3_real(s_new)
+            if side_up == "BUY":
+                pnl_new = z3.If(p_t <= z_sl_new, z_sl_new - z_entry, p_t - z_entry)
+                pnl_old = z3.If(p_t <= z_sl_old, z_sl_old - z_entry, p_t - z_entry)
+                dom_solver.add(z3.Exists([p_t], z3.And(p_t > z3.RealVal("0"), p_t <= z_sl_old, pnl_new < pnl_old)))
+            else:
+                pnl_new = z3.If(p_t >= z_sl_new, z_entry - z_sl_new, z_entry - p_t)
+                pnl_old = z3.If(p_t >= z_sl_old, z_entry - z_sl_old, z_entry - p_t)
+                dom_solver.add(z3.Exists([p_t], z3.And(p_t > z3.RealVal("0"), p_t >= z_sl_old, pnl_new < pnl_old)))
+            dom_chk = dom_solver.check()
+            if dom_chk != z3.unsat:
+                lat_ms = (time.perf_counter() - t0) * 1000.0
+                return (
+                    False,
+                    round(lat_ms, 3),
+                    f"Z3_SHIELD8_RATCHET_UNSAT: Exists P_T where widened SL ({s_old}->{s_new}) yields worse stop PnL",
+                )
+
+        lat_ms = (time.perf_counter() - t0) * 1000.0
         return (
             True,
             round(lat_ms, 3),
-            f"Z3_SHIELD8_SAT ({lat_ms:.2f}ms): EV_hold={forward_ev_r:+.2f}R vs curr={current_r:+.2f}R",
+            f"Z3_SHIELD8_SAT ({lat_ms:.2f}ms): EV_hold={ev_val:+.2f}R vs curr={curr_val:+.2f}R",
         )
 
     # ------------------------------------------------------------------
@@ -583,8 +771,10 @@ class AegisVerifier:
     @staticmethod
     def is_borderline_high_stakes(telemetry: dict[str, Any]) -> bool:
         """True when 0.10 <= net_avg_R <= 0.20 and vol_pct >= 80.0."""
-        net_r = float(telemetry.get("timemachine_net_avg_R", 0.0))
-        vol_pct = float(telemetry.get("vol_pct", 0.0))
+        net_r = _safe_float(telemetry.get("timemachine_net_avg_R", 0.0))
+        vol_pct = _safe_float(telemetry.get("vol_pct", 0.0))
+        if net_r is None or vol_pct is None:
+            return False
         return (0.10 <= net_r <= 0.20) and (vol_pct >= 80.0)
 
     @staticmethod
@@ -703,7 +893,11 @@ class AegisVerifier:
                 allowed_nums.add(vc.cited_value)
                 allowed_nums.add(vc.limit)
 
+        structural_spans = [m.span() for m in _STRUCTURAL_COUNT_RE.finditer(reason)]
         for match in _NUMBER_TOKEN_RE.finditer(reason):
+            m_start, m_end = match.span()
+            if any(s_start <= m_start and m_end <= s_end for s_start, s_end in structural_spans):
+                continue
             try:
                 num = float(match.group(0))
             except ValueError:
@@ -717,15 +911,23 @@ class AegisVerifier:
         elif raw_dec == "VETO" and _VETO_CONTRADICTION_RE.search(reason):
             violations.append("DECISION_REASON_CONTRADICTION")
 
-        # Shield 4: Microsoft Z3 Formal SMT Consistency & Axiom Prover
-        z3_sat, z3_ms, z3_msg = self.verify_z3_smt_axioms(telemetry, raw_dec, verified_claims)
-        if not z3_sat:
-            violations.append("Z3_UNSAT_HALLUCINATION")
-
-        # Shield 6: Split Conformal Prediction calibration p-value
+        # Shield 6: Split Conformal Prediction calibration p-value & Conformalized Kelly Sizing
         conformal_p = 0.5
         if self.ledger_db is not None:
             conformal_p = self.ledger_db.get_conformal_p_value(provider, model_id, conf)
+        alpha_target = max(1e-6, float(self.CONFORMAL_ALPHA_TARGET))
+        conformal_kelly_scale = max(0.25, min(1.0, float(conformal_p) / alpha_target))
+        scaled_mult = round(mult * conformal_kelly_scale, 4)
+
+        # Shield 4: Microsoft Z3 Formal SMT Consistency & Axiom Prover
+        z3_sat, z3_ms, z3_msg = self.verify_z3_smt_axioms(
+            telemetry,
+            raw_dec,
+            verified_claims,
+            risk_scale=scaled_mult,
+        )
+        if not z3_sat:
+            violations.append("Z3_UNSAT_HALLUCINATION")
 
         dedup_violations = tuple(dict.fromkeys(violations))
         hallucination_detected = len(dedup_violations) > 0
@@ -775,7 +977,7 @@ class AegisVerifier:
             raw_decision=raw_dec,
             final_decision=raw_dec,
             confidence=conf,
-            risk_multiplier=0.0 if raw_dec == "VETO" else mult,
+            risk_multiplier=0.0 if raw_dec == "VETO" else scaled_mult,
             reason=reason,
             input_sha256=blinded.input_sha256,
             violation_codes=(),
@@ -800,27 +1002,39 @@ class AegisVerifier:
     # ------------------------------------------------------------------
     @staticmethod
     def build_canary_toxic_context() -> CandidateSetupAuditContext:
-        """Build a known Z3-violating toxic setup for Shield 7 Canary Poison Probe."""
+        """Build a randomized Z3-violating toxic setup for Shield 7 Canary Poison Probe."""
+        import secrets
         from apex.ai.veto_committee import CandidateSetupAuditContext
 
+        rand_alias = f"CNRY_{secrets.choice(['X', 'Q', 'K', 'Z'])}{secrets.randbelow(9000) + 1000}"
+        entry = round(90.0 + secrets.randbelow(2000) / 100.0, 2)
+        sl_dist = round(0.8 + secrets.randbelow(60) / 100.0, 2)
+        spread_frac = round(0.24 + secrets.randbelow(120) / 1000.0, 4)  # 24%..36% of SL
+        neg_r = round(-(0.35 + secrets.randbelow(250) / 1000.0), 4)
+        hh = secrets.randbelow(24)
+        mm = secrets.randbelow(60)
+        dd = secrets.randbelow(28) + 1
+        mo = secrets.randbelow(12) + 1
+        iso_ts = f"2026-{mo:02d}-{dd:02d}T{hh:02d}:{mm:02d}:00Z"
+
         return CandidateSetupAuditContext(
-            symbol="CANARY_TOXIC",
+            symbol=rand_alias,
             side=Side.BUY,
-            timeframe="M5",
-            entry_price=100.0,
-            stop_loss=99.0,
-            take_profit=101.5,
+            timeframe=secrets.choice(["M5", "M15"]),
+            entry_price=entry,
+            stop_loss=round(entry - sl_dist, 4),
+            take_profit=round(entry + 1.5 * sl_dist, 4),
             regime="MEAN_REVERTING_CHOP",
             hurst_exponent=0.41,
             kaufman_er=0.14,
-            volatility_percentile=92.0,
+            volatility_percentile=round(88.0 + secrets.randbelow(10), 1),
             dom_obi=-0.35,
-            spread_pct_of_sl=0.275,  # 27.5% of SL!
-            net_avg_R=-0.45,         # Deeply negative EV!
+            spread_pct_of_sl=spread_frac,
+            net_avg_R=neg_r,
             prob_profit=0.32,
             cvar_95_R=-2.10,
             recommended_risk_pct=0.50,
-            session_utc_iso="2026-11-12T21:55:00Z",
+            session_utc_iso=iso_ts,
             bar_timestamp=0.0,
         )
 

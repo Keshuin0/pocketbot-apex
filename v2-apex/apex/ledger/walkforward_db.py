@@ -17,10 +17,12 @@ Auto-Quarantine Engine:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import sqlite3
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -85,12 +87,20 @@ class WalkForwardLedgerDB:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(str(self.db_path), timeout=15.0)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
@@ -504,25 +514,38 @@ class WalkForwardLedgerDB:
             else:
                 reason = f"ACTIVE: warming up ({n}/{self.MIN_TRADES_FOR_DEMOTION} trades)"
         else:
-            # Currently in PAPER_SHADOW mode -> check last 15 paper trades for PF > 1.25 recovery
+            # Currently in PAPER_SHADOW mode -> require settled paper trades with PF > 1.25 and z_deficit <= 1.0
             paper_rows = [r for r in rows if str(r["execution_mode"]) == SymbolExecutionMode.PAPER_SHADOW.value]
             recent_15 = real_arr[-self.RECOVERY_WINDOW :] if len(real_arr) >= self.RECOVERY_WINDOW else real_arr
+            paper_tail = paper_rows[-self.RECOVERY_WINDOW :] if len(paper_rows) >= self.RECOVERY_WINDOW else paper_rows
             paper_15 = (
-                np.array([float(r["realized_net_r"]) for r in paper_rows[-self.RECOVERY_WINDOW :]], dtype=np.float64)
+                np.array([float(r["realized_net_r"]) for r in paper_tail], dtype=np.float64)
                 if len(paper_rows) >= self.RECOVERY_WINDOW
                 else recent_15
             )
             pf_recovery = self.compute_profit_factor(paper_15)
-            if len(paper_rows) >= self.RECOVERY_WINDOW and pf_recovery > self.RECOVERY_PF_THRESHOLD:
+            if len(paper_tail) > 1:
+                p_pred = np.array([float(r["predicted_net_r"]) for r in paper_tail], dtype=np.float64)
+                p_real = np.array([float(r["realized_net_r"]) for r in paper_tail], dtype=np.float64)
+                p_se = max(float(np.std(p_real, ddof=1)) / math.sqrt(len(paper_tail)), 1e-6)
+                z_deficit_recovery = float((float(np.mean(p_pred)) - float(np.mean(p_real))) / p_se)
+            else:
+                z_deficit_recovery = z_deficit
+            if (
+                len(paper_rows) >= self.RECOVERY_WINDOW
+                and pf_recovery > self.RECOVERY_PF_THRESHOLD
+                and z_deficit <= 1.0
+                and z_deficit_recovery <= 1.0
+            ):
                 new_mode = SymbolExecutionMode.ACTIVE
                 reason = (
                     f"RECOVERED_TO_ACTIVE: rolling {self.RECOVERY_WINDOW}-trade Paper Profit Factor "
-                    f"({pf_recovery:.2f}) > {self.RECOVERY_PF_THRESHOLD:.2f}"
+                    f"({pf_recovery:.2f}) > {self.RECOVERY_PF_THRESHOLD:.2f} (z_deficit={z_deficit:.2f} <= 1.00)"
                 )
             else:
                 reason = (
-                    f"QUARANTINED (PAPER_SHADOW): rolling 15-trade PF={pf_recovery:.2f} "
-                    f"(needs > {self.RECOVERY_PF_THRESHOLD:.2f} across {self.RECOVERY_WINDOW} paper trades)"
+                    f"QUARANTINED (PAPER_SHADOW): rolling 15-trade PF={pf_recovery:.2f}, z_deficit={z_deficit:.2f} "
+                    f"(needs PF > {self.RECOVERY_PF_THRESHOLD:.2f}, z_deficit <= 1.00 across {self.RECOVERY_WINDOW} settled paper trades)"
                 )
 
         updated = SymbolQuarantineState(
@@ -571,6 +594,75 @@ class WalkForwardLedgerDB:
             )
 
         return updated
+
+    def settle_paper_shadow_trades(
+        self,
+        symbol: str,
+        bar_high: float,
+        bar_low: float,
+        bar_close: float,
+    ) -> int:
+        """Settle open PAPER_SHADOW trades for `symbol` when bar OHLC hits SL or TP."""
+        norm_sym = symbol.upper()
+        settled_count = 0
+        with self._connect() as conn:
+            open_rows = conn.execute(
+                """
+                SELECT id, side, entry_price, executed_price, stop_loss, take_profit, realized_slippage_r
+                FROM trade_ledger
+                WHERE symbol = ?
+                  AND execution_mode = ?
+                  AND is_closed = 0
+                  AND is_drill = 0
+                ORDER BY id ASC
+                """,
+                (norm_sym, SymbolExecutionMode.PAPER_SHADOW.value),
+            ).fetchall()
+
+            for r in open_rows:
+                side = str(r["side"] or "BUY").upper()
+                entry_px = float(r["executed_price"] or r["entry_price"] or 0.0)
+                sl_px = float(r["stop_loss"] or 0.0)
+                tp_px = float(r["take_profit"] or 0.0)
+                slip_r = float(r["realized_slippage_r"] or 0.0)
+                sl_dist = abs(entry_px - sl_px)
+                if entry_px <= 0.0 or sl_dist <= 0.0:
+                    continue
+
+                exit_px: float | None = None
+                raw_r = 0.0
+                if side == "SELL":
+                    if sl_px > 0.0 and bar_high >= sl_px:
+                        exit_px = sl_px
+                    elif tp_px > 0.0 and bar_low <= tp_px:
+                        exit_px = tp_px
+                    if exit_px is not None:
+                        raw_r = (entry_px - exit_px) / sl_dist
+                else:
+                    if sl_px > 0.0 and bar_low <= sl_px:
+                        exit_px = sl_px
+                    elif tp_px > 0.0 and bar_high >= tp_px:
+                        exit_px = tp_px
+                    if exit_px is not None:
+                        raw_r = (exit_px - entry_px) / sl_dist
+
+                if exit_px is None:
+                    continue
+
+                realized_net_r = round(float(raw_r - slip_r), 4)
+                conn.execute(
+                    """
+                    UPDATE trade_ledger
+                    SET realized_net_r = ?, exit_price = ?, is_closed = 1
+                    WHERE id = ?
+                    """,
+                    (realized_net_r, float(exit_px), int(r["id"])),
+                )
+                settled_count += 1
+
+        if settled_count > 0:
+            self.evaluate_quarantine(norm_sym)
+        return settled_count
 
     def list_all_quarantine_states(self) -> list[SymbolQuarantineState]:
         """Return quarantine states for all tracked symbols."""
@@ -806,8 +898,8 @@ class WalkForwardLedgerDB:
             alphas.append(abs(y_i - p_i))
 
         cand_alpha = 1.0 - max(0.0, min(1.0, float(raw_confidence)))
-        ge_count = sum(1 for a in alphas if a >= cand_alpha - 1e-9)
-        p_val = (ge_count + 1) / (len(alphas) + 1)
+        le_count = sum(1 for a in alphas if a <= cand_alpha + 1e-9)
+        p_val = (1 + le_count) / (len(alphas) + 1)
         return round(float(p_val), 4)
 
     def get_aegis_integrity_summary(self, window: int = 100) -> dict[str, Any]:
@@ -873,14 +965,37 @@ class WalkForwardLedgerDB:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def update_consolidation_checkpoint_canary(
+        self,
+        checkpoint_id: int,
+        canary_passed: bool,
+        summary: str | None = None,
+    ) -> None:
+        """Update canary pass/fail status and optional summary on a Sleep-Wake checkpoint."""
+        with self._connect() as conn:
+            if summary is not None:
+                conn.execute(
+                    """
+                    UPDATE consolidation_checkpoints
+                    SET canary_passed = ?, summary = ?
+                    WHERE id = ?
+                    """,
+                    (1 if canary_passed else 0, str(summary)[:500], int(checkpoint_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE consolidation_checkpoints SET canary_passed = ? WHERE id = ?",
+                    (1 if canary_passed else 0, int(checkpoint_id)),
+                )
+
     def compute_slippage_calibration_multipliers(self) -> dict[str, dict[str, float]]:
-        """Compute realized-vs-baseline slippage multipliers per symbol and venue, clamped to [0.5, 3.0]."""
+        """Compute realized-vs-baseline slippage multipliers per symbol and venue (requires N >= 10 closed trades)."""
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT symbol, winning_venue, realized_slippage_r
                 FROM trade_ledger
-                WHERE is_drill = 0
+                WHERE is_drill = 0 AND is_closed = 1
                 ORDER BY id DESC
                 LIMIT 500
                 """
@@ -893,10 +1008,12 @@ class WalkForwardLedgerDB:
             slip_r = abs(float(r["realized_slippage_r"] or 0.0))
             grouped.setdefault((sym, venue), []).append(slip_r)
 
-        # Baseline expected slippage in R is ~0.04R; multiplier scales proportionally
+        # Baseline expected slippage in R is ~0.04R; multiplier scales proportionally once N >= 10
         baseline_slip_r = 0.04
         result: dict[str, dict[str, float]] = {}
         for (sym, venue), vals in grouped.items():
+            if len(vals) < 10:
+                continue
             mean_slip = sum(vals) / len(vals)
             raw_mult = mean_slip / baseline_slip_r if mean_slip > 0.0 else 1.0
             clamped = max(0.5, min(3.0, round(raw_mult, 4)))
@@ -1057,6 +1174,7 @@ class WalkForwardLedgerDB:
                 ).fetchall()
 
             q_val = 0.50
+            p_calib_85 = 0.50
             if len(graded) >= 5:
                 alphas = sorted(
                     abs(
@@ -1067,11 +1185,13 @@ class WalkForwardLedgerDB:
                 )
                 idx = min(len(alphas) - 1, max(0, int(math.ceil((1.0 - alpha) * (len(alphas) + 1))) - 1))
                 q_val = round(float(alphas[idx]), 4)
+                p_calib_85 = round((1 + sum(1 for a in alphas if a <= 0.15 + 1e-9)) / (len(alphas) + 1), 4)
 
             summary[f"{prov}:{mid}"] = {
                 "provider": prov,
                 "model_id": mid,
                 "conformal_quantile": q_val,
+                "conformal_p_calib_85": p_calib_85,
                 "epistemic_trust_score": stats.epistemic_trust_score,
                 "hallucination_rate": stats.hallucination_rate,
                 "veto_value_added_r": stats.veto_value_added_r,

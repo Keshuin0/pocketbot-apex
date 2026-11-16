@@ -133,6 +133,7 @@ class MT5Feed:
         now_utc = time.time()
         probe_symbols = ("BTCUSD", "ETHUSD", "SOLUSD", "EURUSD", "USDJPY", "XAUUSD")
         tick_times: list[float] = []
+        fresh_count = 0
         seen_names: set[str] = set()
 
         for sym in probe_symbols:
@@ -142,21 +143,31 @@ class MT5Feed:
             seen_names.add(resolved)
             tick = mt5.symbol_info_tick(resolved)
             if tick is not None and float(getattr(tick, "time", 0) or 0) > 0.0:
-                tick_times.append(float(tick.time))
+                t_val = float(tick.time)
+                tick_times.append(t_val)
+                if abs((t_val - self.compute_utc_offset_seconds(t_val, now_utc)) - now_utc) <= 120.0:
+                    fresh_count += 1
 
-        # Fallback consensus scan across mt5.symbols_get() so 24/7 crypto/active feeds override stale FX
-        try:
-            all_syms = mt5.symbols_get() or ()
-            for s in all_syms:
-                sname = str(getattr(s, "name", "") or "")
-                if not sname or sname in seen_names:
-                    continue
-                seen_names.add(sname)
-                tick = mt5.symbol_info_tick(sname)
-                if tick is not None and float(getattr(tick, "time", 0) or 0) > 0.0:
-                    tick_times.append(float(tick.time))
-        except Exception as exc:
-            logger.debug("Fallback mt5.symbols_get() clock scan skipped: %s", exc)
+        # Bounded consensus scan across mt5.symbols_get() only if probes had < 2 fresh active ticks
+        if fresh_count < 2:
+            try:
+                all_syms = list(mt5.symbols_get() or ())
+                all_syms.sort(key=lambda s: (not bool(getattr(s, "visible", False)), str(getattr(s, "name", ""))))
+                for s in all_syms[:40]:
+                    sname = str(getattr(s, "name", "") or "")
+                    if not sname or sname in seen_names:
+                        continue
+                    seen_names.add(sname)
+                    tick = mt5.symbol_info_tick(sname)
+                    if tick is not None and float(getattr(tick, "time", 0) or 0) > 0.0:
+                        t_val = float(tick.time)
+                        tick_times.append(t_val)
+                        if abs((t_val - self.compute_utc_offset_seconds(t_val, now_utc)) - now_utc) <= 120.0:
+                            fresh_count += 1
+                            if fresh_count >= 3:
+                                break
+            except Exception as exc:
+                logger.debug("Fallback mt5.symbols_get() clock scan skipped: %s", exc)
 
         if not tick_times:
             return self._server_utc_offset_seconds
@@ -512,12 +523,13 @@ class MT5Feed:
         lots_raw = float(risk_amount) / loss_per_lot
 
         if vol_step > 0.0:
-            steps = round(lots_raw / vol_step)
+            # Conservative floor snapping guarantees position risk never rounds UP above risk_amount
+            steps = math.floor((lots_raw / vol_step) + 1e-9)
             lots_snapped = steps * vol_step
         else:
             lots_snapped = lots_raw
 
         lots_final = max(vol_min, min(vol_max, lots_snapped))
-        decimals = max(0, -int(math.floor(math.log10(vol_step)))) if vol_step < 1.0 else 0
+        decimals = max(0, min(8, int(round(-math.log10(vol_step))))) if 0.0 < vol_step < 1.0 else 0
         return round(lots_final, decimals)
 

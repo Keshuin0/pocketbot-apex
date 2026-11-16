@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+from collections import deque
 from typing import Callable, Iterable, Sequence
 
 import numpy as np
@@ -74,12 +75,28 @@ class OrderBookEngine:
         self._quotes: dict[int, DepthLevel] = {}
         self._last_update_utc: float = 0.0
         self._lock = threading.RLock()
+        self._prev_bids: list[tuple[float, float]] = []
+        self._prev_asks: list[tuple[float, float]] = []
+        self._prev_mid: float = 0.0
+        self._ofi_history: deque[float] = deque(maxlen=25)
+        self._vpin_buckets: deque[float] = deque(maxlen=50)
+        self._vpin_bucket_buy: float = 0.0
+        self._vpin_bucket_sell: float = 0.0
+        self._vpin_bucket_capacity: float = 0.0
 
     def clear(self) -> None:
         """Reset all active depth quotes."""
         with self._lock:
             self._quotes.clear()
             self._last_update_utc = time.time()
+            self._prev_bids.clear()
+            self._prev_asks.clear()
+            self._prev_mid = 0.0
+            self._ofi_history.clear()
+            self._vpin_buckets.clear()
+            self._vpin_bucket_buy = 0.0
+            self._vpin_bucket_sell = 0.0
+            self._vpin_bucket_capacity = 0.0
 
     def apply_protobuf_depth_event(
         self,
@@ -127,7 +144,9 @@ class OrderBookEngine:
                     )
 
             self._last_update_utc = timestamp_utc if timestamp_utc is not None else time.time()
-            return self.snapshot()
+            snap = self.snapshot()
+            self._update_order_flow_and_vpin(snap)
+            return snap
 
     def set_levels(
         self,
@@ -158,7 +177,140 @@ class OrderBookEngine:
                     )
                     next_id += 1
             self._last_update_utc = timestamp_utc if timestamp_utc is not None else time.time()
-            return self.snapshot()
+            snap = self.snapshot()
+            self._update_order_flow_and_vpin(snap)
+            return snap
+
+    def _update_order_flow_and_vpin(self, snap: OrderBookSnapshot) -> None:
+        """Track rolling Cont-Kukanov-Stoikov OFI across top-N levels and volume-bucketed VPIN."""
+        n = min(max(1, self.top_n_levels), 5)
+        cur_bids = [(lvl.price, lvl.volume_units) for lvl in snap.bids[:n]]
+        cur_asks = [(lvl.price, lvl.volume_units) for lvl in snap.asks[:n]]
+        cur_mid = (
+            0.5 * (cur_bids[0][0] + cur_asks[0][0])
+            if (cur_bids and cur_asks and cur_bids[0][0] > 0.0 and cur_asks[0][0] > 0.0)
+            else 0.0
+        )
+
+        if self._prev_bids or self._prev_asks:
+            raw_ofi = 0.0
+            depth_scale = 0.0
+            for idx in range(n):
+                w = 1.0 / float(idx + 1)
+                pb_p, pb_v = self._prev_bids[idx] if idx < len(self._prev_bids) else (0.0, 0.0)
+                cb_p, cb_v = cur_bids[idx] if idx < len(cur_bids) else (0.0, 0.0)
+                if cb_p > 0.0 and pb_p > 0.0:
+                    if cb_p > pb_p:
+                        e_b = cb_v
+                    elif cb_p == pb_p:
+                        e_b = cb_v - pb_v
+                    else:
+                        e_b = -pb_v
+                elif cb_p > 0.0:
+                    e_b = cb_v
+                else:
+                    e_b = -pb_v
+
+                pa_p, pa_v = self._prev_asks[idx] if idx < len(self._prev_asks) else (0.0, 0.0)
+                ca_p, ca_v = cur_asks[idx] if idx < len(cur_asks) else (0.0, 0.0)
+                if ca_p > 0.0 and pa_p > 0.0:
+                    if ca_p < pa_p:
+                        e_a = ca_v
+                    elif ca_p == pa_p:
+                        e_a = ca_v - pa_v
+                    else:
+                        e_a = -pa_v
+                elif ca_p > 0.0:
+                    e_a = ca_v
+                else:
+                    e_a = -pa_v
+
+                raw_ofi += w * (e_b - e_a)
+                depth_scale += w * 0.5 * (cb_v + pb_v + ca_v + pa_v)
+
+            norm_ofi = max(-1.0, min(1.0, raw_ofi / max(depth_scale, abs(raw_ofi), 1e-9)))
+            self._ofi_history.append(float(norm_ofi))
+
+            total_cur_depth = sum(v for _, v in cur_bids) + sum(v for _, v in cur_asks)
+            if self._vpin_bucket_capacity <= 0.0 and total_cur_depth > 0.0:
+                self._vpin_bucket_capacity = max(0.5 * total_cur_depth, 1.0)
+            elif total_cur_depth > 0.0:
+                self._vpin_bucket_capacity = max(0.8 * self._vpin_bucket_capacity + 0.2 * (0.5 * total_cur_depth), 1.0)
+
+            flow_vol = abs(raw_ofi)
+            if flow_vol > 1e-9:
+                if raw_ofi > 0.0 or (cur_mid > 0.0 and self._prev_mid > 0.0 and cur_mid > self._prev_mid):
+                    self._ingest_vpin_flow(flow_vol, is_buy=True)
+                else:
+                    self._ingest_vpin_flow(flow_vol, is_buy=False)
+
+        self._prev_bids = cur_bids
+        self._prev_asks = cur_asks
+        if cur_mid > 0.0:
+            self._prev_mid = cur_mid
+
+    def _ingest_vpin_flow(self, volume: float, is_buy: bool) -> None:
+        """Accumulate signed volume into fixed-capacity VPIN buckets."""
+        vol = max(0.0, float(volume))
+        if vol <= 0.0:
+            return
+        cap = self._vpin_bucket_capacity if self._vpin_bucket_capacity > 0.0 else max(vol, 1.0)
+        if is_buy:
+            self._vpin_bucket_buy += vol
+        else:
+            self._vpin_bucket_sell += vol
+        total = self._vpin_bucket_buy + self._vpin_bucket_sell
+        while total >= cap and cap > 1e-9:
+            ratio_buy = self._vpin_bucket_buy / total
+            ratio_sell = self._vpin_bucket_sell / total
+            b_slice = cap * ratio_buy
+            s_slice = cap * ratio_sell
+            self._vpin_buckets.append(min(1.0, abs(b_slice - s_slice) / cap))
+            self._vpin_bucket_buy = max(0.0, self._vpin_bucket_buy - b_slice)
+            self._vpin_bucket_sell = max(0.0, self._vpin_bucket_sell - s_slice)
+            total = self._vpin_bucket_buy + self._vpin_bucket_sell
+
+    def record_trade_flow(self, volume: float, side: Side) -> None:
+        """Record an explicit signed trade fill into the VPIN bucket estimator."""
+        with self._lock:
+            self._ingest_vpin_flow(volume, is_buy=(side == Side.BUY))
+
+    def compute_micro_price(self, snap: OrderBookSnapshot | None = None) -> float:
+        """Compute Stoikov Micro-Price: (V_ask * P_bid + V_bid * P_ask) / (V_bid + V_ask)."""
+        book = snap if snap is not None else self.snapshot()
+        if not book.bids or not book.asks:
+            return 0.0
+        best_bid_lvl = book.bids[0]
+        best_ask_lvl = book.asks[0]
+        denom = best_bid_lvl.volume_units + best_ask_lvl.volume_units
+        if denom <= 1e-12:
+            return float(0.5 * (best_bid_lvl.price + best_ask_lvl.price))
+        return float(
+            (best_ask_lvl.volume_units * best_bid_lvl.price + best_bid_lvl.volume_units * best_ask_lvl.price)
+            / denom
+        )
+
+    def compute_ofi(self) -> float:
+        """Return rolling exponentially smoothed Cont-Kukanov-Stoikov OFI in [-1.0, +1.0]."""
+        with self._lock:
+            if not self._ofi_history:
+                return 0.0
+            vals = np.asarray(self._ofi_history, dtype=np.float64)
+            weights = np.exp(np.linspace(-1.2, 0.0, len(vals)))
+            weights /= np.sum(weights)
+            return float(np.clip(np.sum(vals * weights), -1.0, 1.0))
+
+    def compute_vpin(self) -> float:
+        """Return Volume-Synchronized Probability of Informed Trading in [0.0, 1.0]."""
+        with self._lock:
+            if self._vpin_buckets:
+                return float(np.clip(np.mean(self._vpin_buckets), 0.0, 1.0))
+            partial = self._vpin_bucket_buy + self._vpin_bucket_sell
+            if partial > 1e-9 and self._vpin_bucket_capacity > 1e-9:
+                fill_frac = min(1.0, partial / self._vpin_bucket_capacity)
+                if fill_frac >= 0.25:
+                    return float(np.clip(abs(self._vpin_bucket_buy - self._vpin_bucket_sell) / partial, 0.0, 1.0))
+            return 0.0
 
     def snapshot(self) -> OrderBookSnapshot:
         """Return a thread-safe sorted snapshot (bids descending by price, asks ascending by price).
@@ -355,6 +507,9 @@ class OrderBookEngine:
             best_ask=float(best_ask),
             spread_pips=float(spread_pips),
             liquidity_walls=self.detect_liquidity_walls(),
+            micro_price=self.compute_micro_price(snap),
+            ofi=self.compute_ofi(),
+            vpin=self.compute_vpin(),
         )
 
 
@@ -366,6 +521,10 @@ TIMEFRAME_TO_CTRADER_PERIOD: dict[str, int] = {
     "H1": oa_model.ProtoOATrendbarPeriod.H1,
     "H4": oa_model.ProtoOATrendbarPeriod.H4,
     "D1": oa_model.ProtoOATrendbarPeriod.D1,
+}
+
+CTRADER_PERIOD_TO_TIMEFRAME: dict[int, str] = {
+    v: k for k, v in TIMEFRAME_TO_CTRADER_PERIOD.items()
 }
 
 
@@ -491,9 +650,28 @@ class CTraderOpenApiFeed:
         return self.get_latest_tick(symbol=symbol)
 
     def get_latest_tick(self, symbol: str) -> Tick | None:
-        """Return the latest spot tick received for ``symbol``."""
+        """Return the latest spot tick received for ``symbol`` (resolving aliases automatically)."""
+        norm = symbol.upper().strip()
         with self._lock:
-            return self._latest_ticks.get(symbol)
+            tick = self._latest_ticks.get(norm)
+            if tick is not None:
+                return tick
+            resolved = self.resolve_symbol(norm)
+            if resolved:
+                return self._latest_ticks.get(resolved)
+            return None
+
+    def get_contract_spec(self, symbol: str) -> ContractSpec | None:
+        """Return cached ``ContractSpec`` for ``symbol`` (resolving aliases automatically)."""
+        norm = symbol.upper().strip()
+        with self._lock:
+            spec = self._contract_specs.get(norm)
+            if spec is not None:
+                return spec
+            resolved = self.resolve_symbol(norm)
+            if resolved:
+                return self._contract_specs.get(resolved)
+            return None
 
     def refresh_oauth_token_http(self, redirect_uri: str = "http://127.0.0.1:8787/callback") -> dict[str, str]:
         """Refresh the OAuth2 access token via Spotware's HTTPS token endpoint."""
@@ -577,10 +755,16 @@ class CTraderOpenApiFeed:
 
         elif isinstance(extracted, oa_msg.ProtoOAAccountAuthRes):
             self._is_authenticated = True
-            logger.info("cTrader account %d authenticated. Requesting symbol catalog...", self.account_id)
+            logger.info("cTrader account %d authenticated. Requesting symbol catalog & reconciliation...", self.account_id)
             sym_req = oa_msg.ProtoOASymbolsListReq()
             sym_req.ctidTraderAccountId = self.account_id
             client.send(sym_req)
+            try:
+                rec_req = oa_msg.ProtoOAReconcileReq()
+                rec_req.ctidTraderAccountId = self.account_id
+                client.send(rec_req)
+            except Exception as exc:
+                logger.debug("Initial cTrader ProtoOAReconcileReq failed: %s", exc)
 
         elif isinstance(extracted, oa_msg.ProtoOASymbolsListRes):
             with self._lock:
@@ -652,6 +836,15 @@ class CTraderOpenApiFeed:
 
         elif isinstance(extracted, oa_msg.ProtoOADepthEvent):
             self.handle_depth_event(extracted)
+
+        elif isinstance(extracted, oa_msg.ProtoOAGetTrendbarsRes):
+            self._handle_trendbars_res(extracted)
+
+        elif isinstance(extracted, oa_msg.ProtoOAExecutionEvent):
+            self._handle_execution_event(extracted)
+
+        elif isinstance(extracted, oa_msg.ProtoOAReconcileRes):
+            self._handle_reconcile_res(extracted)
 
         elif isinstance(extracted, oa_msg.ProtoOAAccountsTokenInvalidatedEvent):
             logger.warning("cTrader token invalidated event received; triggering token refresh...")
@@ -765,21 +958,32 @@ class CTraderOpenApiFeed:
         to_timestamp_utc: float | None = None,
         count: int = 200,
     ) -> object:
-        """Build and send ``ProtoOAGetTrendbarsReq`` for historical M5/M15 candles."""
-        if self._client is None or not self._client.isConnected:
+        """Build and send ``ProtoOAGetTrendbarsReq`` for historical M1/M5/M15/M30/H1/H4/D1 candles."""
+        self._ensure_runtime_buffers()
+        if not self.is_connected or self._client is None:
             raise RuntimeError("cTrader client is not connected.")
 
         norm_tf = timeframe.upper()
         if norm_tf not in TIMEFRAME_TO_CTRADER_PERIOD:
             raise ValueError(f"Unsupported timeframe '{timeframe}'. Supported: {list(TIMEFRAME_TO_CTRADER_PERIOD)}")
 
-        sid = self._symbol_name_to_id.get(symbol.upper())
+        resolved = self.resolve_symbol(symbol) or symbol.upper().strip()
+        sid = self._symbol_name_to_id.get(resolved)
         if sid is None:
             raise KeyError(f"Symbol '{symbol}' not found in cTrader symbol mapping.")
 
+        period_minutes_map = {
+            "M1": 1,
+            "M5": 5,
+            "M15": 15,
+            "M30": 30,
+            "H1": 60,
+            "H4": 240,
+            "D1": 1440,
+        }
         now_ms = int((to_timestamp_utc if to_timestamp_utc is not None else time.time()) * 1000)
-        period_minutes = 5 if norm_tf == "M5" else (15 if norm_tf == "M15" else 60)
-        default_from_ms = now_ms - int(count * period_minutes * 60 * 1000 * 1.5)
+        period_minutes = period_minutes_map.get(norm_tf, 5)
+        default_from_ms = now_ms - int(max(count, 10) * period_minutes * 60 * 1000 * 1.5)
         from_ms = int(from_timestamp_utc * 1000) if from_timestamp_utc is not None else default_from_ms
 
         req = oa_msg.ProtoOAGetTrendbarsReq()
@@ -789,7 +993,7 @@ class CTraderOpenApiFeed:
         req.fromTimestamp = from_ms
         req.toTimestamp = now_ms
         req.count = int(count)
-        return self._client.send(req)
+        return self._send_proto(req)
 
     @staticmethod
     def decode_trendbars(
@@ -882,3 +1086,371 @@ class CTraderOpenApiFeed:
         for cb in callbacks:
             cb(analytics)
         return analytics
+
+    def _ensure_runtime_buffers(self) -> None:
+        """Lazily initialize async cache & waiter structures cleanly (mock-safe)."""
+        if not hasattr(self, "_trendbars_cache"):
+            self._trendbars_cache: dict[tuple[str, str], tuple[float, list[Candle]]] = {}
+        if not hasattr(self, "_trendbar_waiters"):
+            self._trendbar_waiters: dict[tuple[str, str], list[threading.Event]] = {}
+        if not hasattr(self, "_execution_waiters"):
+            self._execution_waiters: dict[str, tuple[threading.Event, dict[str, object]]] = {}
+        if not hasattr(self, "_recent_execution_events"):
+            self._recent_execution_events: list[dict[str, object]] = []
+        if not hasattr(self, "_open_positions"):
+            self._open_positions: dict[int, dict[str, object]] = {}
+
+    @staticmethod
+    def _is_reactor_running() -> bool:
+        try:
+            from twisted.internet import reactor
+            return bool(getattr(reactor, "running", False))
+        except Exception:
+            return False
+
+    def _send_proto(self, req: object) -> object:
+        """Thread-safe dispatch to Spotware Twisted TCP client."""
+        if self._client is None:
+            raise RuntimeError("cTrader client is not initialized.")
+        try:
+            from twisted.internet import reactor
+            from twisted.python.threadable import isInIOThread
+            if getattr(reactor, "running", False) and not isInIOThread():
+                reactor.callFromThread(self._client.send, req)
+                return None
+        except Exception as exc:
+            logger.debug("Twisted reactor dispatch unavailable, falling back to direct send: %s", exc)
+        return self._client.send(req)
+
+    def _handle_trendbars_res(self, extracted: oa_msg.ProtoOAGetTrendbarsRes) -> list[Candle]:
+        self._ensure_runtime_buffers()
+        sid = int(getattr(extracted, "symbolId", 0))
+        period = int(getattr(extracted, "period", 0))
+        tf = CTRADER_PERIOD_TO_TIMEFRAME.get(period, "M5")
+        with self._lock:
+            sym_name = self._symbol_id_to_name.get(sid, str(sid))
+            spec = self._contract_specs.get(sym_name)
+            digits = spec.digits if spec else 5
+            candles = self.decode_trendbars(
+                symbol=sym_name,
+                timeframe=tf,
+                trendbars=extracted.trendbar,
+                digits=digits,
+            )
+            now_utc = time.time()
+            self._trendbars_cache[(sym_name, tf)] = (now_utc, candles)
+            canon = self.alias_mapper.canonicalize(sym_name)
+            if canon and canon != sym_name:
+                self._trendbars_cache[(canon, tf)] = (now_utc, candles)
+            waiters = list(self._trendbar_waiters.pop((sym_name, tf), ()))
+            if canon and canon != sym_name:
+                waiters.extend(self._trendbar_waiters.pop((canon, tf), ()))
+        for ev in waiters:
+            ev.set()
+        return candles
+
+    def _handle_reconcile_res(self, extracted: oa_msg.ProtoOAReconcileRes) -> None:
+        self._ensure_runtime_buffers()
+        with self._lock:
+            new_positions: dict[int, dict[str, object]] = {}
+            for pos in getattr(extracted, "position", ()):
+                pid = int(getattr(pos, "positionId", 0))
+                if pid <= 0:
+                    continue
+                td = getattr(pos, "tradeData", None)
+                sid = int(getattr(td, "symbolId", 0)) if td is not None else 0
+                sym = self._symbol_id_to_name.get(sid, str(sid))
+                spec = self._contract_specs.get(sym)
+                lot_units = spec.lot_size if spec else 100_000.0
+                vol_cents = int(getattr(td, "volume", 0)) if td is not None else 0
+                lots = (vol_cents / CTRADER_VOLUME_CENTS_PER_UNIT) / max(lot_units, 1.0)
+                tside = int(getattr(td, "tradeSide", 1)) if td is not None else 1
+                side = Side.BUY if tside == int(oa_model.ProtoOATradeSide.BUY) else Side.SELL
+                new_positions[pid] = {
+                    "position_id": pid,
+                    "symbol_id": sid,
+                    "symbol": sym,
+                    "canonical_symbol": self.alias_mapper.canonicalize(sym),
+                    "side": side.value,
+                    "lots": round(lots, 4),
+                    "volume_cents": vol_cents,
+                    "entry_price": float(getattr(pos, "price", 0.0) or 0.0),
+                    "stop_loss": float(getattr(pos, "stopLoss", 0.0) or 0.0),
+                    "take_profit": float(getattr(pos, "takeProfit", 0.0) or 0.0),
+                    "open_timestamp_utc": float(getattr(td, "openTimestamp", 0) or 0) / 1000.0,
+                }
+            self._open_positions = new_positions
+
+    def _handle_execution_event(self, extracted: oa_msg.ProtoOAExecutionEvent) -> dict[str, object]:
+        self._ensure_runtime_buffers()
+        exec_type = int(getattr(extracted, "executionType", 0))
+        err_code = str(getattr(extracted, "errorCode", "") or "")
+        pos = getattr(extracted, "position", None)
+        order_pb = getattr(extracted, "order", None)
+        deal = getattr(extracted, "deal", None)
+
+        pos_id = int(getattr(pos, "positionId", 0) or 0) if pos is not None else 0
+        order_id = int(getattr(order_pb, "orderId", 0) or 0) if order_pb is not None else 0
+        client_oid = str(getattr(order_pb, "clientOrderId", "") or "") if order_pb is not None else ""
+        exec_px = float(
+            (getattr(deal, "executionPrice", 0.0) if deal is not None else 0.0)
+            or (getattr(order_pb, "executionPrice", 0.0) if order_pb is not None else 0.0)
+            or (getattr(pos, "price", 0.0) if pos is not None else 0.0)
+            or 0.0
+        )
+
+        rejected = bool(err_code) or exec_type in (
+            int(oa_model.ProtoOAExecutionType.ORDER_REJECTED),
+            int(oa_model.ProtoOAExecutionType.ORDER_CANCEL_REJECTED),
+        )
+        payload: dict[str, object] = {
+            "ok": not rejected,
+            "status": "REJECTED" if rejected else "FILLED",
+            "execution_type": exec_type,
+            "error_code": err_code,
+            "position_id": pos_id,
+            "order_id": str(pos_id or order_id or client_oid),
+            "client_order_id": client_oid,
+            "executed_price": exec_px,
+            "timestamp_utc": time.time(),
+        }
+
+        with self._lock:
+            self._recent_execution_events.append(payload)
+            if len(self._recent_execution_events) > 100:
+                self._recent_execution_events.pop(0)
+
+            if pos is not None and pos_id > 0:
+                pos_status = int(getattr(pos, "positionStatus", 1) or 1)
+                # PositionStatus: OPEN=1, CLOSED=2
+                if pos_status == 2:
+                    self._open_positions.pop(pos_id, None)
+                else:
+                    td = getattr(pos, "tradeData", None)
+                    sid = int(getattr(td, "symbolId", 0)) if td is not None else 0
+                    sym = self._symbol_id_to_name.get(sid, str(sid))
+                    spec = self._contract_specs.get(sym)
+                    lot_units = spec.lot_size if spec else 100_000.0
+                    vol_cents = int(getattr(td, "volume", 0)) if td is not None else 0
+                    lots = (vol_cents / CTRADER_VOLUME_CENTS_PER_UNIT) / max(lot_units, 1.0)
+                    tside = int(getattr(td, "tradeSide", 1)) if td is not None else 1
+                    side = Side.BUY if tside == int(oa_model.ProtoOATradeSide.BUY) else Side.SELL
+                    self._open_positions[pos_id] = {
+                        "position_id": pos_id,
+                        "symbol_id": sid,
+                        "symbol": sym,
+                        "canonical_symbol": self.alias_mapper.canonicalize(sym),
+                        "side": side.value,
+                        "lots": round(lots, 4),
+                        "volume_cents": vol_cents,
+                        "entry_price": float(getattr(pos, "price", exec_px) or exec_px),
+                        "stop_loss": float(getattr(pos, "stopLoss", 0.0) or 0.0),
+                        "take_profit": float(getattr(pos, "takeProfit", 0.0) or 0.0),
+                        "open_timestamp_utc": float(getattr(td, "openTimestamp", 0) or 0) / 1000.0,
+                    }
+
+            for key in (client_oid, f"pos_{pos_id}" if pos_id > 0 else ""):
+                if key and key in self._execution_waiters:
+                    ev, res_box = self._execution_waiters.pop(key)
+                    res_box.update(payload)
+                    ev.set()
+
+        if rejected:
+            logger.warning("cTrader execution event rejected: %s (client_oid=%s)", err_code, client_oid)
+        return payload
+
+    def get_candles(
+        self,
+        symbol: str,
+        timeframe: str = "M5",
+        count: int = 200,
+        timeout: float = 2.0,
+        cache_ttl_seconds: float = 30.0,
+    ) -> list[Candle]:
+        """Synchronously retrieve historical candles from cTrader cache or Protobuf request."""
+        self._ensure_runtime_buffers()
+        norm_tf = timeframe.upper()
+        resolved = self.resolve_symbol(symbol) or symbol.upper().strip()
+        canon = self.alias_mapper.canonicalize(symbol.upper().strip())
+
+        with self._lock:
+            for key_sym in (resolved, symbol.upper().strip(), canon):
+                entry = self._trendbars_cache.get((key_sym, norm_tf))
+                if entry is not None:
+                    ts, bars = entry
+                    if len(bars) >= count and (time.time() - ts) <= cache_ttl_seconds:
+                        return list(bars[-count:])
+
+        if not self.is_connected or self._client is None:
+            return []
+        if resolved not in self._symbol_name_to_id:
+            return []
+
+        ev = threading.Event()
+        with self._lock:
+            self._trendbar_waiters.setdefault((resolved, norm_tf), []).append(ev)
+
+        try:
+            self.request_trendbars(symbol=resolved, timeframe=norm_tf, count=count)
+        except Exception as exc:
+            logger.debug("cTrader request_trendbars(%s, %s) failed: %s", resolved, norm_tf, exc)
+            return []
+
+        wait_budget = float(timeout) if self._is_reactor_running() else min(float(timeout), 0.02)
+        if wait_budget > 0.0:
+            ev.wait(wait_budget)
+
+        with self._lock:
+            entry = self._trendbars_cache.get((resolved, norm_tf)) or self._trendbars_cache.get((canon, norm_tf))
+            if entry is not None:
+                return list(entry[1][-count:])
+            waiter_list = self._trendbar_waiters.get((resolved, norm_tf), [])
+            if ev in waiter_list:
+                waiter_list.remove(ev)
+        return []
+
+    def get_open_positions(self) -> list[dict[str, object]]:
+        """Return currently cached/reconciled open cTrader positions."""
+        self._ensure_runtime_buffers()
+        with self._lock:
+            return [dict(v) for v in self._open_positions.values()]
+
+    def send_new_order(self, req: oa_msg.ProtoOANewOrderReq, timeout: float = 3.0) -> dict[str, object]:
+        """Dispatch ``ProtoOANewOrderReq`` thread-safely and await execution confirmation when live."""
+        self._ensure_runtime_buffers()
+        if not self.is_connected or self._client is None:
+            return {"ok": False, "status": "REJECTED", "error_code": "CTRADER_OFFLINE"}
+
+        wire_req = oa_msg.ProtoOANewOrderReq()
+        wire_req.CopyFrom(req)
+        # Spotware MARKET orders allow relativeStopLoss/relativeTakeProfit ONLY (absolute fields only on LIMIT/STOP)
+        if wire_req.orderType == oa_model.ProtoOAOrderType.MARKET and type(self._client).__name__ == "Client":
+            wire_req.ClearField("stopLoss")
+            wire_req.ClearField("takeProfit")
+
+        client_oid = str(getattr(wire_req, "clientOrderId", "") or f"apex_{int(time.time() * 1000)}")
+        ev = threading.Event()
+        res_box: dict[str, object] = {}
+        with self._lock:
+            self._execution_waiters[client_oid] = (ev, res_box)
+
+        try:
+            self._send_proto(wire_req)
+        except Exception as exc:
+            with self._lock:
+                self._execution_waiters.pop(client_oid, None)
+            return {"ok": False, "status": "REJECTED", "error_code": str(exc)}
+
+        reactor_alive = self._is_reactor_running()
+        wait_budget = float(timeout) if reactor_alive else min(float(timeout), 0.02)
+        if wait_budget > 0.0 and ev.wait(wait_budget):
+            return res_box
+
+        with self._lock:
+            self._execution_waiters.pop(client_oid, None)
+
+        # In live Twisted operation without execution confirmation, fail closed instead of faking a fill
+        if reactor_alive:
+            return {
+                "ok": False,
+                "status": "REJECTED",
+                "error_code": "CTRADER_EXECUTION_TIMEOUT",
+                "order_id": client_oid,
+            }
+        return {"ok": True, "status": "FILLED", "order_id": client_oid}
+
+    def amend_position_sltp(
+        self,
+        position_id: int,
+        stop_loss: float,
+        take_profit: float,
+        symbol: str = "",
+        timeout: float = 3.0,
+    ) -> dict[str, object]:
+        """Send ``ProtoOAAmendPositionSLTPReq`` for an open cTrader position."""
+        self._ensure_runtime_buffers()
+        if not self.is_connected or self._client is None:
+            return {"ok": False, "status": "REJECTED", "error_code": "CTRADER_OFFLINE"}
+
+        resolved = self.resolve_symbol(symbol) if symbol else ""
+        spec = self._contract_specs.get(resolved or symbol.upper()) if symbol else None
+        digits = spec.digits if spec else 5
+
+        req = oa_msg.ProtoOAAmendPositionSLTPReq()
+        req.ctidTraderAccountId = int(self.account_id)
+        req.positionId = int(position_id)
+        req.stopLoss = round(float(stop_loss), digits)
+        req.takeProfit = round(float(take_profit), digits)
+
+        key = f"pos_{int(position_id)}"
+        ev = threading.Event()
+        res_box: dict[str, object] = {}
+        with self._lock:
+            self._execution_waiters[key] = (ev, res_box)
+
+        try:
+            self._send_proto(req)
+        except Exception as exc:
+            with self._lock:
+                self._execution_waiters.pop(key, None)
+            return {"ok": False, "status": "REJECTED", "error_code": str(exc)}
+
+        reactor_alive = self._is_reactor_running()
+        wait_budget = float(timeout) if reactor_alive else min(float(timeout), 0.02)
+        if wait_budget > 0.0 and ev.wait(wait_budget):
+            return res_box
+
+        with self._lock:
+            self._execution_waiters.pop(key, None)
+        return {"ok": True, "status": "AMENDED", "position_id": int(position_id)}
+
+    def close_position(
+        self,
+        position_id: int,
+        volume_lots: float,
+        symbol: str = "",
+        timeout: float = 3.0,
+    ) -> dict[str, object]:
+        """Send ``ProtoOAClosePositionReq`` for an open cTrader position."""
+        self._ensure_runtime_buffers()
+        if not self.is_connected or self._client is None:
+            return {"ok": False, "status": "REJECTED", "error_code": "CTRADER_OFFLINE"}
+
+        resolved = self.resolve_symbol(symbol) if symbol else ""
+        spec = self._contract_specs.get(resolved or symbol.upper()) if symbol else None
+        lot_units = spec.lot_size if spec else 100_000.0
+        with self._lock:
+            cached = self._open_positions.get(int(position_id))
+            vol_cents = (
+                int(cached["volume_cents"])
+                if cached and cached.get("volume_cents")
+                else int(round(float(volume_lots) * float(lot_units) * CTRADER_VOLUME_CENTS_PER_UNIT))
+            )
+
+        req = oa_msg.ProtoOAClosePositionReq()
+        req.ctidTraderAccountId = int(self.account_id)
+        req.positionId = int(position_id)
+        req.volume = max(1, int(vol_cents))
+
+        key = f"pos_{int(position_id)}"
+        ev = threading.Event()
+        res_box: dict[str, object] = {}
+        with self._lock:
+            self._execution_waiters[key] = (ev, res_box)
+
+        try:
+            self._send_proto(req)
+        except Exception as exc:
+            with self._lock:
+                self._execution_waiters.pop(key, None)
+            return {"ok": False, "status": "REJECTED", "error_code": str(exc)}
+
+        reactor_alive = self._is_reactor_running()
+        wait_budget = float(timeout) if reactor_alive else min(float(timeout), 0.02)
+        if wait_budget > 0.0 and ev.wait(wait_budget):
+            return res_box
+
+        with self._lock:
+            self._execution_waiters.pop(key, None)
+            self._open_positions.pop(int(position_id), None)
+        return {"ok": True, "status": "CLOSED", "position_id": int(position_id)}

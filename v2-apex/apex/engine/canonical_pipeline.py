@@ -15,6 +15,7 @@ from apex.ai.aegis_verifier import AegisVerifier
 from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.models import AssetClass, Candle, Side
+from apex.quant.contagion_oracle import ContagionOracle
 from apex.quant.correlation_shield import CorrelationShield, PositionRiskSpec
 from apex.quant.momentum_dom import DOMAnalytics, MomentumDOMGate
 from apex.quant.mtf_confluence import MTFConfluenceFilter
@@ -49,6 +50,41 @@ class AgentPipelineTrace:
     recommended_risk_pct: float
     z3_status: str
     stages: list[PipelineStageResult] = field(default_factory=list)
+    regime: str = ""
+    hurst_exponent: float = 0.5
+    kaufman_er: float = 0.0
+    volatility_percentile: float = 0.5
+    dom_obi: float = 0.0
+    spread_pct_of_sl: float = 0.0
+    prob_profit: float = 0.0
+    cvar_95_r: float = 0.0
+    ai_decision: str = ""
+    ai_reason: str = ""
+    ai_model: str = ""
+    ai_provider: str = ""
+    ai_confidence: float = 0.0
+    ai_risk_multiplier: float = 1.0
+    winning_venue: str = ""
+
+    @property
+    def blocked_stage(self) -> str | None:
+        """Return the first stage label that blocked this trace, or None if all passed."""
+        if self.passed_all:
+            return None
+        for stage in self.stages:
+            if not stage.passed:
+                return f"Stage {stage.stage_num}: {stage.agent_name}"
+        return self.final_decision or "PIPELINE_BLOCKED"
+
+    @property
+    def blocked_reason(self) -> str:
+        """Return the detail string of the first failed stage, or empty string if passed."""
+        if self.passed_all:
+            return ""
+        for stage in self.stages:
+            if not stage.passed:
+                return stage.detail
+        return self.final_decision
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -60,19 +96,31 @@ class AgentPipelineTrace:
             "take_profit": self.take_profit,
             "passed_all": self.passed_all,
             "final_decision": self.final_decision,
+            "blocked_stage": self.blocked_stage,
+            "blocked_reason": self.blocked_reason,
             "net_avg_r": self.net_avg_r,
             "recommended_risk_pct": self.recommended_risk_pct,
+            "ai_risk_multiplier": self.ai_risk_multiplier,
+            "ai_decision": self.ai_decision,
+            "ai_model": self.ai_model,
+            "ai_reason": self.ai_reason,
             "z3_status": self.z3_status,
             "stages": [asdict(s) for s in self.stages],
         }
 
 
-def compute_asset_class_commission_usd(symbol: str, asset_class: Optional[AssetClass] = None) -> float:
-    """Fusion Markets Zero: $4.50/lot round-turn ONLY on FOREX and METALS ($0 on Crypto/Indices/Equities/Energy/Commodities)."""
+def compute_asset_class_commission_usd(
+    symbol: str,
+    asset_class: Optional[AssetClass] = None,
+    *,
+    forex_metals_commission_usd: float = 4.50,
+    other_commission_usd: float = 0.0,
+) -> float:
+    """Fusion Markets Zero: commission ONLY on FOREX and METALS by default ($0 on Crypto/Indices/Equities/Energy)."""
     ac = asset_class or SmartAliasMapper().classify_asset_class(symbol)
     if ac in (AssetClass.FOREX, AssetClass.METALS):
-        return 4.50
-    return 0.0
+        return float(forex_metals_commission_usd)
+    return float(other_commission_usd)
 
 
 class Canonical11AgentPipeline:
@@ -87,15 +135,41 @@ class Canonical11AgentPipeline:
         time_machine: Optional[BlockBootstrapTimeMachine] = None,
         correlation_shield: Optional[CorrelationShield] = None,
         ai_committee: Optional[AIVetoCommittee] = None,
-        min_net_avg_r: float = 0.10,
+        contagion_oracle: Optional[ContagionOracle] = None,
+        config: Optional[dict[str, Any]] = None,
+        min_net_avg_r: Optional[float] = None,
+        default_risk_pct: Optional[float] = None,
+        forex_metals_commission_usd: Optional[float] = None,
+        other_commission_usd: Optional[float] = None,
+        horizon_bars: Optional[int] = None,
     ) -> None:
+        cfg = dict(config or {})
+        risk_cfg = dict(cfg.get("risk", {})) if isinstance(cfg.get("risk"), dict) else {}
+        tm_replays = int(risk_cfg.get("monte_carlo_replays", 8192) or 8192)
         self.regime_classifier = regime_classifier or RegimeClassifier()
         self.momentum_dom_gate = momentum_dom_gate or MomentumDOMGate()
         self.mtf_filter = mtf_filter or MTFConfluenceFilter()
-        self.time_machine = time_machine or BlockBootstrapTimeMachine(replays=2000, seed=19)
-        self.correlation_shield = correlation_shield or CorrelationShield(account_equity_usd=10_000.0)
+        self.time_machine = time_machine or BlockBootstrapTimeMachine(replays=tm_replays, seed=19)
+        self.correlation_shield = correlation_shield or CorrelationShield(
+            max_factor_risk_pct=float(risk_cfg.get("max_factor_risk_pct", 1.0)),
+            account_equity_usd=float(risk_cfg.get("account_equity_usd", 10_000.0)),
+        )
         self.ai_committee = ai_committee
-        self.min_net_avg_r = float(min_net_avg_r)
+        self.contagion_oracle = contagion_oracle
+        self.config = cfg
+        self.min_net_avg_r = float(min_net_avg_r if min_net_avg_r is not None else risk_cfg.get("min_net_avg_r", 0.10))
+        self.default_risk_pct = float(
+            default_risk_pct if default_risk_pct is not None else risk_cfg.get("default_risk_per_trade_pct", 0.50)
+        )
+        self.forex_metals_commission_usd = float(
+            forex_metals_commission_usd
+            if forex_metals_commission_usd is not None
+            else risk_cfg.get("forex_metals_commission_usd", 4.50)
+        )
+        self.other_commission_usd = float(
+            other_commission_usd if other_commission_usd is not None else risk_cfg.get("other_commission_usd", 0.0)
+        )
+        self.horizon_bars = int(horizon_bars if horizon_bars is not None else risk_cfg.get("horizon_bars", 36))
         self._alias_mapper = SmartAliasMapper()
 
     def evaluate(
@@ -110,12 +184,19 @@ class Canonical11AgentPipeline:
         spread_price: float = 0.0,
         pip_size: float = 0.0001,
         dom_analytics: Optional[DOMAnalytics] = None,
-        cross_asset_shock_z: float = 0.0,
-        rollover_illiquidity_flag: bool = False,
+        cross_asset_shock_z: Optional[float] = None,
+        rollover_illiquidity_flag: Optional[bool] = None,
         open_positions: Sequence[PositionRiskSpec] = (),
         risk_per_lot_usd: float = 100.0,
+        contract_spec: Any = None,
+        cost_model: Optional[TimeMachineCostModel] = None,
         run_ai_committee: bool = False,
         in_flight_ready: bool = True,
+        feed_router: Any = None,
+        winning_venue: str = "",
+        historical_spreads: Sequence[float] | None = None,
+        current_tick_rate: float | None = None,
+        historical_tick_rates: Sequence[float] | None = None,
     ) -> AgentPipelineTrace:
         """Execute all 11 stages deterministically and emit an AgentPipelineTrace."""
         candles = list(candles or ())
@@ -124,11 +205,14 @@ class Canonical11AgentPipeline:
         stages: list[PipelineStageResult] = []
         asset_class = self._alias_mapper.classify_asset_class(symbol)
 
-        # Stage 2 first computes ATR/Hurst/ER for downstream geometry, recorded in order 1..11
+        # Stage 2 first computes ATR/Hurst/ER + microstructure telemetry, recorded in order 1..11
         diag = self.regime_classifier.classify_candles(
             symbol=symbol,
             candles=candles,
             current_spread=spread_price if spread_price > 0.0 else None,
+            historical_spreads=historical_spreads,
+            current_tick_rate=current_tick_rate,
+            historical_tick_rates=historical_tick_rates,
         )
         atr_val = max(diag.current_atr, max(pip_size, 1e-6) * 5.0)
         sl_dist = 1.5 * atr_val
@@ -174,14 +258,16 @@ class Canonical11AgentPipeline:
             candles=candles,
             current_spread=spread_price,
             dom_analytics=dom_analytics,
+            hawkes_intensity_ratio=diag.hawkes_intensity_ratio,
         )
+        spread_pct_of_sl_pct = float(gate_verdict.spread_pct_of_sl) * 100.0
         stages.append(
             PipelineStageResult(
                 stage_num=3,
                 agent_name="trader-entry + MomentumDOM",
                 passed=gate_verdict.passed,
                 detail=("; ".join(gate_verdict.reasons) if gate_verdict.reasons else ("OK" if gate_verdict.passed else "Blocked")),
-                metric_value=f"spread%SL={gate_verdict.spread_pct_of_sl:.1f}%",
+                metric_value=f"spread%SL={spread_pct_of_sl_pct:.1f}%",
             )
         )
 
@@ -198,13 +284,29 @@ class Canonical11AgentPipeline:
         )
 
         # Stage 5: 10,000-Path TimeMachine v2 (asset-class commission)
-        comm_usd = compute_asset_class_commission_usd(symbol, asset_class=asset_class)
-        cost_model = TimeMachineCostModel(
+        comm_usd = compute_asset_class_commission_usd(
+            symbol,
+            asset_class=asset_class,
+            forex_metals_commission_usd=self.forex_metals_commission_usd,
+            other_commission_usd=self.other_commission_usd,
+        )
+        effective_risk_per_lot = max(float(risk_per_lot_usd), 1.0)
+        if contract_spec is not None:
+            t_val = float(getattr(contract_spec, "trade_tick_value", 0.0) or 0.0)
+            t_size = float(getattr(contract_spec, "trade_tick_size", 0.0) or 0.0)
+            lot_sz = float(getattr(contract_spec, "lot_size", 0.0) or 0.0)
+            if t_val > 0.0 and t_size > 0.0:
+                effective_risk_per_lot = max((sl_dist / t_size) * t_val, 1.0)
+            elif lot_sz > 0.0 and sl_dist * lot_sz > 0.0:
+                effective_risk_per_lot = max(sl_dist * lot_sz, 1.0)
+
+        eff_cost_model = cost_model or TimeMachineCostModel(
             commission_per_lot_round_turn_usd=comm_usd,
             lots=0.10,
-            risk_per_lot_usd=max(risk_per_lot_usd, 1.0),
+            risk_per_lot_usd=effective_risk_per_lot,
             spread_price=spread_price,
             vwap_slippage_price=0.2 * pip_size,
+            asymmetric_barriers=True,
         )
         tm_res = self.time_machine.simulate_candles(
             symbol=symbol,
@@ -213,8 +315,11 @@ class Canonical11AgentPipeline:
             stop_price=stop_px,
             target_price=target_px,
             candles=candles,
-            horizon_bars=36,
-            cost_model=cost_model,
+            horizon_bars=self.horizon_bars,
+            cost_model=eff_cost_model,
+            current_hurst=diag.hurst_exponent,
+            current_er=diag.kaufman_er,
+            current_vol_pct=diag.volatility_percentile,
         )
         tm_ok = tm_res.net_avg_R >= self.min_net_avg_r
         stages.append(
@@ -228,14 +333,31 @@ class Canonical11AgentPipeline:
         )
 
         # Stage 6: Contagion / News / Analyst
-        contagion_ok = (cross_asset_shock_z <= 3.5) and not (rollover_illiquidity_flag and diag.volatility_percentile > 85.0)
+        if (cross_asset_shock_z is None or rollover_illiquidity_flag is None) and self.contagion_oracle is not None:
+            bar_dt = (
+                datetime.datetime.fromtimestamp(float(candles[-1].timestamp_utc), tz=datetime.timezone.utc)
+                if candles
+                else datetime.datetime.now(datetime.timezone.utc)
+            )
+            contagion = self.contagion_oracle.evaluate(feed_router=feed_router, utc_dt=bar_dt)
+            resolved_shock_z = float(contagion.cross_asset_shock_z if cross_asset_shock_z is None else cross_asset_shock_z)
+            resolved_rollover = bool(
+                contagion.rollover_illiquidity_flag
+                if rollover_illiquidity_flag is None
+                else rollover_illiquidity_flag
+            )
+        else:
+            resolved_shock_z = float(cross_asset_shock_z or 0.0)
+            resolved_rollover = bool(rollover_illiquidity_flag or False)
+
+        contagion_ok = (resolved_shock_z <= 3.5) and not (resolved_rollover and diag.volatility_percentile > 85.0)
         stages.append(
             PipelineStageResult(
                 stage_num=6,
                 agent_name="Contagion / News / Analyst",
                 passed=contagion_ok,
-                detail=f"shock_z={cross_asset_shock_z:.2f}, rollover={rollover_illiquidity_flag}",
-                metric_value=f"Z={cross_asset_shock_z:.2f}",
+                detail=f"shock_z={resolved_shock_z:.2f}, rollover={resolved_rollover}",
+                metric_value=f"Z={resolved_shock_z:.2f}",
             )
         )
 
@@ -253,18 +375,19 @@ class Canonical11AgentPipeline:
         )
 
         # Stage 8: trader-risk + CorrelationShield
-        proposed_risk_pct = rec_risk if rec_risk > 0.0 else 0.50
+        proposed_risk_pct = rec_risk if rec_risk > 0.0 else self.default_risk_pct
         corr_verdict = self.correlation_shield.evaluate_proposed_trade(
             proposed=PositionRiskSpec(symbol=symbol, side=side, risk_pct=proposed_risk_pct),
             open_positions=open_positions,
         )
+        corr_ok = bool(corr_verdict.allowed)
         stages.append(
             PipelineStageResult(
                 stage_num=8,
                 agent_name="trader-risk + CorrelationShield",
-                passed=corr_verdict.allowed,
+                passed=corr_ok,
                 detail=corr_verdict.reason,
-                metric_value="CAP<=1.0%",
+                metric_value=f"CAP<={self.correlation_shield.max_factor_risk_pct:.1f}%",
             )
         )
 
@@ -273,14 +396,20 @@ class Canonical11AgentPipeline:
             "symbol": symbol,
             "side": side.value,
             "timemachine_net_avg_R": tm_res.net_avg_R,
-            "spread_pct_of_sl": gate_verdict.spread_pct_of_sl,
+            "spread_pct_of_sl": spread_pct_of_sl_pct,
             "vol_pct": diag.volatility_percentile,
-            "cross_asset_shock_z": cross_asset_shock_z,
-            "rollover_illiquidity_flag": rollover_illiquidity_flag,
+            "cross_asset_shock_z": resolved_shock_z,
+            "rollover_illiquidity_flag": resolved_rollover,
         }
         z3_dec, z3_msg = AegisVerifier.z3_pure_math_axiom_gate(z3_telemetry)
         ai_ok = z3_dec == "APPROVE"
         ai_detail = z3_msg
+        ai_decision_label = z3_dec if not ai_ok else ("FILTERED" if not (pre_quant_ok and corr_ok) else "APPROVE")
+        ai_reason_text = z3_msg
+        ai_model_name = "Z3_AXIOM_GATE" if not ai_ok else "PURE_QUANT"
+        ai_provider_name = "z3" if not ai_ok else "quant"
+        ai_conf = 0.0
+        ai_risk_mult = 1.0 if (pre_quant_ok and corr_ok and ai_ok) else 0.0
 
         if run_ai_committee and self.ai_committee is not None and pre_quant_ok and corr_ok and ai_ok:
             bar_ts = float(candles[-1].timestamp_utc) if candles else time.time()
@@ -303,12 +432,24 @@ class Canonical11AgentPipeline:
                 recommended_risk_pct=rec_risk,
                 session_utc_iso=datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 bar_timestamp=bar_ts,
-                rollover_illiquidity_flag=rollover_illiquidity_flag,
-                cross_asset_shock_z=cross_asset_shock_z,
+                rollover_illiquidity_flag=resolved_rollover,
+                cross_asset_shock_z=resolved_shock_z,
             )
             ai_res = self.ai_committee.evaluate_sync(ctx)
-            ai_ok = ai_res.decision == "APPROVE"
-            ai_detail = f"{ai_res.decision} ({ai_res.model_used}) | {z3_msg}"
+            raw_dec = getattr(ai_res, "decision", "VETO")
+            raw_reason = getattr(ai_res, "reason", "")
+            raw_model = getattr(ai_res, "model_used", "")
+            raw_prov = getattr(ai_res, "provider_used", "")
+            raw_conf = getattr(ai_res, "confidence", 0.0)
+            raw_mult = getattr(ai_res, "risk_multiplier", None)
+            ai_ok = raw_dec == "APPROVE"
+            ai_decision_label = raw_dec if isinstance(raw_dec, str) else "FILTERED"
+            ai_reason_text = raw_reason if isinstance(raw_reason, str) else z3_msg
+            ai_model_name = raw_model if isinstance(raw_model, str) else "AI_COMMITTEE"
+            ai_provider_name = raw_prov if isinstance(raw_prov, str) else "ai"
+            ai_conf = float(raw_conf) if isinstance(raw_conf, (int, float)) else 0.0
+            ai_risk_mult = float(raw_mult) if isinstance(raw_mult, (int, float)) else (1.0 if ai_ok else 0.0)
+            ai_detail = f"{ai_decision_label} ({ai_model_name}) | {z3_msg}"
 
         stages.append(
             PipelineStageResult(
@@ -358,4 +499,19 @@ class Canonical11AgentPipeline:
             recommended_risk_pct=round(rec_risk, 4),
             z3_status=z3_msg,
             stages=stages,
+            regime=diag.regime.value,
+            hurst_exponent=round(float(diag.hurst_exponent), 4),
+            kaufman_er=round(float(diag.kaufman_er), 4),
+            volatility_percentile=round(float(diag.volatility_percentile), 2),
+            dom_obi=round(float(dom_analytics.obi), 4) if dom_analytics else 0.0,
+            spread_pct_of_sl=round(float(gate_verdict.spread_pct_of_sl), 6),
+            prob_profit=round(float(tm_res.prob_profit), 4),
+            cvar_95_r=round(float(tm_res.cvar_95_R), 4),
+            ai_decision=ai_decision_label,
+            ai_reason=ai_reason_text,
+            ai_model=ai_model_name,
+            ai_provider=ai_provider_name,
+            ai_confidence=ai_conf,
+            ai_risk_multiplier=ai_risk_mult,
+            winning_venue=winning_venue,
         )

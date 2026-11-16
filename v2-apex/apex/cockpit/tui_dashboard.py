@@ -297,3 +297,49 @@ class ApexTUIDashboard:
             live.update(group, refresh=True)
         else:
             self.console.print(group)
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    import sys
+
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+    parser = argparse.ArgumentParser(description="PocketBot Apex TUI Cockpit Diagnostic Preview")
+    parser.add_argument("--equity", type=float, default=10000.0, help="Displayed equity balance")
+    parser.add_argument("--mode", default="DEMO-AUTO", help="Run mode badge")
+    cli_args = parser.parse_args()
+    dash = ApexTUIDashboard()
+    sample_row = SymbolCockpitRow(
+        symbol="EURUSD",
+        tier="TIGHT_SPREAD_M5",
+        timeframe="M5",
+        bid=1.08500,
+        ask=1.08510,
+        spread_pips=1.0,
+        regime="TRENDING_CALM",
+        hurst=0.61,
+        kaufman_er=0.52,
+        obi=0.28,
+        net_avg_r=0.34,
+        rec_risk_pct=0.45,
+        ai_verdict="APPROVE",
+        quarantine_mode="ACTIVE",
+        profit_factor=1.85,
+    )
+    dash.print_snapshot(
+        run_mode=cli_args.mode,
+        active_feed="PREVIEW",
+        ctrader_connected=False,
+        mt5_connected=False,
+        account_equity_usd=cli_args.equity,
+        daily_pnl_usd=0.0,
+        open_positions_count=0,
+        rows=[sample_row],
+        ai_brain_badge=f"MODE: {cli_args.mode}",
+    )

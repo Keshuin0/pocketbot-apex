@@ -18,8 +18,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Sequence
 
-from apex.feeds.models import Candle, DOMAnalytics, LiquidityWall, Side
+from apex.feeds.alias_mapper import SmartAliasMapper
+from apex.feeds.models import AssetClass, Candle, DOMAnalytics, LiquidityWall, Side
 from apex.quant.regime import compute_atr_series
+
+
+_TIER_MAPPER = SmartAliasMapper()
 
 
 class InstrumentTier(str, Enum):
@@ -39,11 +43,15 @@ TIGHT_SPREAD_M5_SYMBOLS: frozenset[str] = frozenset(
         "USDCAD",
         "NZDUSD",
         "XAUUSD",
+        "XAGUSD",
         "US500",
         "SPX",
         "SPX500",
         "NAS100",
-        "NQ",
+        "US100",
+        "US30",
+        "GER40",
+        "UK100",
         "USTEC",
     }
 )
@@ -53,6 +61,8 @@ WIDE_SPREAD_M15_SYMBOLS: frozenset[str] = frozenset(
         "BTCUSD",
         "ETHUSD",
         "SOLUSD",
+        "USOIL",
+        "UKOIL",
         "TSLA",
         "NVDA",
         "AMD",
@@ -66,16 +76,16 @@ WIDE_SPREAD_M15_SYMBOLS: frozenset[str] = frozenset(
 
 
 def classify_instrument_tier(symbol: str) -> InstrumentTier:
-    """Map an instrument symbol to its required execution tier (M5 Tight-Spread vs M15 Wide-Spread)."""
-    clean = symbol.upper().strip().lstrip("#")
-    for prefix in TIGHT_SPREAD_M5_SYMBOLS:
-        if clean == prefix or clean.startswith(prefix):
-            return InstrumentTier.TIGHT_SPREAD_M5
-    for prefix in WIDE_SPREAD_M15_SYMBOLS:
-        if clean == prefix or clean.startswith(prefix):
-            return InstrumentTier.WIDE_SPREAD_M15
-    # Default FX pairs (6 letters) to Tight-Spread M5, equities/crypto to Wide-Spread M15
-    if len(clean) == 6 and clean.isalpha():
+    """Delegate instrument tier mapping strictly to SmartAliasMapper.classify_asset_class()."""
+    canon = _TIER_MAPPER.canonicalize(symbol).upper()
+    if canon in WIDE_SPREAD_M15_SYMBOLS:
+        return InstrumentTier.WIDE_SPREAD_M15
+    asset_class = SmartAliasMapper.classify_asset_class(symbol)
+    if asset_class in (AssetClass.FOREX, AssetClass.METALS):
+        return InstrumentTier.TIGHT_SPREAD_M5
+    if asset_class == AssetClass.INDICES:
+        return InstrumentTier.TIGHT_SPREAD_M5
+    if canon in TIGHT_SPREAD_M5_SYMBOLS:
         return InstrumentTier.TIGHT_SPREAD_M5
     return InstrumentTier.WIDE_SPREAD_M15
 
@@ -96,6 +106,9 @@ class MomentumDOMVerdict:
     obi: float | None
     blocking_wall: LiquidityWall | None
     reasons: tuple[str, ...] = field(default_factory=tuple)
+    ofi: float | None = None
+    vpin: float | None = None
+    setup_type: str = "MOMENTUM"
 
 
 class MomentumDOMGate:
@@ -114,6 +127,9 @@ class MomentumDOMGate:
         extreme_close_fraction: float = 0.25,
         wall_min_median_multiple: float = 3.0,
         wall_max_distance_r: float = 0.35,
+        max_vpin: float = 0.75,
+        min_abs_ofi: float = 0.05,
+        max_exhaustion_atr_multiple: float = 2.4,
     ) -> None:
         self.dom_obi_enabled: bool = bool(dom_obi_enabled)
         self.min_abs_obi: float = float(min_abs_obi)
@@ -122,6 +138,9 @@ class MomentumDOMGate:
         self.extreme_close_fraction: float = float(extreme_close_fraction)
         self.wall_min_median_multiple: float = float(wall_min_median_multiple)
         self.wall_max_distance_r: float = float(wall_max_distance_r)
+        self.max_vpin: float = float(max_vpin)
+        self.min_abs_ofi: float = float(min_abs_ofi)
+        self.max_exhaustion_atr_multiple: float = float(max_exhaustion_atr_multiple)
 
     def evaluate(
         self,
@@ -132,6 +151,7 @@ class MomentumDOMGate:
         candles: Sequence[Candle],
         current_spread: float,
         dom_analytics: DOMAnalytics | None = None,
+        hawkes_intensity_ratio: float = 1.0,
     ) -> MomentumDOMVerdict:
         """Evaluate whether a candidate setup passes both its Tiered Bar Gate and Level 2 DOM Gate."""
         norm_sym = symbol.upper().strip()
@@ -165,49 +185,67 @@ class MomentumDOMGate:
         impulse_body = abs(trigger_bar.close - trigger_bar.open)
         impulse_atr_ratio = impulse_body / current_atr
         bar_range = max(trigger_bar.high - trigger_bar.low, 1e-12)
-        # Position of close inside bar range: 1.0 = high of bar, 0.0 = low of bar
         close_pos = (trigger_bar.close - trigger_bar.low) / bar_range
 
-        # Enforce Wide-Spread Momentum Tier (M15) rules
-        if tier == InstrumentTier.WIDE_SPREAD_M15:
-            if spread_pct_of_sl > self.max_spread_pct_of_sl + 1e-9:
-                reasons.append(
-                    f"wide_spread_sl_ratio: spread ({current_spread:.4f}) is {spread_pct_of_sl * 100:.1f}% "
-                    f"of ATR Stop-Loss distance ({sl_distance:.4f}), exceeding {self.max_spread_pct_of_sl * 100:.1f}% limit"
-                )
-            if impulse_atr_ratio < self.min_impulse_atr_multiple - 1e-9:
-                reasons.append(
-                    f"weak_impulse_body: M15 body ({impulse_body:.4f}) is {impulse_atr_ratio:.2f}x ATR(14) "
-                    f"({current_atr:.4f}), requiring >= {self.min_impulse_atr_multiple:.2f}x ATR(14)"
-                )
+        # Uniform Spread-to-SL Budget Check across ALL instrument tiers
+        if spread_pct_of_sl > self.max_spread_pct_of_sl + 1e-9:
+            reasons.append(
+                f"spread_sl_ratio: spread ({current_spread:.5f}) is {spread_pct_of_sl * 100:.1f}% "
+                f"of SL distance ({sl_distance:.5f}) > {self.max_spread_pct_of_sl * 100:.1f}%"
+            )
+
+        # Structural Liquidity Sweep / Displacement Retest & Candle Polarity Gate (uniform across M5 & M15)
+        prior_window = candles[-7:-1] if len(candles) >= 3 else []
+        is_sweep_reclaim = False
+        is_displacement_retest = False
+        if prior_window:
             if side == Side.BUY:
-                min_pos = 1.0 - self.extreme_close_fraction
-                if close_pos < min_pos - 1e-9:
-                    reasons.append(
-                        f"close_not_in_extreme_25pct: BUY close is at {close_pos * 100:.1f}% of bar range "
-                        f"(requires top {self.extreme_close_fraction * 100:.0f}% >= {min_pos * 100:.0f}%)"
-                    )
-                if trigger_bar.close <= trigger_bar.open:
-                    reasons.append("impulse_direction_mismatch: BUY trigger bar closed bearish")
+                prior_low = min(c.low for c in prior_window)
+                swept_low = (trigger_bar.low <= prior_low) or (len(candles) >= 2 and candles[-2].low <= prior_low)
+                is_sweep_reclaim = swept_low and (trigger_bar.close >= trigger_bar.open or close_pos >= 0.55)
+                prior_bull_disp = any((c.close - c.open) >= 0.45 * current_atr for c in prior_window[-3:])
+                shallow_pullback = (trigger_bar.open - trigger_bar.close) <= 0.40 * current_atr
+                is_displacement_retest = prior_bull_disp and shallow_pullback
             else:
-                max_pos = self.extreme_close_fraction
-                if close_pos > max_pos + 1e-9:
-                    reasons.append(
-                        f"close_not_in_extreme_25pct: SELL close is at {close_pos * 100:.1f}% of bar range "
-                        f"(requires bottom {self.extreme_close_fraction * 100:.0f}% <= {max_pos * 100:.0f}%)"
-                    )
-                if trigger_bar.close >= trigger_bar.open:
-                    reasons.append("impulse_direction_mismatch: SELL trigger bar closed bullish")
-        else:
-            # Tight-spread M5 tier still enforces a sanity check that spread <= 15% of SL
-            if spread_pct_of_sl > self.max_spread_pct_of_sl + 1e-9:
+                prior_high = max(c.high for c in prior_window)
+                swept_high = (trigger_bar.high >= prior_high) or (len(candles) >= 2 and candles[-2].high >= prior_high)
+                is_sweep_reclaim = swept_high and (trigger_bar.close <= trigger_bar.open or close_pos <= 0.45)
+                prior_bear_disp = any((c.open - c.close) >= 0.45 * current_atr for c in prior_window[-3:])
+                shallow_pullback = (trigger_bar.close - trigger_bar.open) <= 0.40 * current_atr
+                is_displacement_retest = prior_bear_disp and shallow_pullback
+
+        setup_type = "LIQUIDITY_SWEEP_RECLAIM" if is_sweep_reclaim else (
+            "DISPLACEMENT_RETEST" if is_displacement_retest else "MOMENTUM"
+        )
+
+        # Candle polarity + OFI/Hawkes confirmation on ALL tiers (replaces empty M5 else-pass & 1.5x-2.2x exhaustion chase)
+        dom_active = dom_analytics is not None and self.dom_obi_enabled
+        ofi_val: float | None = float(getattr(dom_analytics, "ofi", 0.0)) if dom_analytics is not None else None
+        vpin_val: float | None = float(getattr(dom_analytics, "vpin", 0.0)) if dom_analytics is not None else None
+        ofi_aligned = (
+            ofi_val is not None
+            and ((side == Side.BUY and ofi_val >= self.min_abs_ofi) or (side == Side.SELL and ofi_val <= -self.min_abs_ofi))
+        )
+        hawkes_accel = float(hawkes_intensity_ratio) >= 1.10
+
+        if side == Side.BUY:
+            bullish_bar = trigger_bar.close > trigger_bar.open
+            if not bullish_bar and not is_sweep_reclaim and not (is_displacement_retest and (close_pos >= 0.40 or ofi_aligned or hawkes_accel)):
+                reasons.append("impulse_direction_mismatch: BUY trigger bar closed bearish without sweep/retest reclaim")
+            elif impulse_atr_ratio > self.max_exhaustion_atr_multiple and close_pos >= 0.90 and not is_sweep_reclaim and not (ofi_aligned and hawkes_accel):
                 reasons.append(
-                    f"spread_sl_ratio: spread ({current_spread:.5f}) is {spread_pct_of_sl * 100:.1f}% "
-                    f"of SL distance ({sl_distance:.5f}) > {self.max_spread_pct_of_sl * 100:.1f}%"
+                    f"exhaustion_climax_chase: BUY bar stretched {impulse_atr_ratio:.2f}x ATR at {close_pos*100:.0f}% top without sweep/OFI"
+                )
+        else:
+            bearish_bar = trigger_bar.close < trigger_bar.open
+            if not bearish_bar and not is_sweep_reclaim and not (is_displacement_retest and (close_pos <= 0.60 or ofi_aligned or hawkes_accel)):
+                reasons.append("impulse_direction_mismatch: SELL trigger bar closed bullish without sweep/retest reclaim")
+            elif impulse_atr_ratio > self.max_exhaustion_atr_multiple and close_pos <= 0.10 and not is_sweep_reclaim and not (ofi_aligned and hawkes_accel):
+                reasons.append(
+                    f"exhaustion_climax_chase: SELL bar stretched {impulse_atr_ratio:.2f}x ATR at {close_pos*100:.0f}% bottom without sweep/OFI"
                 )
 
-        # Level 2 DOM Microstructure Gate (when cTrader Depth Quotes are active & filter enabled)
-        dom_active = dom_analytics is not None and self.dom_obi_enabled
+        # Level 2 DOM + OFI + VPIN + Liquidity Wall Gate
         obi_val: float | None = dom_analytics.obi if dom_analytics is not None else None
         blocking_wall: LiquidityWall | None = None
 
@@ -223,9 +261,16 @@ class MomentumDOMGate:
                     f"got {dom_analytics.obi:+.3f}"
                 )
 
+            if ofi_val is not None and abs(ofi_val) > 1e-6:
+                if side == Side.BUY and ofi_val < -self.min_abs_ofi:
+                    reasons.append(f"dom_ofi_misaligned: BUY opposing OFI={ofi_val:+.3f} < -{self.min_abs_ofi:.2f}")
+                elif side == Side.SELL and ofi_val > self.min_abs_ofi:
+                    reasons.append(f"dom_ofi_misaligned: SELL opposing OFI={ofi_val:+.3f} > +{self.min_abs_ofi:.2f}")
+
+            if vpin_val is not None and vpin_val > self.max_vpin:
+                reasons.append(f"vpin_toxicity_extreme: VPIN={vpin_val:.3f} > {self.max_vpin:.2f} flow toxicity threshold")
+
             # Check for opposing resting liquidity walls (> 3x median book level) within 0.35R of entry
-            # For a BUY entry, an opposing wall is a resting SELL (ask) wall above entry within 0.35R.
-            # For a SELL entry, an opposing wall is a resting BUY (bid) wall below entry within 0.35R.
             opposing_side = Side.SELL if side == Side.BUY else Side.BUY
             max_wall_dist_price = self.wall_max_distance_r * sl_distance
 
@@ -262,4 +307,7 @@ class MomentumDOMGate:
             obi=obi_val,
             blocking_wall=blocking_wall,
             reasons=tuple(reasons),
+            ofi=ofi_val,
+            vpin=vpin_val,
+            setup_type=setup_type,
         )

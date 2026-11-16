@@ -106,7 +106,7 @@ def test_dynamic_model_discovery_and_tier_classification() -> None:
     assert "gemini-4-hydrogen-medium" in agy_ids
     assert "gemini-3.8-flash-low" in agy_ids
     assert "gemini-4-hydrogen-xhigh" not in agy_ids
-    assert "claude-sonnet-5-5-medium" not in agy_ids
+    assert "claude-sonnet-5-5-medium" in agy_ids
 
 
 def test_stakes_and_latency_scoring_preferences() -> None:

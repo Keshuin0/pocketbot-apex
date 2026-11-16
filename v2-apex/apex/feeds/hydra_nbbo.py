@@ -264,14 +264,19 @@ class HydraNBBOEngine:
         pip_size: float = 0.0001,
         one_r_price_distance: float = 0.0010,
         expected_vwap_slippage_pips: float = 0.10,
+        side: Side = Side.BUY,
+        side_quote_disadvantage_pips: float = 0.0,
     ) -> VenueCostQuote:
-        """Compute `effective_cost = live_spread + round_turn_commission_in_price + expected_vwap_dom_slippage + latency_penalty`."""
+        """Compute directional `effective_cost = live_spread + directional_dislocation + commission + slippage + latency`."""
         eff_pip = max(float(pip_size), 1e-9)
         eff_1r = max(float(one_r_price_distance), 1e-9)
         pip_val_usd = max(float(profile.pip_value_per_lot_usd), 1e-6)
 
         live_spread_price = max(0.0, float(tick.ask - tick.bid))
         live_spread_pips = live_spread_price / eff_pip
+
+        dir_pips = max(0.0, float(side_quote_disadvantage_pips))
+        dir_price = dir_pips * eff_pip
 
         commission_pips = max(0.0, float(profile.commission_per_lot_round_turn_usd)) / pip_val_usd
         commission_price = commission_pips * eff_pip
@@ -284,8 +289,8 @@ class HydraNBBOEngine:
         )
         latency_price = latency_pips * eff_pip
 
-        eff_cost_pips = live_spread_pips + commission_pips + slip_pips + latency_pips
-        eff_cost_price = live_spread_price + commission_price + slip_price + latency_price
+        eff_cost_pips = live_spread_pips + dir_pips + commission_pips + slip_pips + latency_pips
+        eff_cost_price = live_spread_price + dir_price + commission_price + slip_price + latency_price
         eff_cost_r = eff_cost_price / eff_1r
         eff_cost_usd_per_lot = eff_cost_pips * pip_val_usd
 
@@ -324,36 +329,59 @@ class HydraNBBOEngine:
         ctrader_dom: DOMAnalytics | None = None,
         ctrader_profile_override: VenueFeeProfile | None = None,
         mt5_profile_override: VenueFeeProfile | None = None,
+        side: Side = Side.BUY,
     ) -> SyntheticNBBOResult:
-        """Compute Synthetic NBBO, All-In Effective Cost per venue, Cross-Pollinated DOM, and Spike Shield."""
+        """Compute Synthetic NBBO, Directional All-In Effective Cost per venue, Cross-Pollinated DOM, and Spike Shield."""
         norm_sym = symbol.upper()
         ct_prof = ctrader_profile_override or self.ctrader_profile
         mt5_prof = mt5_profile_override or self.mt5_profile
 
-        ct_online = ctrader_tick is not None
-        mt5_online = mt5_tick is not None
+        ct_online = ctrader_tick is not None and ctrader_tick.bid > 0.0 and ctrader_tick.ask > 0.0
+        mt5_online = mt5_tick is not None and mt5_tick.bid > 0.0 and mt5_tick.ask > 0.0
+        eff_ct_tick = ctrader_tick if ct_online else None
+        eff_mt5_tick = mt5_tick if mt5_online else None
         topology = self.resolve_topology(configured_mode, ctrader_online=ct_online, mt5_online=mt5_online)
+
+        ct_dir_pen = 0.0
+        mt5_dir_pen = 0.0
+        if eff_ct_tick is not None and eff_mt5_tick is not None:
+            eff_pip = max(float(pip_size), 1e-9)
+            ct_sp_pips = max(0.0, (eff_ct_tick.ask - eff_ct_tick.bid) / eff_pip)
+            mt5_sp_pips = max(0.0, (eff_mt5_tick.ask - eff_mt5_tick.bid) / eff_pip)
+            min_sp_pips = min(ct_sp_pips, mt5_sp_pips)
+            if side == Side.BUY:
+                min_ask = min(eff_ct_tick.ask, eff_mt5_tick.ask)
+                ct_dir_pen = max(0.0, ((eff_ct_tick.ask - min_ask) / eff_pip) - max(0.0, ct_sp_pips - min_sp_pips) * 0.5)
+                mt5_dir_pen = max(0.0, ((eff_mt5_tick.ask - min_ask) / eff_pip) - max(0.0, mt5_sp_pips - min_sp_pips) * 0.5)
+            else:
+                max_bid = max(eff_ct_tick.bid, eff_mt5_tick.bid)
+                ct_dir_pen = max(0.0, ((max_bid - eff_ct_tick.bid) / eff_pip) - max(0.0, ct_sp_pips - min_sp_pips) * 0.5)
+                mt5_dir_pen = max(0.0, ((max_bid - eff_mt5_tick.bid) / eff_pip) - max(0.0, mt5_sp_pips - min_sp_pips) * 0.5)
 
         ct_quote = (
             self.compute_venue_cost_quote(
-                tick=ctrader_tick,
+                tick=eff_ct_tick,
                 profile=ct_prof,
                 pip_size=pip_size,
                 one_r_price_distance=one_r_price_distance,
                 expected_vwap_slippage_pips=ctrader_vwap_slippage_pips,
+                side=side,
+                side_quote_disadvantage_pips=ct_dir_pen,
             )
-            if ctrader_tick is not None
+            if eff_ct_tick is not None
             else None
         )
         mt5_quote = (
             self.compute_venue_cost_quote(
-                tick=mt5_tick,
+                tick=eff_mt5_tick,
                 profile=mt5_prof,
                 pip_size=pip_size,
                 one_r_price_distance=one_r_price_distance,
                 expected_vwap_slippage_pips=mt5_vwap_slippage_pips,
+                side=side,
+                side_quote_disadvantage_pips=mt5_dir_pen,
             )
-            if mt5_tick is not None
+            if eff_mt5_tick is not None
             else None
         )
 
