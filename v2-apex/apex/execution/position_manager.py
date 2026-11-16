@@ -14,9 +14,13 @@ import datetime
 import logging
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, Optional, Sequence
 
-import MetaTrader5 as mt5
+try:
+    import MetaTrader5 as mt5
+except ImportError:  # pragma: no cover - headless/cTrader-only nodes
+    mt5 = None  # type: ignore[assignment]
 
 from apex.ai.aegis_verifier import AegisVerifier
 from apex.feeds.alias_mapper import SmartAliasMapper
@@ -34,6 +38,14 @@ _TIMEFRAME_SECONDS = {
     "M30": 1800,
     "H1": 3600,
 }
+
+
+class PositionAction(str, Enum):
+    """Canonical in-flight position action strings."""
+
+    HOLD = "HOLD"
+    RATCHET_SLTP = "RATCHET_SLTP"
+    EARLY_EXIT = "EARLY_EXIT"
 
 
 @dataclass
@@ -59,6 +71,7 @@ class InFlightPositionState:
     z3_status: str = "SHIELD8_ARMED"
     bars_held: int = 0
     grace_locked: bool = True
+    last_mark_price: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +148,11 @@ class AutonomousPositionOrchestrator:
             return max(current_sl, candidate_sl)
         return min(current_sl, candidate_sl)
 
+    @staticmethod
+    def _is_broker_ack_ok(retcode: int) -> bool:
+        """Accept MT5 TRADE_RETCODE_DONE (10009), PLACED (10008), or cTrader/generic 0."""
+        return int(retcode) in (0, 10008, 10009)
+
     def _register_or_update_state(
         self,
         *,
@@ -150,24 +168,32 @@ class AutonomousPositionOrchestrator:
         lots: float,
         now_utc: float,
         bars_held_override: Optional[int] = None,
+        initial_one_r: Optional[float] = None,
     ) -> tuple[InFlightPositionState, float]:
         st = self.tracked.get(ticket)
+        resolved_1r = (
+            float(initial_one_r)
+            if (initial_one_r is not None and float(initial_one_r) > 1e-9)
+            else (abs(entry_price - current_sl) if current_sl > 0.0 else max(entry_price * 0.002, 1e-5))
+        )
         if st is None:
-            one_r = abs(entry_price - current_sl) if current_sl > 0.0 else max(entry_price * 0.002, 1e-5)
             st = InFlightPositionState(
                 ticket=ticket,
                 symbol=symbol,
                 side=side,
                 timeframe=timeframe.upper(),
                 entry_price=entry_price,
-                initial_sl=current_sl if current_sl > 0.0 else (entry_price - one_r if side == Side.BUY else entry_price + one_r),
-                initial_tp=current_tp if current_tp > 0.0 else (entry_price + 2.0 * one_r if side == Side.BUY else entry_price - 2.0 * one_r),
-                one_r_distance=max(one_r, 1e-6),
+                initial_sl=current_sl if current_sl > 0.0 else (entry_price - resolved_1r if side == Side.BUY else entry_price + resolved_1r),
+                initial_tp=current_tp if current_tp > 0.0 else (entry_price + 2.0 * resolved_1r if side == Side.BUY else entry_price - 2.0 * resolved_1r),
+                one_r_distance=max(resolved_1r, 1e-6),
                 opened_at_utc=opened_at_utc,
                 lots=lots,
             )
             self.tracked[ticket] = st
+        elif initial_one_r is not None and float(initial_one_r) > 1e-9:
+            st.one_r_distance = max(float(initial_one_r), 1e-6)
 
+        st.last_mark_price = float(mark_price)
         signed_diff = (mark_price - st.entry_price) if side == Side.BUY else (st.entry_price - mark_price)
         current_r = signed_diff / max(st.one_r_distance, 1e-6)
         st.mfe_r = max(st.mfe_r, current_r)
@@ -191,7 +217,8 @@ class AutonomousPositionOrchestrator:
         current_sl: float,
         current_tp: float,
         mark_price: float,
-        candles: Sequence[Candle],
+        candles: Optional[Sequence[Candle]] = None,
+        candles_m5: Optional[Sequence[Candle]] = None,
         spread_price: float = 0.0,
         commission_price_equiv: float = 0.0,
         dom_obi: Optional[float] = None,
@@ -201,11 +228,14 @@ class AutonomousPositionOrchestrator:
         lots: float = 0.01,
         now_utc: Optional[float] = None,
         bars_held_override: Optional[int] = None,
+        bars_held: Optional[int] = None,
+        initial_one_r: Optional[float] = None,
         force_evaluate: bool = False,
         execute_broker_actions: bool = False,
     ) -> PositionDecision:
-        """Evaluate one open position across Rules A-D and optionally dispatch SLTP/close."""
-        candles = list(candles or ())
+        """Evaluate one open position across Zones 1-3 + Rules A-D and verify SLTP/close ACK."""
+        candles_seq = list(candles if candles is not None else (candles_m5 or ()))
+        eff_bars_held = bars_held if bars_held is not None else bars_held_override
         now_ts = float(now_utc if now_utc is not None else time.time())
         open_ts = float(opened_at_utc if opened_at_utc is not None else now_ts)
         st, current_r = self._register_or_update_state(
@@ -220,8 +250,11 @@ class AutonomousPositionOrchestrator:
             opened_at_utc=open_ts,
             lots=lots,
             now_utc=now_ts,
-            bars_held_override=bars_held_override,
+            bars_held_override=eff_bars_held,
+            initial_one_r=initial_one_r,
         )
+
+        candles = candles_seq
 
         # Determine ATR & latest bar timestamp
         atr_val = st.one_r_distance / 1.5
@@ -382,13 +415,32 @@ class AutonomousPositionOrchestrator:
             st.z3_status = z3_msg
             if z3_ok:
                 stage = "FLASH_EXIT" if cross_asset_shock_z > self.flash_crash_shock_z else ("ZOMBIE_EXIT" if is_zombie else "THESIS_EXIT")
-                st.ratchet_stage = stage
                 if execute_broker_actions:
-                    self._dispatch_close(ticket, symbol, side, lots, mark_price)
+                    ret = self._dispatch_close(ticket, symbol, side, lots, mark_price)
+                    if not self._is_broker_ack_ok(ret):
+                        st.ratchet_stage = f"{stage}_RETRY"
+                        return PositionDecision(
+                            ticket=ticket,
+                            symbol=symbol,
+                            action=PositionAction.HOLD.value,
+                            ratchet_stage=st.ratchet_stage,
+                            new_sl=None,
+                            new_tp=None,
+                            current_r=round(current_r, 4),
+                            forward_ev_r=round(st.forward_ev_r, 4),
+                            forward_prob_tp=round(st.forward_prob_tp, 4),
+                            mfe_r=round(st.mfe_r, 4),
+                            mae_r=round(st.mae_r, 4),
+                            bars_held=st.bars_held,
+                            grace_locked=False,
+                            z3_status=z3_msg,
+                            reason=f"{stage} broker close failed (retcode={ret}); holding for retry.",
+                        )
+                st.ratchet_stage = stage
                 return PositionDecision(
                     ticket=ticket,
                     symbol=symbol,
-                    action="EARLY_EXIT",
+                    action=PositionAction.EARLY_EXIT.value,
                     ratchet_stage=stage,
                     new_sl=None,
                     new_tp=None,
@@ -403,7 +455,63 @@ class AutonomousPositionOrchestrator:
                     reason=f"{stage}: fwd_ev={st.forward_ev_r:+.2f}R, sigs={invalidation_signals}, ER={er_val:.2f}",
                 )
 
-        # Rule C: Dynamic Profit-Ratchet & Super-Momentum Runner Mode
+        # Zone 1 Defensive Early Exit / Risk Compression (negative excursion outside Grace Lock)
+        min_sep = max(float(spread_price) * 2.0, 0.05 * st.one_r_distance, 1e-6)
+        if not in_grace and current_r <= -0.25 and (st.forward_prob_tp < 0.35 or st.forward_ev_r < -0.15):
+            if st.forward_ev_r <= -0.35 and st.forward_prob_tp < 0.25 and invalidation_signals >= 2:
+                z3_ok, _, z3_msg = AegisVerifier.verify_z3_inflight_trajectory(
+                    proposed_action="EARLY_EXIT",
+                    bars_held=st.bars_held,
+                    min_hold_bars=self.min_hold_bars,
+                    abs_move_atr=abs_move_atr,
+                    cross_asset_shock_z=cross_asset_shock_z,
+                    forward_ev_r=st.forward_ev_r,
+                    current_r=current_r,
+                    invalidation_signals=max(invalidation_signals, 2),
+                    is_zombie_decay=False,
+                )
+                st.z3_status = z3_msg
+                if z3_ok:
+                    if execute_broker_actions:
+                        ret = self._dispatch_close(ticket, symbol, side, lots, mark_price)
+                        if not self._is_broker_ack_ok(ret):
+                            return PositionDecision(
+                                ticket=ticket,
+                                symbol=symbol,
+                                action=PositionAction.HOLD.value,
+                                ratchet_stage="DEFENSIVE_RETRY",
+                                new_sl=None,
+                                new_tp=None,
+                                current_r=round(current_r, 4),
+                                forward_ev_r=round(st.forward_ev_r, 4),
+                                forward_prob_tp=round(st.forward_prob_tp, 4),
+                                mfe_r=round(st.mfe_r, 4),
+                                mae_r=round(st.mae_r, 4),
+                                bars_held=st.bars_held,
+                                grace_locked=False,
+                                z3_status=z3_msg,
+                                reason=f"DEFENSIVE_EXIT close rejected (retcode={ret})",
+                            )
+                    st.ratchet_stage = "DEFENSIVE_EXIT"
+                    return PositionDecision(
+                        ticket=ticket,
+                        symbol=symbol,
+                        action=PositionAction.EARLY_EXIT.value,
+                        ratchet_stage="DEFENSIVE_EXIT",
+                        new_sl=None,
+                        new_tp=None,
+                        current_r=round(current_r, 4),
+                        forward_ev_r=round(st.forward_ev_r, 4),
+                        forward_prob_tp=round(st.forward_prob_tp, 4),
+                        mfe_r=round(st.mfe_r, 4),
+                        mae_r=round(st.mae_r, 4),
+                        bars_held=st.bars_held,
+                        grace_locked=False,
+                        z3_status=z3_msg,
+                        reason=f"Zone 1 DEFENSIVE_EXIT: fwd_ev={st.forward_ev_r:+.2f}R, p_tp={st.forward_prob_tp:.2f}",
+                    )
+
+        # Zone 1 Compression, Zone 2 Smooth Profit-Surfing & Zone 3 Dynamic TP Sliding
         new_sl: Optional[float] = None
         new_tp: Optional[float] = None
         stage = "HOLD"
@@ -413,32 +521,59 @@ class AutonomousPositionOrchestrator:
             one_r_lock = (st.entry_price + st.one_r_distance) if side == Side.BUY else (st.entry_price - st.one_r_distance)
             if super_momentum:
                 stage = "RUNNER_3_5R"
-                expanded_tp = (st.entry_price + 3.5 * st.one_r_distance) if side == Side.BUY else (st.entry_price - 3.5 * st.one_r_distance)
+                # Zone 3 smooth dynamic TP sliding in [3.5R, 4.5R]
+                tp_mult = min(4.5, 3.5 + max(0.0, (current_r - 2.5) * 0.50))
+                expanded_tp = (st.entry_price + tp_mult * st.one_r_distance) if side == Side.BUY else (st.entry_price - tp_mult * st.one_r_distance)
                 if side == Side.BUY:
                     swing_trail = min(float(c.low) for c in candles[-3:]) if len(candles) >= 3 else (mark_price - 1.8 * atr_val)
                     atr_trail = mark_price - 1.8 * atr_val
-                    cand_sl = max(one_r_lock, min(swing_trail, atr_trail))
+                    cand_sl = min(mark_price - min_sep, max(one_r_lock, min(swing_trail, atr_trail)))
                     cand_tp = max(current_tp, expanded_tp)
                 else:
                     swing_trail = max(float(c.high) for c in candles[-3:]) if len(candles) >= 3 else (mark_price + 1.8 * atr_val)
                     atr_trail = mark_price + 1.8 * atr_val
-                    cand_sl = min(one_r_lock, max(swing_trail, atr_trail))
+                    cand_sl = max(mark_price + min_sep, min(one_r_lock, max(swing_trail, atr_trail)))
                     cand_tp = min(current_tp, expanded_tp) if current_tp > 0.0 else expanded_tp
                 new_sl = self._never_widen_sl(side, current_sl, cand_sl)
                 new_tp = cand_tp
             else:
                 stage = "BANK_1R"
-                new_sl = self._never_widen_sl(side, current_sl, one_r_lock)
+                # Lock +1.0R at 1.5R..2.0R and surf smoothly higher beyond +2.0R
+                lock_r = 1.0 + max(0.0, 0.55 * (current_r - 2.0))
+                bank_sl = (st.entry_price + lock_r * st.one_r_distance) if side == Side.BUY else (st.entry_price - lock_r * st.one_r_distance)
+                bank_sl = min(mark_price - min_sep, bank_sl) if side == Side.BUY else max(mark_price + min_sep, bank_sl)
+                new_sl = self._never_widen_sl(side, current_sl, bank_sl)
                 new_tp = current_tp if current_tp > 0.0 else st.initial_tp
         elif current_r >= 1.0:
             stage = "FREE_ROLL_1R"
-            fee_offset = max(spread_price + commission_price_equiv, 0.0) + 0.05 * st.one_r_distance
+            fee_offset = max(spread_price + commission_price_equiv, 0.0) + max(0.05, 0.85 * (current_r - 1.0)) * st.one_r_distance
             be_sl = (st.entry_price + fee_offset) if side == Side.BUY else (st.entry_price - fee_offset)
+            be_sl = min(mark_price - min_sep, be_sl) if side == Side.BUY else max(mark_price + min_sep, be_sl)
             new_sl = self._never_widen_sl(side, current_sl, be_sl)
             new_tp = current_tp if current_tp > 0.0 else st.initial_tp
+        elif current_r >= 0.75:
+            stage = "PROFIT_SURF"
+            frac = (current_r - 0.75) / 0.25
+            surf_r = -0.35 * (1.0 - max(0.0, min(1.0, frac)))
+            surf_sl = (st.entry_price + surf_r * st.one_r_distance) if side == Side.BUY else (st.entry_price - surf_r * st.one_r_distance)
+            surf_sl = min(mark_price - min_sep, surf_sl) if side == Side.BUY else max(mark_price + min_sep, surf_sl)
+            new_sl = self._never_widen_sl(side, current_sl, surf_sl)
+            new_tp = current_tp if current_tp > 0.0 else st.initial_tp
+        elif not in_grace and current_r <= -0.25 and (st.forward_prob_tp < 0.35 or st.forward_ev_r < -0.15):
+            stage = "DEFENSIVE_COMPRESS"
+            lock_r = max(-0.70, current_r - 0.22)
+            def_sl = (st.entry_price + lock_r * st.one_r_distance) if side == Side.BUY else (st.entry_price - lock_r * st.one_r_distance)
+            def_sl = min(mark_price - min_sep, def_sl) if side == Side.BUY else max(mark_price + min_sep, def_sl)
+            new_sl = self._never_widen_sl(side, current_sl, def_sl)
+            new_tp = current_tp if current_tp > 0.0 else st.initial_tp
 
-        _, _, z3_msg = AegisVerifier.verify_z3_inflight_trajectory(
-            proposed_action="HOLD",
+        hyst_min = max(float(spread_price) * 0.25, 0.02 * st.one_r_distance, 1e-6)
+        sl_changed = new_sl is not None and abs(new_sl - current_sl) >= hyst_min
+        tp_changed = new_tp is not None and abs(new_tp - current_tp) >= hyst_min
+        wants_ratchet = new_sl is not None and (sl_changed or tp_changed)
+
+        z3_ok, _, z3_msg = AegisVerifier.verify_z3_inflight_trajectory(
+            proposed_action="RATCHET_SLTP" if wants_ratchet else "HOLD",
             bars_held=st.bars_held,
             min_hold_bars=self.min_hold_bars,
             abs_move_atr=abs_move_atr,
@@ -446,17 +581,43 @@ class AutonomousPositionOrchestrator:
             forward_ev_r=st.forward_ev_r,
             current_r=current_r,
             invalidation_signals=invalidation_signals,
+            side=side.value,
+            entry_price=st.entry_price,
+            sl_old=current_sl if wants_ratchet else None,
+            sl_new=new_sl if wants_ratchet else None,
+            mark_price=mark_price if wants_ratchet else None,
+            tp_old=current_tp if wants_ratchet else None,
+            tp_new=(new_tp or current_tp) if wants_ratchet else None,
         )
         st.z3_status = z3_msg
         st.ratchet_stage = stage
 
-        if new_sl is not None and (abs(new_sl - current_sl) > 1e-7 or (new_tp is not None and abs(new_tp - current_tp) > 1e-7)):
+        if wants_ratchet and z3_ok and new_sl is not None:
             if execute_broker_actions:
-                self._dispatch_sltp(ticket, symbol, new_sl, new_tp or current_tp)
+                ret = self._dispatch_sltp(ticket, symbol, new_sl, new_tp or current_tp)
+                if not self._is_broker_ack_ok(ret):
+                    logger.warning("SL/TP amend failed for %s ticket=%d (retcode=%s)", symbol, ticket, ret)
+                    return PositionDecision(
+                        ticket=ticket,
+                        symbol=symbol,
+                        action=PositionAction.HOLD.value,
+                        ratchet_stage=f"{stage}_RETRY",
+                        new_sl=None,
+                        new_tp=None,
+                        current_r=round(current_r, 4),
+                        forward_ev_r=round(st.forward_ev_r, 4),
+                        forward_prob_tp=round(st.forward_prob_tp, 4),
+                        mfe_r=round(st.mfe_r, 4),
+                        mae_r=round(st.mae_r, 4),
+                        bars_held=st.bars_held,
+                        grace_locked=False,
+                        z3_status=z3_msg,
+                        reason=f"Broker SL/TP amend rejected (retcode={ret}); holding.",
+                    )
             return PositionDecision(
                 ticket=ticket,
                 symbol=symbol,
-                action="RATCHET_SLTP",
+                action=PositionAction.RATCHET_SLTP.value,
                 ratchet_stage=stage,
                 new_sl=new_sl,
                 new_tp=new_tp,
@@ -495,11 +656,13 @@ class AutonomousPositionOrchestrator:
 
         feed_router = getattr(self, "feed_router", None)
         ct = getattr(feed_router, "ctrader", None) if feed_router is not None else None
-        mt5_pos = mt5.positions_get(ticket=int(ticket)) if getattr(mt5, "positions_get", None) else None
+        mt5_pos = mt5.positions_get(ticket=int(ticket)) if (mt5 is not None and getattr(mt5, "positions_get", None)) else None
         if not mt5_pos and ct is not None and ct.is_connected and hasattr(ct, "amend_position_sltp"):
             res = ct.amend_position_sltp(position_id=int(ticket), stop_loss=float(sl), take_profit=float(tp), symbol=symbol)
             return 10009 if (isinstance(res, dict) and res.get("ok")) else -1
 
+        if mt5 is None:
+            return -1
         info = mt5.symbol_info(symbol) if getattr(mt5, "symbol_info", None) else None
         digits = int(getattr(info, "digits", 5) or 5) if info is not None else 5
         req = {
@@ -520,11 +683,13 @@ class AutonomousPositionOrchestrator:
 
         feed_router = getattr(self, "feed_router", None)
         ct = getattr(feed_router, "ctrader", None) if feed_router is not None else None
-        mt5_pos = mt5.positions_get(ticket=int(ticket)) if getattr(mt5, "positions_get", None) else None
+        mt5_pos = mt5.positions_get(ticket=int(ticket)) if (mt5 is not None and getattr(mt5, "positions_get", None)) else None
         if not mt5_pos and ct is not None and ct.is_connected and hasattr(ct, "close_position"):
             res = ct.close_position(position_id=int(ticket), volume_lots=float(lots), symbol=symbol)
             return 10009 if (isinstance(res, dict) and res.get("ok")) else -1
 
+        if mt5 is None:
+            return -1
         info = mt5.symbol_info(symbol)
         digits = int(getattr(info, "digits", 5) or 5) if info is not None else 5
         filling = int(mt5.ORDER_FILLING_FOK)
@@ -569,14 +734,61 @@ class AutonomousPositionOrchestrator:
         closed_tickets = [t for t in list(self.tracked.keys()) if t not in open_set]
         reconciled: list[dict[str, Any]] = []
         for ticket in closed_tickets:
-            st = self.tracked.pop(ticket)
-            deals = list((deals_fetcher(ticket) if deals_fetcher is not None else mt5.history_deals_get(position=ticket)) or ())
-            exit_deals = [d for d in deals if int(getattr(d, "entry", -1)) == int(getattr(mt5, "DEAL_ENTRY_OUT", 1))]
-            if not exit_deals:
+            st = self.tracked.get(ticket)
+            if st is None:
                 continue
-            d = exit_deals[-1]
-            exit_px = float(getattr(d, "price", st.entry_price) or st.entry_price)
-            realized_pnl = float(getattr(d, "profit", 0.0)) + float(getattr(d, "commission", 0.0)) + float(getattr(d, "swap", 0.0))
+            exit_px: float | None = None
+            realized_pnl: float = 0.0
+            venue_used: str = "mt5"
+
+            if deals_fetcher is not None:
+                deals = list(deals_fetcher(ticket) or ())
+                exit_entry_code = int(getattr(mt5, "DEAL_ENTRY_OUT", 1)) if mt5 is not None else 1
+                exit_deals = [d for d in deals if int(getattr(d, "entry", -1)) == exit_entry_code]
+                if not exit_deals:
+                    self.tracked.pop(ticket, None)
+                    continue
+                d = exit_deals[-1]
+                exit_px = float(getattr(d, "price", st.entry_price) or st.entry_price)
+                realized_pnl = float(getattr(d, "profit", 0.0)) + float(getattr(d, "commission", 0.0)) + float(getattr(d, "swap", 0.0))
+            else:
+                if mt5 is not None and getattr(mt5, "history_deals_get", None):
+                    deals = list(mt5.history_deals_get(position=ticket) or ())
+                    exit_entry_code = int(getattr(mt5, "DEAL_ENTRY_OUT", 1))
+                    exit_deals = [d for d in deals if int(getattr(d, "entry", -1)) == exit_entry_code]
+                    if exit_deals:
+                        d = exit_deals[-1]
+                        exit_px = float(getattr(d, "price", st.entry_price) or st.entry_price)
+                        realized_pnl = float(getattr(d, "profit", 0.0)) + float(getattr(d, "commission", 0.0)) + float(getattr(d, "swap", 0.0))
+
+                # cTrader closed-deal reconciliation when ticket is absent from MT5 deals
+                if exit_px is None and self.feed_router is not None:
+                    ct = getattr(self.feed_router, "ctrader", None)
+                    if ct is not None and (ct.is_connected or getattr(ct, "_recent_execution_events", None)):
+                        ct_events = list(getattr(ct, "_recent_execution_events", ()) or ())
+                        for ev in reversed(ct_events):
+                            if int(ev.get("position_id", 0) or 0) == int(ticket):
+                                px_ev = float(ev.get("executed_price", 0.0) or 0.0)
+                                if px_ev > 0.0:
+                                    exit_px = px_ev
+                                    venue_used = "ctrader"
+                                    break
+                        if exit_px is None and hasattr(ct, "get_open_positions"):
+                            ct_open_ids = {int(p.get("position_id", 0) or 0) for p in (ct.get_open_positions() or ())}
+                            if int(ticket) not in ct_open_ids:
+                                tick_ct = ct.get_latest_tick(st.symbol) if hasattr(ct, "get_latest_tick") else None
+                                if tick_ct is not None:
+                                    exit_px = float(tick_ct.bid if st.side == Side.BUY else tick_ct.ask)
+                                    venue_used = "ctrader"
+                                elif st.last_mark_price > 0.0:
+                                    exit_px = float(st.last_mark_price)
+                                    venue_used = "ctrader"
+
+            if exit_px is None:
+                self.tracked.pop(ticket, None)
+                continue
+
+            self.tracked.pop(ticket, None)
             signed = (exit_px - st.entry_price) if st.side == Side.BUY else (st.entry_price - exit_px)
             realized_r = signed / max(st.one_r_distance, 1e-6)
             if self.ledger is not None:
@@ -588,6 +800,12 @@ class AutonomousPositionOrchestrator:
                     mfe_r=round(st.mfe_r, 4),
                     mae_r=round(st.mae_r, 4),
                     symbol=st.symbol,
+                    side=st.side.value,
+                    entry_price=st.entry_price,
+                    stop_loss=st.initial_sl,
+                    take_profit=st.initial_tp,
+                    lots=st.lots,
+                    venue=venue_used,
                 )
             reconciled.append(
                 {

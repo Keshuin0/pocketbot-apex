@@ -471,6 +471,7 @@ class UniverseScanner:
         candidate: CandidatePreScore,
         cost_model: TimeMachineCostModel | None = None,
         open_positions: Sequence[PositionRiskSpec] = (),
+        remaining_daily_budget_pct: float = 3.0,
     ) -> SymbolCockpitRow:
         """Stage B: Delegate candidate evaluation directly to Canonical11AgentPipeline."""
         sym = candidate.symbol
@@ -537,6 +538,29 @@ class UniverseScanner:
         spread_pips_atomic = round(max(spread_px / pip_size, 0.0), 2)
         h1_candles = self.feed_router.get_candles(sym, timeframe="H1", count=80)
         side = self.infer_candidate_side(candles, h1_candles)
+        cooldown_mins = int(self.config.get("risk", {}).get("stopout_cooldown_minutes", 120))
+        cooldown_fn = getattr(self.ledger, "is_symbol_side_in_stopout_cooldown", None)
+        if callable(cooldown_fn) and cooldown_mins > 0:
+            cd_res = cooldown_fn(sym, side.value, cooldown_minutes=cooldown_mins)
+            if isinstance(cd_res, tuple) and len(cd_res) == 2 and cd_res[0] is True:
+                return SymbolCockpitRow(
+                    symbol=sym,
+                    tier=candidate.tier.value,
+                    timeframe=tf,
+                    bid=tick.bid,
+                    ask=tick.ask,
+                    spread_pips=spread_pips_atomic,
+                    regime="COOLDOWN",
+                    hurst=candidate.hurst_estimate,
+                    kaufman_er=candidate.kaufman_er,
+                    obi=dom.obi if dom else None,
+                    net_avg_r=None,
+                    rec_risk_pct=0.0,
+                    ai_verdict=f"STOPOUT_COOLDOWN ({float(cd_res[1]):.0f}m)",
+                    quarantine_mode=q_state.mode.value,
+                    profit_factor=q_state.profit_factor,
+                    side=side,
+                )
         entry_px = tick.ask if side == Side.BUY else tick.bid
 
         if self.last_contagion is None:
@@ -544,27 +568,32 @@ class UniverseScanner:
         shock_z = float(self.last_contagion.cross_asset_shock_z)
         rollover_flag = bool(self.last_contagion.rollover_illiquidity_flag)
 
-        trace = self.canonical_pipeline.evaluate(
-            symbol=sym,
-            side=side,
-            timeframe=tf,
-            entry_price=entry_px,
-            candles=candles,
-            h1_candles=h1_candles,
-            spread_price=spread_px,
-            pip_size=pip_size,
-            dom_analytics=dom,
-            cross_asset_shock_z=shock_z,
-            rollover_illiquidity_flag=rollover_flag,
-            open_positions=open_positions,
-            contract_spec=spec,
-            cost_model=cost_model,
-            run_ai_committee=(self.ai_committee is not None),
-            feed_router=self.feed_router,
-            historical_spreads=list(spread_hist) if len(spread_hist) >= 5 else None,
-            current_tick_rate=cur_tick_rate,
-            historical_tick_rates=list(rate_hist) if len(rate_hist) >= 5 else None,
-        )
+        eval_kwargs: dict[str, Any] = {
+            "symbol": sym,
+            "side": side,
+            "timeframe": tf,
+            "entry_price": entry_px,
+            "candles": candles,
+            "h1_candles": h1_candles,
+            "spread_price": spread_px,
+            "pip_size": pip_size,
+            "dom_analytics": dom,
+            "cross_asset_shock_z": shock_z,
+            "rollover_illiquidity_flag": rollover_flag,
+            "open_positions": open_positions,
+            "contract_spec": spec,
+            "cost_model": cost_model,
+            "run_ai_committee": (self.ai_committee is not None),
+            "feed_router": self.feed_router,
+            "historical_spreads": list(spread_hist) if len(spread_hist) >= 5 else None,
+            "current_tick_rate": cur_tick_rate,
+            "historical_tick_rates": list(rate_hist) if len(rate_hist) >= 5 else None,
+        }
+        if not self._custom_pipeline or "remaining_daily_budget_pct" in getattr(
+            getattr(self.canonical_pipeline.evaluate, "__code__", None), "co_varnames", ()
+        ):
+            eval_kwargs["remaining_daily_budget_pct"] = float(remaining_daily_budget_pct)
+        trace = self.canonical_pipeline.evaluate(**eval_kwargs)
 
         sl_dist = max(abs(trace.entry_price - trace.stop_loss), pip_size)
         nbbo = self.feed_router.evaluate_nbbo(
@@ -654,6 +683,7 @@ class UniverseScanner:
         target_symbols: Sequence[DiscoveredSymbol] | Sequence[str] | None = None,
         now_utc: float | None = None,
         open_positions: Sequence[PositionRiskSpec] = (),
+        remaining_daily_budget_pct: float = 3.0,
     ) -> tuple[list[SymbolCockpitRow], UniverseScanSummary]:
         """Execute a full two-stage funnel scan cycle."""
         # Recompute fresh ground-truth contagion & rollover telemetry on every cycle
@@ -663,7 +693,11 @@ class UniverseScanner:
 
         rows: list[SymbolCockpitRow] = []
         for candidate in top_candidates:
-            row = self.evaluate_candidate_pipeline(candidate, open_positions=open_positions)
+            row = self.evaluate_candidate_pipeline(
+                candidate,
+                open_positions=open_positions,
+                remaining_daily_budget_pct=remaining_daily_budget_pct,
+            )
             rows.append(row)
 
         # Stage-B Convex Portfolio Kelly Optimization across multi-symbol survivors
@@ -679,7 +713,7 @@ class UniverseScanner:
                 (r.symbol, r.side, float(r.net_avg_r or 0.0), float(r.rec_risk_pct or 0.0))
                 for _, r in survivors
             ]
-            max_conc = int(self.config.get("risk", {}).get("max_concurrent_positions", 5))
+            max_conc = int(self.config.get("risk", {}).get("max_concurrent_positions", 2))
             opt_weights = self.correlation_shield.optimize_portfolio_weights(
                 candidates=opt_inputs,
                 open_positions=open_positions,

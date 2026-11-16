@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [3.2.0] - 2026-11-16 — Apex Omega v3.2
+
+### Added
+- **Single Version Authority & Omega Verification Gatekeeper (`v2-apex/apex/__version__.py`, `v2-apex/tools/verify_omega_gates.py`, `v2-apex/tests/test_phase20_omega_v3_2_full_consolidation.py`):**
+  - Centralized `v3.2.0 OMEGA` branding across `apex_runner.py`, `tui_dashboard.py`, `web_cockpit.py`, and `static/index.html`.
+  - Added mechanical 7-gate Omega verification suite (`--gate 0..6` / `--gate all`) and Phase 20 end-to-end consolidation tests (**119/119** passing).
+- **Calibrated NeuralAlpha & Continuous Zone 1/2/3 In-Flight Position Orchestration (`apex/quant/neural_alpha.py`, `apex/engine/canonical_pipeline.py`, `apex/execution/position_manager.py`, `apex/ai/aegis_verifier.py`):**
+  - Walk-forward purged Ridge fit gating zero/negative OOS skill (`blend_weight = 0.0`), Stage-B 3D SL/TP grid optimization, smooth Zone 1/2/3 SL(t)/TP(t) ratchets anchored to persisted `initial_one_r`, Shield 8 Z3 mark/TP boundary proofs, and cTrader closed-deal reconciliation.
+- **Stationary Hawkes Branching, Smooth Portfolio Covariance SLSQP & Monotonic Conformal Calibration (`apex/quant/regime.py`, `apex/quant/correlation_shield.py`, `apex/ledger/walkforward_db.py`, `apex/quant/timemachine_v2.py`):**
+  - Enforced `alpha < beta` Hawkes stationarity, replaced non-smooth `abs()` inside SLSQP constraints with paired linear inequalities, fixed Split-Conformal `p_calib` monotonicity, eliminated QMC spread double-counting under `asymmetric_barriers=True`, and seeded Sobol paths deterministically via per-`(symbol, bar_ts)` `zlib.crc32`.
+
+### Fixed
+- **Runtime, Concurrency & Execution Safety (`apex/ai/aegis_verifier.py`, `apex/ledger/walkforward_db.py`, `apex/feeds/mt5_feed.py`, `apex/feeds/ctrader_feed.py`, `apex/feeds/hydra_nbbo.py`, `apex/execution/router.py`, `apex_runner.py`):**
+  - Isolated per-call `z3.Context()` under module `RLock`, thread-local SQLite WAL connections with un-nested autopsy writes & `is_drill=0` stop-out cooldown isolation, isolated `NUMBA_CACHE_DIR`, closed-bar MT5 candle fetching (`start_pos=1`), FX-converted commission-inclusive `Decimal` lot sizing (`0.0` floor below `vol_min`), fail-closed cTrader order/amend/close RPCs, Hydra NBBO `winning_venue="NONE"` when unroutable + DOM impact penalty, causal `H1` replay filtering (`timestamp_utc + 3600 <= bar_ts`), bounded 512-entry LRU `_verdict_cache` + cascade wall-clock budget, same-origin `403` protection on `/api/state`, inline `onclick` XSS removal, Pending Confirmations UI, supervised Telegram polling, and config-preserving GitHub updates in `7_UPDATE_FROM_GITHUB.bat`.
+
+---
+
 ## [2.5.1] - 2026-11-13
 
 ### Added

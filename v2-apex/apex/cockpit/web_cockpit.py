@@ -17,6 +17,8 @@ from typing import Any, Callable, Optional
 
 from aiohttp import WSMsgType, web
 
+from apex.__version__ import DISPLAY_VERSION, __version__
+
 logger = logging.getLogger("apex.cockpit.web")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -119,6 +121,8 @@ def launch_chrome_app(url: str, no_gui: bool = False) -> Optional[subprocess.Pop
 
 def _default_state() -> dict[str, Any]:
     return {
+        "version": __version__,
+        "display_version": DISPLAY_VERSION,
         "run_mode": "DEMO-AUTO",
         "mind_state_badge": "AWAKE",
         "universe_scanned_count": 0,
@@ -372,7 +376,7 @@ class WebCockpitServer:
 
     async def _handle_index(self, request: web.Request) -> web.Response:
         if INDEX_HTML_PATH.is_file():
-            html = INDEX_HTML_PATH.read_text(encoding="utf-8")
+            html = INDEX_HTML_PATH.read_text(encoding="utf-8").replace("__APEX_VERSION__", DISPLAY_VERSION)
             resp = web.Response(text=html, content_type="text/html")
             resp.set_cookie(
                 "apex_csrf",
@@ -385,8 +389,12 @@ class WebCockpitServer:
         return web.Response(text="<h1>PocketBot Apex Cockpit HTML missing</h1>", content_type="text/html", status=404)
 
     async def _handle_api_state(self, request: web.Request) -> web.Response:
+        if not self._is_same_origin(request):
+            return web.json_response({"ok": False, "error": "Forbidden cross-origin state fetch"}, status=403)
         snap = self.get_state_snapshot()
         snap.pop("csrf_token", None)
+        snap.setdefault("version", __version__)
+        snap.setdefault("display_version", DISPLAY_VERSION)
         return web.json_response(snap)
 
     async def _handle_api_csrf(self, request: web.Request) -> web.Response:

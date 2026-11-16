@@ -13,12 +13,16 @@ from typing import Any, Optional, Sequence
 
 from apex.ai.aegis_verifier import AegisVerifier
 from apex.ai.veto_committee import AIVetoCommittee, CandidateSetupAuditContext
+import numpy as np
+
+from apex.compute.hyperion_fabric import get_hyperion_fabric
 from apex.feeds.alias_mapper import SmartAliasMapper
 from apex.feeds.models import AssetClass, Candle, Side
 from apex.quant.contagion_oracle import ContagionOracle
 from apex.quant.correlation_shield import CorrelationShield, PositionRiskSpec
 from apex.quant.momentum_dom import DOMAnalytics, MomentumDOMGate
 from apex.quant.mtf_confluence import MTFConfluenceFilter
+from apex.quant.neural_alpha import NeuralAlphaForecaster
 from apex.quant.regime import RegimeClassifier
 from apex.quant.timemachine_v2 import BlockBootstrapTimeMachine, TimeMachineCostModel
 
@@ -136,6 +140,7 @@ class Canonical11AgentPipeline:
         correlation_shield: Optional[CorrelationShield] = None,
         ai_committee: Optional[AIVetoCommittee] = None,
         contagion_oracle: Optional[ContagionOracle] = None,
+        neural_alpha: Optional[NeuralAlphaForecaster] = None,
         config: Optional[dict[str, Any]] = None,
         min_net_avg_r: Optional[float] = None,
         default_risk_pct: Optional[float] = None,
@@ -156,6 +161,7 @@ class Canonical11AgentPipeline:
         )
         self.ai_committee = ai_committee
         self.contagion_oracle = contagion_oracle
+        self.neural_alpha = neural_alpha or NeuralAlphaForecaster(enabled=True)
         self.config = cfg
         self.min_net_avg_r = float(min_net_avg_r if min_net_avg_r is not None else risk_cfg.get("min_net_avg_r", 0.10))
         self.default_risk_pct = float(
@@ -197,6 +203,7 @@ class Canonical11AgentPipeline:
         historical_spreads: Sequence[float] | None = None,
         current_tick_rate: float | None = None,
         historical_tick_rates: Sequence[float] | None = None,
+        remaining_daily_budget_pct: float = 3.0,
     ) -> AgentPipelineTrace:
         """Execute all 11 stages deterministically and emit an AgentPipelineTrace."""
         candles = list(candles or ())
@@ -215,9 +222,44 @@ class Canonical11AgentPipeline:
             historical_tick_rates=historical_tick_rates,
         )
         atr_val = max(diag.current_atr, max(pip_size, 1e-6) * 5.0)
-        sl_dist = 1.5 * atr_val
+        eff_pip = float(getattr(contract_spec, "pip_size", 0.0) or pip_size or 1e-6)
+        spread_px = max(0.0, float(spread_price or 0.0))
+        structural_sl_dist = max(
+            1.5 * atr_val,
+            (12.0 * eff_pip if asset_class == AssetClass.FOREX else 1.5 * atr_val),
+        )
+        structural_stop_px = (
+            (entry_price - structural_sl_dist) if side == Side.BUY else (entry_price + structural_sl_dist)
+        )
+        sl_dist = max(structural_sl_dist, 6.0 * spread_px)
+        opt_tp_r = 2.0
+        na_fc = self.neural_alpha.predict_quantiles(
+            candles=candles,
+            current_atr=atr_val,
+            symbol=symbol,
+            ofi=float(dom_analytics.ofi) if dom_analytics else 0.0,
+            contagion_shock_z=float(cross_asset_shock_z or 0.0),
+            h1_closes=[float(c.close) for c in h1_candles] if h1_candles else (),
+        )
+        if len(candles) >= 30 and entry_price > 0.0:
+            try:
+                bar_ratios_3d = BlockBootstrapTimeMachine.build_relative_bar_ratios(candles)
+                grid_opt = get_hyperion_fabric().optimize_sl_tp_grid_batch(
+                    hist_ratios=bar_ratios_3d.astype(np.float32)[np.newaxis, :, :],
+                    entry_prices=np.array([float(entry_price)], dtype=np.float64),
+                    atr_values=np.array([float(atr_val)], dtype=np.float64),
+                    is_longs=np.array([side == Side.BUY], dtype=np.bool_),
+                    spread_values=np.array([float(spread_px)], dtype=np.float64),
+                    n_paths=256,
+                    horizon_bars=min(24, int(self.horizon_bars)),
+                )
+                opt_sl_mult = max(1.5, float(grid_opt.optimal_sl_atr[0]))
+                opt_tp_r = max(1.5, min(4.0, float(grid_opt.optimal_tp_r[0])))
+                sl_dist = max(opt_sl_mult * atr_val, structural_sl_dist, 6.0 * spread_px)
+            except Exception:
+                opt_tp_r = 2.0
         stop_px = (entry_price - sl_dist) if side == Side.BUY else (entry_price + sl_dist)
-        target_px = (entry_price + 2.0 * sl_dist) if side == Side.BUY else (entry_price - 2.0 * sl_dist)
+        target_px = (entry_price + opt_tp_r * sl_dist) if side == Side.BUY else (entry_price - opt_tp_r * sl_dist)
 
         # Stage 1: trader-scanner + H1 MTF Confluence
         mtf_verdict = self.mtf_filter.evaluate(
@@ -254,7 +296,7 @@ class Canonical11AgentPipeline:
             symbol=symbol,
             side=side,
             entry_price=entry_price,
-            stop_price=stop_px,
+            stop_price=structural_stop_px,
             candles=candles,
             current_spread=spread_price,
             dom_analytics=dom_analytics,
@@ -278,7 +320,7 @@ class Canonical11AgentPipeline:
                 stage_num=4,
                 agent_name="trader-exit",
                 passed=bracket_ok,
-                detail=f"SL={stop_px:.5f} | TP={target_px:.5f} (2.0R)",
+                detail=f"SL={stop_px:.5f} | TP={target_px:.5f} ({opt_tp_r:.2f}R, NA_w={na_fc.blend_weight:.2f})",
                 metric_value=f"1R={sl_dist:.5f}",
             )
         )
@@ -400,6 +442,8 @@ class Canonical11AgentPipeline:
             "vol_pct": diag.volatility_percentile,
             "cross_asset_shock_z": resolved_shock_z,
             "rollover_illiquidity_flag": resolved_rollover,
+            "recommended_risk_pct": float(rec_risk),
+            "remaining_daily_budget_pct": float(remaining_daily_budget_pct),
         }
         z3_dec, z3_msg = AegisVerifier.z3_pure_math_axiom_gate(z3_telemetry)
         ai_ok = z3_dec == "APPROVE"

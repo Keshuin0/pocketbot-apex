@@ -212,24 +212,29 @@ def test_universe_scanner_empty_and_closed_market_no_phantom_fallback_and_delega
 
 
 def test_sqlite_context_manager_closes_connections_and_paper_shadow_settlement(tmp_path: Path) -> None:
-    """Verify 200 sequential SQLite queries leak zero connections, plus PAPER_SHADOW OHLC settlement & anti-ping-pong."""
+    """Verify 200 sequential SQLite queries reuse 1 thread-local connection, close() leaks zero handles, plus PAPER_SHADOW OHLC settlement."""
     db_path = tmp_path / "hygiene.db"
-    ledger = WalkForwardLedgerDB(db_path=db_path)
 
     opened_conns: list[sqlite3.Connection] = []
     real_connect = sqlite3.connect
 
     class _TrackedConn:
         def __init__(self, inner: sqlite3.Connection) -> None:
-            self._inner = inner
-            self.closed = False
+            object.__setattr__(self, "_inner", inner)
+            object.__setattr__(self, "closed", False)
 
         def __getattr__(self, name: str):
-            return getattr(self._inner, name)
+            return getattr(object.__getattribute__(self, "_inner"), name)
+
+        def __setattr__(self, name: str, value: object) -> None:
+            if name in ("_inner", "closed"):
+                object.__setattr__(self, name, value)
+            else:
+                setattr(object.__getattribute__(self, "_inner"), name, value)
 
         def close(self) -> None:
-            self.closed = True
-            self._inner.close()
+            object.__setattr__(self, "closed", True)
+            object.__getattribute__(self, "_inner").close()
 
     def _spy_connect(*args, **kwargs):
         c = _TrackedConn(real_connect(*args, **kwargs))
@@ -239,13 +244,14 @@ def test_sqlite_context_manager_closes_connections_and_paper_shadow_settlement(t
     orig_connect = sqlite3.connect
     sqlite3.connect = _spy_connect  # type: ignore[assignment]
     try:
+        ledger = WalkForwardLedgerDB(db_path=db_path)
         for _ in range(200):
             ledger.get_quarantine_state("EURUSD")
+        assert len(opened_conns) == 1
+        ledger.close()
+        assert all(getattr(c, "closed", False) for c in opened_conns)
     finally:
         sqlite3.connect = orig_connect  # type: ignore[assignment]
-
-    assert len(opened_conns) == 200
-    assert all(getattr(c, "closed", False) for c in opened_conns)
 
     # Seed 15 ACTIVE losing trades -> demoted to PAPER_SHADOW
     for i in range(15):

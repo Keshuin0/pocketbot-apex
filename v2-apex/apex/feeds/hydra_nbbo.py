@@ -91,6 +91,9 @@ class VenueCostQuote:
     effective_cost_r: float
     effective_cost_usd_per_lot: float
     margin_and_autotrading_ok: bool
+    effective_ask: float = 0.0
+    effective_bid: float = 0.0
+    dom_impact_pips: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,8 +269,10 @@ class HydraNBBOEngine:
         expected_vwap_slippage_pips: float = 0.10,
         side: Side = Side.BUY,
         side_quote_disadvantage_pips: float = 0.0,
+        intended_lots: float = 0.0,
+        dom_book: DOMAnalytics | None = None,
     ) -> VenueCostQuote:
-        """Compute directional `effective_cost = live_spread + directional_dislocation + commission + slippage + latency`."""
+        """Compute directional `effective_cost = live_spread + directional_dislocation + commission + slippage + latency + DOM impact`."""
         eff_pip = max(float(pip_size), 1e-9)
         eff_1r = max(float(one_r_price_distance), 1e-9)
         pip_val_usd = max(float(profile.pip_value_per_lot_usd), 1e-6)
@@ -289,10 +294,23 @@ class HydraNBBOEngine:
         )
         latency_price = latency_pips * eff_pip
 
-        eff_cost_pips = live_spread_pips + dir_pips + commission_pips + slip_pips + latency_pips
-        eff_cost_price = live_spread_price + dir_price + commission_price + slip_price + latency_price
+        dom_impact_pips = 0.0
+        if dom_book is not None and intended_lots > 0.0:
+            avail_vol = float(dom_book.ask_volume_top_n if side == Side.BUY else dom_book.bid_volume_top_n)
+            target_units = float(intended_lots) * 100_000.0
+            if avail_vol > 0.0 and target_units > avail_vol:
+                unfilled_ratio = (target_units - avail_vol) / avail_vol
+                dom_impact_pips = 0.5 * (unfilled_ratio ** 0.5)
+        dom_impact_price = dom_impact_pips * eff_pip
+
+        eff_cost_pips = live_spread_pips + dir_pips + commission_pips + slip_pips + latency_pips + dom_impact_pips
+        eff_cost_price = live_spread_price + dir_price + commission_price + slip_price + latency_price + dom_impact_price
         eff_cost_r = eff_cost_price / eff_1r
         eff_cost_usd_per_lot = eff_cost_pips * pip_val_usd
+
+        extra_cost_px = dir_price + commission_price + slip_price + latency_price + dom_impact_price
+        effective_ask = float(tick.ask) + extra_cost_px
+        effective_bid = float(tick.bid) - extra_cost_px
 
         return VenueCostQuote(
             venue=profile.venue,
@@ -314,6 +332,9 @@ class HydraNBBOEngine:
             effective_cost_r=eff_cost_r,
             effective_cost_usd_per_lot=eff_cost_usd_per_lot,
             margin_and_autotrading_ok=profile.margin_and_autotrading_ok,
+            effective_ask=effective_ask,
+            effective_bid=effective_bid,
+            dom_impact_pips=dom_impact_pips,
         )
 
     def evaluate_symbol(
@@ -330,6 +351,7 @@ class HydraNBBOEngine:
         ctrader_profile_override: VenueFeeProfile | None = None,
         mt5_profile_override: VenueFeeProfile | None = None,
         side: Side = Side.BUY,
+        intended_lots: float = 0.0,
     ) -> SyntheticNBBOResult:
         """Compute Synthetic NBBO, Directional All-In Effective Cost per venue, Cross-Pollinated DOM, and Spike Shield."""
         norm_sym = symbol.upper()
@@ -367,6 +389,8 @@ class HydraNBBOEngine:
                 expected_vwap_slippage_pips=ctrader_vwap_slippage_pips,
                 side=side,
                 side_quote_disadvantage_pips=ct_dir_pen,
+                intended_lots=intended_lots,
+                dom_book=ctrader_dom,
             )
             if eff_ct_tick is not None
             else None
@@ -380,6 +404,8 @@ class HydraNBBOEngine:
                 expected_vwap_slippage_pips=mt5_vwap_slippage_pips,
                 side=side,
                 side_quote_disadvantage_pips=mt5_dir_pen,
+                intended_lots=intended_lots,
+                dom_book=ctrader_dom,
             )
             if eff_mt5_tick is not None
             else None
@@ -484,22 +510,43 @@ class HydraNBBOEngine:
                 winning_cost_r = ct_quote.effective_cost_r
                 runner_up_venue = "mt5"
                 runner_up_cost_pips = mt5_quote.effective_cost_pips
-            else:
+            elif mt5_ok:
                 winning_venue = "mt5"
                 winning_cost_pips = mt5_quote.effective_cost_pips
                 winning_cost_r = mt5_quote.effective_cost_r
                 runner_up_venue = "ctrader"
                 runner_up_cost_pips = ct_quote.effective_cost_pips
+            else:
+                winning_venue = "NONE"
+                winning_cost_pips = 0.0
+                winning_cost_r = 0.0
+                runner_up_venue = None
+                runner_up_cost_pips = 0.0
 
         elif ct_quote is not None:
-            winning_venue = "ctrader"
-            winning_cost_pips = ct_quote.effective_cost_pips
-            winning_cost_r = ct_quote.effective_cost_r
+            if ct_quote.margin_and_autotrading_ok:
+                winning_venue = "ctrader"
+                winning_cost_pips = ct_quote.effective_cost_pips
+                winning_cost_r = ct_quote.effective_cost_r
+            else:
+                winning_venue = "NONE"
+                winning_cost_pips = 0.0
+                winning_cost_r = 0.0
 
         elif mt5_quote is not None:
-            winning_venue = "mt5"
-            winning_cost_pips = mt5_quote.effective_cost_pips
-            winning_cost_r = mt5_quote.effective_cost_r
+            if mt5_quote.margin_and_autotrading_ok:
+                winning_venue = "mt5"
+                winning_cost_pips = mt5_quote.effective_cost_pips
+                winning_cost_r = mt5_quote.effective_cost_r
+            else:
+                winning_venue = "NONE"
+                winning_cost_pips = 0.0
+                winning_cost_r = 0.0
+
+        else:
+            winning_venue = "NONE"
+            winning_cost_pips = 0.0
+            winning_cost_r = 0.0
 
         return SyntheticNBBOResult(
             symbol=norm_sym,
@@ -524,3 +571,58 @@ class HydraNBBOEngine:
             spike_basis_ratio=spike_ratio,
             spike_reason=spike_reason,
         )
+
+    def evaluate_nbbo(
+        self,
+        symbol: str,
+        intended_lots: float = 0.0,
+        side: Side = Side.BUY,
+        ct_tick: Tick | None = None,
+        mt5_tick: Tick | None = None,
+        ct_ok: bool = True,
+        mt5_ok: bool = True,
+        pip_size: float = 0.0001,
+        one_r_price_distance: float = 0.0010,
+        ctrader_dom: DOMAnalytics | None = None,
+    ) -> SyntheticNBBOResult:
+        """Convenience NBBO wrapper respecting per-venue health flags (`ct_ok`, `mt5_ok`) and lot size."""
+        ct_prof = None
+        mt5_prof = None
+        if not ct_ok:
+            b = self.ctrader_profile
+            ct_prof = VenueFeeProfile(
+                venue=b.venue,
+                commission_per_lot_round_turn_usd=b.commission_per_lot_round_turn_usd,
+                pip_value_per_lot_usd=b.pip_value_per_lot_usd,
+                ping_ms=b.ping_ms,
+                latency_penalty_pips_per_100ms=b.latency_penalty_pips_per_100ms,
+                margin_and_autotrading_ok=False,
+            )
+        if not mt5_ok:
+            b = self.mt5_profile
+            mt5_prof = VenueFeeProfile(
+                venue=b.venue,
+                commission_per_lot_round_turn_usd=b.commission_per_lot_round_turn_usd,
+                pip_value_per_lot_usd=b.pip_value_per_lot_usd,
+                ping_ms=b.ping_ms,
+                latency_penalty_pips_per_100ms=b.latency_penalty_pips_per_100ms,
+                margin_and_autotrading_ok=False,
+            )
+        res = self.evaluate_symbol(
+            symbol=symbol,
+            configured_mode="AUTO_HYDRA_MESH",
+            ctrader_tick=ct_tick,
+            mt5_tick=mt5_tick,
+            pip_size=pip_size,
+            one_r_price_distance=one_r_price_distance,
+            ctrader_dom=ctrader_dom,
+            ctrader_profile_override=ct_prof,
+            mt5_profile_override=mt5_prof,
+            side=side,
+            intended_lots=intended_lots,
+        )
+        if not ct_ok and not mt5_ok and res.winning_venue != "NONE":
+            return SyntheticNBBOResult(
+                **{**res.__dict__, "winning_venue": "NONE", "winning_cost_pips": 0.0, "winning_cost_r": 0.0}
+            )
+        return res

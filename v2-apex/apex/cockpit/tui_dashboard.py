@@ -11,6 +11,8 @@ Displays:
 
 from __future__ import annotations
 
+import shutil
+import sys
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -19,6 +21,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
+from apex.__version__ import DISPLAY_VERSION, __version__
 from apex.feeds.models import Side
 
 
@@ -69,7 +72,13 @@ class ApexTUIDashboard:
     """Rich Terminal Dashboard for PocketBot Apex."""
 
     def __init__(self, console: Console | None = None) -> None:
-        self.console: Console = console or Console(width=145)
+        if console is not None:
+            self.console: Console = console
+        elif not sys.stdout.isatty():
+            term_cols = shutil.get_terminal_size(fallback=(195, 40)).columns
+            self.console = Console(width=max(term_cols, 195))
+        else:
+            self.console = Console()
 
     @staticmethod
     def format_obi_meter(obi: float | None) -> str:
@@ -117,7 +126,7 @@ class ApexTUIDashboard:
         universe_badge: str | None = None,
         account_currency: str = "USD",
         broker_events: Sequence[BrokerExecutionEvent] = (),
-        aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught Hallucinations",
+        aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught | 0 Intercepted",
         contagion_shock_z: float = 0.0,
         mind_state_badge: str = "Mind State: FRESH (Cycle #0 | Wisdom Checkpoints: 0 | Last Refresh: --:--)",
     ) -> Group:
@@ -139,7 +148,7 @@ class ApexTUIDashboard:
             )
 
         header_text = (
-            f"[bold cyan]POCKETBOT APEX v2.4.1[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
+            f"[bold cyan]POCKETBOT APEX {DISPLAY_VERSION}[/bold cyan] | Mode: [bold]{run_mode.upper()}[/bold] | "
             f"[bold bright_cyan]{mesh_badge}[/bold bright_cyan] (cTrader: {ct_badge} | MT5: {mt5_badge}) | "
             f"SOR Saved: [bold green]+{sor_saved_pips:.1f}p ({sor_saved_usd:,.2f} {account_currency})[/bold green]\n"
             f"[bold magenta]{ai_brain_badge}[/bold magenta] | "
@@ -158,7 +167,7 @@ class ApexTUIDashboard:
             expand=True,
             header_style="bold cyan",
         )
-        table.add_column("Symbol", style="bold white", no_wrap=True)
+        table.add_column("Symbol", style="bold white", min_width=10, no_wrap=True)
         table.add_column("Tier / TF", no_wrap=True)
         table.add_column("Bid / Ask", justify="right", no_wrap=True)
         table.add_column("Spread", justify="right", no_wrap=True)
@@ -265,7 +274,7 @@ class ApexTUIDashboard:
         universe_badge: str | None = None,
         account_currency: str = "USD",
         broker_events: Sequence[BrokerExecutionEvent] = (),
-        aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught Hallucinations",
+        aegis_badge: str = "Aegis Z3: 0 Verified Proofs | 0% Uncaught | 0 Intercepted",
         contagion_shock_z: float = 0.0,
         mind_state_badge: str = "Mind State: FRESH (Cycle #0 | Wisdom Checkpoints: 0 | Last Refresh: --:--)",
         live: Live | None = None,

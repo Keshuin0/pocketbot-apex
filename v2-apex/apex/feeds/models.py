@@ -112,7 +112,7 @@ class Candle:
     low: float
     close: float
     volume: float
-    source: str
+    source: str = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +130,7 @@ class ContractSpec:
     source: str
     trade_tick_value: float = 0.0
     trade_tick_size: float = 0.0
+    commission_per_lot_rt: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

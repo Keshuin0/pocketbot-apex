@@ -70,6 +70,8 @@ class NeuralAlphaForecast:
     backend_used: str
     latency_ms: float
     enabled: bool = True
+    oos_skill_score: float = 0.0
+    blend_weight: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -286,6 +288,11 @@ class NeuralAlphaForecaster:
         self.backend_used: str = "DISABLED"
         self.last_batch_ms: float = 0.0
         self.last_batch_size: int = 0
+        self.oos_skill_score: float = 0.0
+        self.blend_weight: float = 0.0
+        self._ridge_coef: np.ndarray | None = None
+        self._ridge_intercept: float = 0.0
+        self._ridge_by_symbol: dict[str, tuple[np.ndarray, float, float, float]] = {}
 
         self._init_backend()
 
@@ -495,6 +502,8 @@ class NeuralAlphaForecaster:
                 backend_used=self.backend_used,
                 latency_ms=per_sym_ms,
                 enabled=True,
+                oos_skill_score=self.oos_skill_score,
+                blend_weight=self.blend_weight,
             )
             for i in range(b_cnt)
         ]
@@ -511,6 +520,222 @@ class NeuralAlphaForecaster:
             backend_used=self.backend_used,
             batch_latency_ms=elapsed_ms,
         )
+
+    def fit_walkforward_ridge_quantiles(
+        self,
+        candles: Sequence[Candle],
+        horizon_bars: int | None = None,
+        l2_alpha: float = 5.0,
+        symbol: str = "",
+    ) -> dict[str, float]:
+        """Train causal blocked walk-forward Ridge quantile adapter; gate blend_weight=0.0 if OOS skill <= 0."""
+        h = max(1, int(horizon_bars if horizon_bars is not None else self.horizon_bars))
+        c_seq = list(candles or ())
+        sym_key = (symbol or (str(getattr(c_seq[0], "symbol", "UNKNOWN")) if c_seq else "UNKNOWN")).upper().strip()
+        closes = np.asarray([float(getattr(c, "close", 0.0) or 0.0) for c in c_seq], dtype=np.float64)
+        log_rets = compute_log_returns(closes)
+        min_needed = max(24, h + 16)
+        if log_rets.size < min_needed or float(np.std(log_rets)) < 1e-12:
+            with self._lock:
+                self.oos_skill_score = 0.0
+                self.blend_weight = 0.0
+                self._ridge_coef = None
+                self._ridge_intercept = 0.0
+                self._ridge_by_symbol[sym_key] = (np.zeros((4,), dtype=np.float64), 0.0, 0.0, 0.0)
+            return {"oos_skill_score": 0.0, "blend_weight": 0.0}
+
+        # Causal features [r_{t-1}, sum4_r, sum8_r, vol8] -> forward h-bar cumulative log return
+        feat_rows: list[list[float]] = []
+        targets: list[float] = []
+        start_t = 8
+        end_t = int(log_rets.size) - h
+        for t in range(start_t, end_t):
+            win8 = log_rets[t - 8 : t]
+            r1 = float(log_rets[t - 1])
+            r4 = float(np.sum(log_rets[t - 4 : t]))
+            r8 = float(np.sum(win8))
+            v8 = float(np.sqrt(np.mean(np.square(win8))) + 1e-8)
+            fwd = float(np.sum(log_rets[t : t + h]))
+            feat_rows.append([r1 / v8, r4 / (v8 * 2.0), r8 / (v8 * 2.828), v8])
+            targets.append(fwd)
+
+        if len(feat_rows) < 15:
+            with self._lock:
+                self.oos_skill_score = 0.0
+                self.blend_weight = 0.0
+                self._ridge_coef = None
+                self._ridge_intercept = 0.0
+            return {"oos_skill_score": 0.0, "blend_weight": 0.0}
+
+        x_mat = np.asarray(feat_rows, dtype=np.float64)
+        y_vec = np.asarray(targets, dtype=np.float64)
+        if float(np.std(y_vec)) < 1e-12:
+            with self._lock:
+                self.oos_skill_score = 0.0
+                self.blend_weight = 0.0
+                self._ridge_coef = None
+                self._ridge_intercept = 0.0
+            return {"oos_skill_score": 0.0, "blend_weight": 0.0}
+
+        def _fit_ridge(xm: np.ndarray, yv: np.ndarray) -> tuple[np.ndarray, float]:
+            xm_aug = np.column_stack([xm, np.ones((xm.shape[0],), dtype=np.float64)])
+            reg = np.eye(xm_aug.shape[1], dtype=np.float64) * float(l2_alpha)
+            reg[-1, -1] = 1e-6  # do not shrink intercept
+            beta = np.linalg.solve(xm_aug.T @ xm_aug + reg, xm_aug.T @ yv)
+            return beta[:-1], float(beta[-1])
+
+        # Chronological expanding walk-forward splits with purge gap h (strict causality)
+        n_obs = len(y_vec)
+        n_splits = 3
+        fold_sz = max(4, (n_obs // 2) // n_splits)
+        oos_preds: list[float] = []
+        oos_trues: list[float] = []
+        split_start = max(8, n_obs // 2)
+        for k in range(n_splits):
+            te_start = split_start + k * fold_sz
+            te_end = min(n_obs, te_start + fold_sz) if k < n_splits - 1 else n_obs
+            tr_end = te_start - h
+            if tr_end < 8 or te_end <= te_start:
+                continue
+            w_k, b_k = _fit_ridge(x_mat[:tr_end], y_vec[:tr_end])
+            preds = x_mat[te_start:te_end] @ w_k + b_k
+            oos_preds.extend(preds.tolist())
+            oos_trues.extend(y_vec[te_start:te_end].tolist())
+
+        if len(oos_preds) < 5:
+            skill = 0.0
+        else:
+            op = np.asarray(oos_preds, dtype=np.float64)
+            ot = np.asarray(oos_trues, dtype=np.float64)
+            mse_model = float(np.mean(np.square(ot - op)))
+            mse_zero = float(np.mean(np.square(ot)))
+            skill = (1.0 - (mse_model / mse_zero)) if mse_zero > 1e-18 else 0.0
+            if not math.isfinite(skill):
+                skill = 0.0
+
+        w_full, b_full = _fit_ridge(x_mat, y_vec)
+        if skill <= 0.0:
+            eff_skill = round(max(-1.0, skill), 6)
+            eff_blend = 0.0
+        else:
+            eff_skill = round(min(1.0, skill), 6)
+            eff_blend = round(min(0.25, skill), 4)
+            residuals = np.abs(y_vec - (x_mat @ w_full + b_full))
+            self.update_conformal_calibration(
+                realized_returns=residuals,
+                pred_q10=-residuals * 0.5,
+                pred_q90=residuals * 0.5,
+                alpha=0.20,
+            )
+
+        with self._lock:
+            self.oos_skill_score = eff_skill
+            self.blend_weight = eff_blend
+            self._ridge_coef = w_full
+            self._ridge_intercept = b_full
+            self._ridge_by_symbol[sym_key] = (w_full, b_full, eff_skill, eff_blend)
+        return {"oos_skill_score": eff_skill, "blend_weight": eff_blend}
+
+    def predict_quantiles(
+        self,
+        candles: Sequence[Candle],
+        current_atr: float = 0.0,
+        *,
+        symbol: str = "",
+        ofi: float = 0.0,
+        contagion_shock_z: float = 0.0,
+        h1_closes: Sequence[float] = (),
+    ) -> NeuralAlphaForecast:
+        """Forecast quantiles and gate blend_weight by walk-forward out-of-sample Ridge skill."""
+        c_list = list(candles or ())
+        sym = symbol or (str(getattr(c_list[0], "symbol", "UNKNOWN")) if c_list else "UNKNOWN")
+        sym_key = sym.upper().strip()
+        closes = [float(getattr(c, "close", 0.0) or 0.0) for c in c_list]
+
+        if sym_key not in self._ridge_by_symbol and len(c_list) >= 32:
+            self.fit_walkforward_ridge_quantiles(c_list, symbol=sym_key)
+        entry = self._ridge_by_symbol.get(sym_key)
+        sym_coef = entry[0] if entry is not None else None
+        sym_int = entry[1] if entry is not None else 0.0
+        sym_skill = entry[2] if entry is not None else 0.0
+        sym_blend = entry[3] if entry is not None else 0.0
+
+        if len(c_list) < 2:
+            return NeuralAlphaForecast(
+                symbol=sym,
+                q10=0.0,
+                q50=0.0,
+                q90=0.0,
+                interval_width=0.0,
+                realized_bpv=max(float(current_atr), 1e-6),
+                jump_ratio=0.0,
+                ofi=float(ofi),
+                contagion_shock_z=float(contagion_shock_z),
+                confidence=0.0,
+                backend_used=self.backend_used,
+                latency_ms=0.0,
+                enabled=self.enabled,
+                oos_skill_score=sym_skill,
+                blend_weight=0.0,
+            )
+
+        win = MultiResolutionWindow(
+            symbol=sym,
+            m5_closes=closes,
+            h1_closes=h1_closes,
+            ofi=float(ofi),
+            contagion_shock_z=float(contagion_shock_z),
+        )
+        fc = self.forecast_symbol(win)
+        if sym_blend <= 0.0 or sym_coef is None:
+            return NeuralAlphaForecast(
+                symbol=fc.symbol,
+                q10=fc.q10,
+                q50=fc.q50,
+                q90=fc.q90,
+                interval_width=fc.interval_width,
+                realized_bpv=fc.realized_bpv,
+                jump_ratio=fc.jump_ratio,
+                ofi=fc.ofi,
+                contagion_shock_z=fc.contagion_shock_z,
+                confidence=fc.confidence,
+                backend_used=fc.backend_used,
+                latency_ms=fc.latency_ms,
+                enabled=fc.enabled,
+                oos_skill_score=sym_skill,
+                blend_weight=0.0,
+            )
+
+        log_rets = compute_log_returns(closes)
+        if log_rets.size >= 8:
+            win8 = log_rets[-8:]
+            r1 = float(log_rets[-1])
+            r4 = float(np.sum(log_rets[-4:]))
+            r8 = float(np.sum(win8))
+            v8 = float(np.sqrt(np.mean(np.square(win8))) + 1e-8)
+            x_now = np.array([r1 / v8, r4 / (v8 * 2.0), r8 / (v8 * 2.828), v8], dtype=np.float64)
+            ridge_q50 = float(x_now @ sym_coef + sym_int)
+            w = sym_blend
+            blended_q50 = (1.0 - w) * fc.q50 + w * ridge_q50
+            half_w = max(fc.interval_width * 0.5, 1e-7)
+            return NeuralAlphaForecast(
+                symbol=fc.symbol,
+                q10=round(min(fc.q10, blended_q50 - half_w), 7),
+                q50=round(blended_q50, 7),
+                q90=round(max(fc.q90, blended_q50 + half_w), 7),
+                interval_width=round(max(fc.interval_width, 2.0 * half_w), 7),
+                realized_bpv=fc.realized_bpv,
+                jump_ratio=fc.jump_ratio,
+                ofi=fc.ofi,
+                contagion_shock_z=fc.contagion_shock_z,
+                confidence=fc.confidence,
+                backend_used=fc.backend_used,
+                latency_ms=fc.latency_ms,
+                enabled=fc.enabled,
+                oos_skill_score=sym_skill,
+                blend_weight=sym_blend,
+            )
+        return fc
 
     def forecast_symbol(self, window: MultiResolutionWindow) -> NeuralAlphaForecast:
         """Compute calibrated `(Q10, Q50, Q90)` return quantiles for a single symbol."""
