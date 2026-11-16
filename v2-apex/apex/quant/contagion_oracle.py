@@ -50,11 +50,12 @@ class ContagionOracle:
         spread_ratio: float | None = None,
     ) -> tuple[bool, str]:
         """Detect daily FX/Index maintenance & rollover spread-widening windows (21:55-23:10 UTC)."""
-        dt = (
-            utc_dt.astimezone(datetime.timezone.utc)
-            if utc_dt is not None
-            else datetime.datetime.now(datetime.timezone.utc)
-        )
+        if utc_dt is None:
+            dt = datetime.datetime.now(datetime.timezone.utc)
+        elif utc_dt.tzinfo is None:
+            dt = utc_dt.replace(tzinfo=datetime.timezone.utc)
+        else:
+            dt = utc_dt.astimezone(datetime.timezone.utc)
         mins = dt.hour * 60 + dt.minute
         # 21:55 UTC (1315m) through 23:10 UTC (1390m)
         if 1315 <= mins <= 1390:
@@ -71,15 +72,13 @@ class ContagionOracle:
             return 0.0
         arr = np.asarray(returns, dtype=float)
         hist = arr[:-1]
-        mu = float(np.mean(hist))
-        sigma = float(np.std(hist, ddof=1)) if len(hist) > 1 else 0.0
-        if sigma <= 1e-12 or math.isnan(sigma):
+        if len(hist) <= 1 or math.isnan(float(np.std(hist, ddof=1))):
             return 0.0
-        # Session-aware robust baseline floor so ultra-quiet rollover bars don't explode Z
+        # MAD-only robust denominator removes outlier-inflated sigma sensitivity
         med = float(np.median(hist))
         mad = float(np.median(np.abs(hist - med)))
-        robust_sigma = max(sigma, 1.4826 * mad, 0.00035)
-        z = abs(float(arr[-1]) - mu) / robust_sigma
+        robust_sigma = max(1.4826 * mad, 0.00035)
+        z = abs(float(arr[-1]) - med) / robust_sigma
         return round(float(z), 4)
 
     def compute_cross_asset_shock_z(
@@ -105,7 +104,13 @@ class ContagionOracle:
                             # Ignore frozen/maintenance bars older than 15m so shock Z never freezes
                             last_ts = float(getattr(candles[-1], "timestamp_utc", 0.0) or 0.0)
                             if last_ts <= 0.0 or (cur_ts - last_ts) <= 900.0:
-                                closes = np.asarray([c.close for c in candles], dtype=float)
+                                # Exclude currently forming M5 candle so only completed bar[-2] drives shock Z
+                                closed_bars = (
+                                    candles[:-1]
+                                    if (len(candles) >= 16 and last_ts > 0.0 and 0.0 <= (cur_ts - last_ts) < 300.0)
+                                    else candles
+                                )
+                                closes = np.asarray([c.close for c in closed_bars], dtype=float)
                                 rets = np.diff(closes) / np.maximum(closes[:-1], 1e-9)
                     except Exception:
                         rets = None

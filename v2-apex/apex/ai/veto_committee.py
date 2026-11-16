@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -38,7 +39,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 import aiohttp
 from dotenv import dotenv_values
@@ -53,9 +54,10 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 
 class AIProviderName(str, Enum):
-    """Supported tiers in the Hybrid 3-Tier AI Router."""
+    """Supported tiers in the Hybrid 4-Tier AI Router."""
 
     STUDIO_API = "studio_api"
+    LOCAL_VLLM = "local_vllm"
     AGY_PRO = "agy_pro"
     PURE_MATH = "pure_math"
 
@@ -103,6 +105,7 @@ class HybridAIRouterStatus:
     agy_pro_status: AIProviderStatus
     pure_math_status: AIProviderStatus
     model_quota_summary: dict[str, Any] = field(default_factory=dict)
+    local_vllm_status: AIProviderStatus | None = None
 
     @property
     def active_model_label(self) -> str:
@@ -216,8 +219,9 @@ class AIVetoCommittee:
     """
 
     GEMINI_ENDPOINT_TEMPLATE: str = (
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     )
+    LOCAL_VLLM_ENDPOINT: str = "http://127.0.0.1:8000/v1/chat/completions"
     DEFAULT_STUDIO_MODEL: str = "gemini-2.5-flash"
 
     def __init__(
@@ -234,6 +238,9 @@ class AIVetoCommittee:
         agy_executable_override: str | None = None,
         probe_agy_auth: bool = False,
         ledger_db: Any = None,
+        vllm_endpoint: str | None = None,
+        vllm_model: str | None = None,
+        vllm_enabled: bool | None = None,
     ) -> None:
         self.env_path = Path(env_path)
         self.config_path = Path(config_path)
@@ -248,13 +255,34 @@ class AIVetoCommittee:
         self.agy_timeout_seconds: float = float(agy_timeout_seconds)
         self._agy_executable_override: str | None = agy_executable_override
 
+        env_vllm_url = os.environ.get("APEX_VLLM_URL", "").strip()
+        self._explicit_vllm_endpoint: str | None = vllm_endpoint
+        self.vllm_endpoint: str = (vllm_endpoint or env_vllm_url or self.LOCAL_VLLM_ENDPOINT).strip()
+        self.vllm_model: str = (
+            vllm_model or os.environ.get("APEX_VLLM_MODEL", "") or "Qwen/Qwen2.5-7B-Instruct-AWQ"
+        ).strip()
+        self._explicit_vllm_enabled: bool | None = vllm_enabled
+        self.vllm_enabled: bool = bool(
+            vllm_enabled
+            if vllm_enabled is not None
+            else (
+                bool(vllm_endpoint or env_vllm_url)
+                or (
+                    self._explicit_priority is not None
+                    and AIProviderName.LOCAL_VLLM.value in self._explicit_priority
+                )
+            )
+        )
+
         self._env_mtime: float = -1.0
         self._config_mtime: float = -1.0
 
         self.enabled: bool = bool(enabled)
         self.mode: str = str(mode)
         self.api_key: str = (api_key or "").strip()
-        self._priority_order: tuple[str, ...] = self._resolve_priority_tuple(self.mode, priority_order)
+        self._priority_order: tuple[str, ...] = self._resolve_priority_tuple(
+            self.mode, priority_order, include_vllm=self.vllm_enabled
+        )
 
         self._cached_agy_path: str | None = None
         self._cached_agy_auth_ok: bool | None = None
@@ -290,16 +318,30 @@ class AIVetoCommittee:
     def _resolve_priority_tuple(
         mode: str,
         custom_order: Sequence[str] | None = None,
+        include_vllm: bool = False,
     ) -> tuple[str, ...]:
         norm_mode = str(mode or AIVetoMode.AUTO_STUDIO_FIRST.value).lower().strip()
         if norm_mode == AIVetoMode.FORCE_PURE_MATH.value:
             return (AIProviderName.PURE_MATH.value,)
-        if norm_mode in MODE_DEFAULT_PRIORITY:
+        if custom_order and (
+            norm_mode not in MODE_DEFAULT_PRIORITY
+            or AIProviderName.LOCAL_VLLM.value in [str(x).lower().strip() for x in custom_order]
+        ):
+            chain = [str(x).lower().strip() for x in custom_order if str(x).strip()]
+        elif norm_mode in MODE_DEFAULT_PRIORITY:
             chain = list(MODE_DEFAULT_PRIORITY[norm_mode])
         elif custom_order:
             chain = [str(x).lower().strip() for x in custom_order if str(x).strip()]
         else:
             chain = list(MODE_DEFAULT_PRIORITY[AIVetoMode.AUTO_STUDIO_FIRST.value])
+
+        if (
+            include_vllm
+            and AIProviderName.LOCAL_VLLM.value not in chain
+            and len(chain) >= 2
+            and norm_mode != AIVetoMode.FORCE_PURE_MATH.value
+        ):
+            chain.insert(1, AIProviderName.LOCAL_VLLM.value)
 
         # Guarantee pure_math is always at the bottom of the cascade so execution never crashes
         if AIProviderName.PURE_MATH.value not in chain:
@@ -367,12 +409,30 @@ class AIVetoCommittee:
             except Exception as exc:
                 return False, f"agy.exe auth probe error: {exc}"
 
-        # Fast non-blocking check: verify binary exists and user has `.gemini` profile directory
-        home = Path(os.environ.get("USERPROFILE", str(Path.home())))
+        # Fast non-blocking check: verify binary exists and user has non-empty authenticated `.gemini` profile
+        home = Path(os.environ.get("USERPROFILE") or os.environ.get("HOME") or str(Path.home()))
         gemini_dir = home / ".gemini"
-        if gemini_dir.exists():
-            return True, f"Ready via Google AI Pro login ({exe_file})"
-        return True, f"Ready ({exe_file})"
+        if not gemini_dir.exists() or not gemini_dir.is_dir():
+            return False, f"Google AI Pro not authenticated (missing {gemini_dir})"
+        auth_markers = (
+            gemini_dir / "oauth_creds.json",
+            gemini_dir / "settings.json",
+            gemini_dir / "google_accounts.json",
+            gemini_dir / "antigravity",
+            gemini_dir / "accounts",
+        )
+        has_marker = any(
+            m.exists() and ((m.is_file() and m.stat().st_size > 2) or (m.is_dir() and any(m.iterdir())))
+            for m in auth_markers
+        )
+        if not has_marker:
+            try:
+                has_marker = any(p.is_file() and p.stat().st_size > 2 for p in gemini_dir.iterdir())
+            except OSError:
+                has_marker = False
+        if not has_marker:
+            return False, f"Google AI Pro not authenticated (empty {gemini_dir})"
+        return True, f"Ready via Google AI Pro login ({exe_file})"
 
     def hot_reload_if_needed(self, force: bool = False, probe_agy_auth: bool = False) -> bool:
         """Check `.env` and `config/apex_config.json` `mtime` and hot-reload settings if modified.
@@ -413,8 +473,26 @@ class AIVetoCommittee:
                     self.enabled = bool(ai_cfg.get("enabled", self._explicit_enabled))
                     cfg_mode = str(ai_cfg.get("mode", self._explicit_mode or AIVetoMode.AUTO_STUDIO_FIRST.value))
                     cfg_order = ai_cfg.get("priority_order")
+                    if "vllm_endpoint" in ai_cfg and not self._explicit_vllm_endpoint:
+                        self.vllm_endpoint = str(ai_cfg["vllm_endpoint"]).strip() or self.LOCAL_VLLM_ENDPOINT
+                    if "vllm_model" in ai_cfg:
+                        self.vllm_model = str(ai_cfg["vllm_model"]).strip() or self.vllm_model
+                    if self._explicit_vllm_enabled is None and "vllm_enabled" in ai_cfg:
+                        self.vllm_enabled = bool(ai_cfg["vllm_enabled"])
                     self.mode = cfg_mode
-                    self._priority_order = self._resolve_priority_tuple(cfg_mode, cfg_order)
+                    effective_order = cfg_order if cfg_order is not None else self._explicit_priority
+                    effective_vllm = bool(
+                        self.vllm_enabled
+                        or (
+                            effective_order is not None
+                            and AIProviderName.LOCAL_VLLM.value in [str(x).lower().strip() for x in effective_order]
+                        )
+                    )
+                    self._priority_order = self._resolve_priority_tuple(
+                        cfg_mode,
+                        effective_order,
+                        include_vllm=effective_vllm,
+                    )
                     if "studio_timeout_seconds" in ai_cfg:
                         self.timeout_seconds = min(float(ai_cfg["studio_timeout_seconds"]), 4.0)
                     elif "timeout_seconds" in ai_cfg:
@@ -426,7 +504,11 @@ class AIVetoCommittee:
             else:
                 self.enabled = self._explicit_enabled
                 self.mode = self._explicit_mode
-                self._priority_order = self._resolve_priority_tuple(self.mode, self._explicit_priority)
+                self._priority_order = self._resolve_priority_tuple(
+                    self.mode,
+                    self._explicit_priority,
+                    include_vllm=self.vllm_enabled,
+                )
 
         # Refresh agy.exe discovery & adaptive model catalog
         self._cached_agy_path = self.locate_agy_executable(self._agy_executable_override)
@@ -479,8 +561,23 @@ class AIVetoCommittee:
             executable_or_endpoint="apex/quant",
         )
 
+        local_vllm_ready = bool(
+            self.vllm_endpoint
+            and (
+                self.vllm_enabled
+                or AIProviderName.LOCAL_VLLM.value in self._priority_order
+            )
+        )
+        local_vllm_status = AIProviderStatus(
+            provider=AIProviderName.LOCAL_VLLM.value,
+            ready=local_vllm_ready,
+            detail=f"OpenAI-compatible vLLM ({self.vllm_model})" if local_vllm_ready else "local_vllm disabled",
+            executable_or_endpoint=self.vllm_endpoint if local_vllm_ready else "",
+        )
+
         ready_map = {
             AIProviderName.STUDIO_API.value: studio_status.ready,
+            AIProviderName.LOCAL_VLLM.value: local_vllm_status.ready,
             AIProviderName.AGY_PRO.value: agy_status.ready,
             AIProviderName.PURE_MATH.value: True,
         }
@@ -495,6 +592,7 @@ class AIVetoCommittee:
                 studio_status=studio_status,
                 agy_pro_status=agy_status,
                 pure_math_status=math_status,
+                local_vllm_status=local_vllm_status,
             )
 
         ready_chain = [p for p in self._priority_order if ready_map.get(p, False)]
@@ -515,6 +613,7 @@ class AIVetoCommittee:
             agy_pro_status=agy_status,
             pure_math_status=math_status,
             model_quota_summary=q_summary,
+            local_vllm_status=local_vllm_status,
         )
 
     @staticmethod
@@ -591,31 +690,146 @@ class AIVetoCommittee:
         cascade_path: Sequence[str] = (),
         model_used: str = "",
     ) -> AIVetoDecision:
-        """Parse and validate `{ "decision": "APPROVE" | "VETO" | "ABSTAIN", "confidence": 0.0-1.0, "reason": "..." }`."""
-        data = cls.clean_and_extract_json_payload(raw_text)
-        raw_dec = str(data.get("decision", "APPROVE")).upper().strip()
-        if raw_dec not in ("APPROVE", "VETO", "ABSTAIN"):
-            raise ValueError(f"Invalid AI decision value: {raw_dec!r}")
-        conf = float(max(0.0, min(1.0, float(data.get("confidence", 0.5)))))
-        default_mult = 0.0 if raw_dec == "VETO" else 1.0
-        mult = float(max(0.0, min(1.0, float(data.get("risk_multiplier", default_mult)))))
-        reason = str(data.get("reason", f"Audited by {provider_used}")).strip()
+        """Parse `{decision, confidence, reason}`; fail closed to ABSTAIN on missing/malformed inputs."""
         path_tuple = tuple(cascade_path) if cascade_path else (provider_used,)
-        return AIVetoDecision(
-            decision=raw_dec,
-            confidence=conf,
+        try:
+            data = cls.clean_and_extract_json_payload(raw_text)
+            if not isinstance(data, dict):
+                raise ValueError("AI payload JSON is not a mapping")
+            raw_dec = str(data.get("decision") or "ABSTAIN").upper().strip()
+            if raw_dec not in ("APPROVE", "VETO", "ABSTAIN"):
+                raise ValueError(f"Invalid AI decision value: {raw_dec!r}")
+            conf_raw = float(data.get("confidence", 0.5))
+            if math.isnan(conf_raw) or math.isinf(conf_raw):
+                raise ValueError("Non-finite confidence")
+            conf = float(max(0.0, min(1.0, conf_raw)))
+            default_mult = 0.0 if raw_dec in ("VETO", "ABSTAIN") else 1.0
+            mult_raw = float(data.get("risk_scale", data.get("risk_multiplier", default_mult)))
+            if math.isnan(mult_raw) or math.isinf(mult_raw):
+                raise ValueError("Non-finite risk_multiplier")
+            mult = float(max(0.0, min(1.0, mult_raw)))
+            reason = str(data.get("reason", f"Audited by {provider_used}")).strip()
+            return AIVetoDecision(
+                decision=raw_dec,
+                confidence=conf,
+                reason=reason,
+                latency_ms=latency_ms,
+                bypassed=(raw_dec == "ABSTAIN"),
+                provider_used=provider_used,
+                cascade_path=path_tuple,
+                model_used=model_used,
+                risk_multiplier=mult,
+            )
+        except Exception as exc:
+            logger.warning("parse_structured_decision failed closed to ABSTAIN (%s)", exc)
+            return AIVetoDecision(
+                decision="ABSTAIN",
+                confidence=0.0,
+                reason=f"Fail-closed ABSTAIN on malformed AI payload: {exc}",
+                latency_ms=latency_ms,
+                bypassed=True,
+                provider_used=provider_used,
+                cascade_path=path_tuple,
+                model_used=model_used,
+                risk_multiplier=0.0,
+            )
+
+    def _log_epistemic_and_update_trust(
+        self,
+        ctx: CandidateSetupAuditContext,
+        blinded: BlindedTelemetry,
+        provider_used: str,
+        model_used: str,
+        raw_decision: str,
+        final_decision: str,
+        confidence: float,
+        risk_multiplier: float,
+        hallucination_detected: bool,
+        violation_codes: str,
+        reason: str,
+    ) -> int:
+        if self.ledger_db is None:
+            return 0
+        side_str = ctx.side.value if hasattr(ctx.side, "value") else str(ctx.side).upper()
+        audit_id = self.ledger_db.log_ai_epistemic_audit(
+            symbol=ctx.symbol,
+            side=side_str,
+            timeframe=ctx.timeframe,
+            provider=provider_used,
+            model_id=model_used,
+            input_sha256=blinded.input_sha256,
+            raw_decision=raw_decision,
+            final_decision=final_decision,
+            confidence=confidence,
+            risk_multiplier=risk_multiplier,
+            hallucination_detected=hallucination_detected,
+            violation_codes=violation_codes,
             reason=reason,
-            latency_ms=latency_ms,
-            bypassed=False,
+            is_canary=False,
+            predicted_net_r=ctx.net_avg_R,
+        )
+        stats = self.ledger_db.get_model_epistemic_stats(provider=provider_used, model_id=model_used, window=20)
+        self.model_selector.update_epistemic_trust(
+            provider_used,
+            model_used,
+            stats.epistemic_trust_score,
+            quarantined=stats.should_demote_to_pure_math,
+            reason=stats.demote_reason,
+        )
+        return int(audit_id)
+
+    def _build_swap_abstain_decision(
+        self,
+        ctx: CandidateSetupAuditContext,
+        blinded: BlindedTelemetry,
+        provider_used: str,
+        model_used: str,
+        cascade_path: Sequence[str],
+        raw_decision: str,
+        swap_decision: str,
+        confidence: float,
+        latency_ms: float,
+        start_perf: float,
+    ) -> AIVetoDecision:
+        swap_reason = f"Shield 5 SHIELD5_SEMANTIC_ENTROPY ({raw_decision}->{swap_decision}) -> pure_math"
+        audit_id = self._log_epistemic_and_update_trust(
+            ctx=ctx,
+            blinded=blinded,
             provider_used=provider_used,
-            cascade_path=path_tuple,
             model_used=model_used,
-            risk_multiplier=mult,
+            raw_decision=raw_decision,
+            final_decision="ABSTAIN",
+            confidence=0.0,
+            risk_multiplier=1.0,
+            hallucination_detected=False,
+            violation_codes="SHIELD5_SEMANTIC_ENTROPY",
+            reason=swap_reason,
+        )
+        fb = self._evaluate_pure_math_fallback(
+            ctx=ctx,
+            start_perf=start_perf,
+            cascade_path=list(cascade_path) + [AIProviderName.PURE_MATH.value],
+            fallback_reason_prefix=swap_reason,
+        )
+        return AIVetoDecision(
+            decision=fb.decision,
+            confidence=fb.confidence,
+            reason=fb.reason,
+            latency_ms=fb.latency_ms if fb.latency_ms > 0.0 else latency_ms,
+            bypassed=True,
+            provider_used=fb.provider_used,
+            cascade_path=fb.cascade_path,
+            model_used=model_used,
+            risk_multiplier=0.0 if fb.decision == "VETO" else 1.0,
+            aegis_verified=True,
+            hallucination_detected=False,
+            input_sha256=blinded.input_sha256,
+            audit_id=audit_id,
         )
 
-    def _verify_and_finalize_ai_response(
+    def _finalize_from_verification(
         self,
-        raw_text: str,
+        v_res: Any,
         ctx: CandidateSetupAuditContext,
         blinded: BlindedTelemetry,
         latency_ms: float,
@@ -624,43 +838,19 @@ class AIVetoCommittee:
         model_used: str,
         start_perf: float,
     ) -> AIVetoDecision:
-        """Run Aegis Shields 1-4 & 6 on a raw LLM response; fall back to pure_math on hallucination/abstain."""
-        payload = self.clean_and_extract_json_payload(raw_text)
-        v_res = self.aegis.verify_response(
-            payload,
-            blinded,
-            provider=provider_used,
-            model_id=model_used,
+        audit_id = self._log_epistemic_and_update_trust(
+            ctx=ctx,
+            blinded=blinded,
+            provider_used=provider_used,
+            model_used=model_used,
+            raw_decision=v_res.raw_decision,
+            final_decision=v_res.final_decision,
+            confidence=v_res.confidence,
+            risk_multiplier=v_res.risk_multiplier,
+            hallucination_detected=v_res.hallucination_detected,
+            violation_codes=",".join(v_res.violation_codes),
+            reason=v_res.reason,
         )
-
-        audit_id = 0
-        if self.ledger_db is not None:
-            side_str = ctx.side.value if hasattr(ctx.side, "value") else str(ctx.side).upper()
-            audit_id = self.ledger_db.log_ai_epistemic_audit(
-                symbol=ctx.symbol,
-                side=side_str,
-                timeframe=ctx.timeframe,
-                provider=provider_used,
-                model_id=model_used,
-                input_sha256=blinded.input_sha256,
-                raw_decision=v_res.raw_decision,
-                final_decision=v_res.final_decision,
-                confidence=v_res.confidence,
-                risk_multiplier=v_res.risk_multiplier,
-                hallucination_detected=v_res.hallucination_detected,
-                violation_codes=",".join(v_res.violation_codes),
-                reason=v_res.reason,
-                is_canary=False,
-                predicted_net_r=ctx.net_avg_R,
-            )
-            stats = self.ledger_db.get_model_epistemic_stats(provider=provider_used, model_id=model_used, window=20)
-            self.model_selector.update_epistemic_trust(
-                provider_used,
-                model_used,
-                stats.epistemic_trust_score,
-                quarantined=stats.should_demote_to_pure_math,
-                reason=stats.demote_reason,
-            )
 
         if v_res.hallucination_detected:
             self.model_selector.record_failure(
@@ -731,6 +921,136 @@ class AIVetoCommittee:
             audit_id=audit_id,
         )
 
+    def _verify_and_finalize_ai_response(
+        self,
+        raw_text: str,
+        ctx: CandidateSetupAuditContext,
+        blinded: BlindedTelemetry,
+        latency_ms: float,
+        provider_used: str,
+        cascade_path: Sequence[str],
+        model_used: str,
+        start_perf: float,
+        swap_evaluator: Callable[[str], str] | None = None,
+    ) -> AIVetoDecision:
+        """Run Aegis Shields 1-6 (including Shield 5 order-swap) on a raw sync LLM response."""
+        try:
+            payload = self.clean_and_extract_json_payload(raw_text)
+        except Exception as exc:
+            payload = {"decision": "INVALID", "confidence": 0.0, "reason": str(exc)}
+        v_res = self.aegis.verify_response(
+            payload,
+            blinded,
+            provider=provider_used,
+            model_id=model_used,
+        )
+        if (
+            not v_res.hallucination_detected
+            and v_res.final_decision in ("APPROVE", "VETO")
+            and self.aegis.is_borderline_high_stakes(blinded.telemetry)
+            and swap_evaluator is not None
+        ):
+            swap_prompt = self.aegis.build_aegis_prompt(blinded, swap_order=True)
+            try:
+                swap_raw = swap_evaluator(swap_prompt)
+                swap_dec = self.parse_structured_decision(
+                    swap_raw,
+                    latency_ms=latency_ms,
+                    provider_used=provider_used,
+                    cascade_path=cascade_path,
+                    model_used=model_used,
+                ).decision
+            except Exception:
+                swap_dec = "ABSTAIN"
+            if swap_dec == "ABSTAIN" or not self.aegis.check_semantic_invariance(v_res.raw_decision, swap_dec):
+                return self._build_swap_abstain_decision(
+                    ctx=ctx,
+                    blinded=blinded,
+                    provider_used=provider_used,
+                    model_used=model_used,
+                    cascade_path=cascade_path,
+                    raw_decision=v_res.raw_decision,
+                    swap_decision=swap_dec,
+                    confidence=v_res.confidence,
+                    latency_ms=latency_ms,
+                    start_perf=start_perf,
+                )
+        return self._finalize_from_verification(
+            v_res=v_res,
+            ctx=ctx,
+            blinded=blinded,
+            latency_ms=latency_ms,
+            provider_used=provider_used,
+            cascade_path=cascade_path,
+            model_used=model_used,
+            start_perf=start_perf,
+        )
+
+    async def _verify_and_finalize_ai_response_async(
+        self,
+        raw_text: str,
+        ctx: CandidateSetupAuditContext,
+        blinded: BlindedTelemetry,
+        latency_ms: float,
+        provider_used: str,
+        cascade_path: Sequence[str],
+        model_used: str,
+        start_perf: float,
+        swap_evaluator: Callable[[str], Awaitable[str]] | None = None,
+    ) -> AIVetoDecision:
+        """Run Aegis Shields 1-6 (including async Shield 5 order-swap) on a raw LLM response."""
+        try:
+            payload = self.clean_and_extract_json_payload(raw_text)
+        except Exception as exc:
+            payload = {"decision": "INVALID", "confidence": 0.0, "reason": str(exc)}
+        v_res = self.aegis.verify_response(
+            payload,
+            blinded,
+            provider=provider_used,
+            model_id=model_used,
+        )
+        if (
+            not v_res.hallucination_detected
+            and v_res.final_decision in ("APPROVE", "VETO")
+            and self.aegis.is_borderline_high_stakes(blinded.telemetry)
+            and swap_evaluator is not None
+        ):
+            swap_prompt = self.aegis.build_aegis_prompt(blinded, swap_order=True)
+            try:
+                swap_raw = await swap_evaluator(swap_prompt)
+                swap_dec = self.parse_structured_decision(
+                    swap_raw,
+                    latency_ms=latency_ms,
+                    provider_used=provider_used,
+                    cascade_path=cascade_path,
+                    model_used=model_used,
+                ).decision
+            except Exception:
+                swap_dec = "ABSTAIN"
+            if swap_dec == "ABSTAIN" or not self.aegis.check_semantic_invariance(v_res.raw_decision, swap_dec):
+                return self._build_swap_abstain_decision(
+                    ctx=ctx,
+                    blinded=blinded,
+                    provider_used=provider_used,
+                    model_used=model_used,
+                    cascade_path=cascade_path,
+                    raw_decision=v_res.raw_decision,
+                    swap_decision=swap_dec,
+                    confidence=v_res.confidence,
+                    latency_ms=latency_ms,
+                    start_perf=start_perf,
+                )
+        return self._finalize_from_verification(
+            v_res=v_res,
+            ctx=ctx,
+            blinded=blinded,
+            latency_ms=latency_ms,
+            provider_used=provider_used,
+            cascade_path=cascade_path,
+            model_used=model_used,
+            start_perf=start_perf,
+        )
+
     def _get_ranked_model_ids(self, provider: str, ctx: CandidateSetupAuditContext, fallback_id: str) -> list[str]:
         """Score & pick the top candidate from each distinct non-quarantined model family."""
         stakes = compute_setup_stakes(
@@ -747,56 +1067,203 @@ class AIVetoCommittee:
             return []
         return [fallback_id]
 
+    @staticmethod
+    def _build_local_vllm_body(model_id: str, prompt: str) -> dict[str, Any]:
+        """Build an OpenAI-compatible ChatCompletions request with strict JSON Schema response_format."""
+        claim_schema = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "field": {"type": "string"},
+                    "op": {"type": "string", "enum": ["<", "<=", "==", ">=", ">"]},
+                    "cited_value": {"type": "number"},
+                    "threshold": {"type": "number"},
+                },
+                "required": ["field", "op", "cited_value", "threshold"],
+                "additionalProperties": False,
+            },
+        }
+        return {
+            "model": model_id,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Respond ONLY with valid JSON conforming to the Closed-World Proof-Carrying Schema.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 450,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "aegis_veto_verdict",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "bull_claims": claim_schema,
+                            "bear_claims": claim_schema,
+                            "decision": {"type": "string", "enum": ["APPROVE", "VETO", "ABSTAIN"]},
+                            "confidence": {"type": "number"},
+                            "risk_scale": {"type": "number"},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["bull_claims", "bear_claims", "decision", "confidence", "risk_scale", "reason"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        }
+
+    @staticmethod
+    def _extract_local_vllm_text(resp_json: dict[str, Any]) -> str:
+        choice = (resp_json.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        if "parsed" in msg and isinstance(msg["parsed"], dict):
+            return json.dumps(msg["parsed"])
+        return str(msg.get("content") or choice.get("text") or "")
+
+    def _call_local_vllm_sync(
+        self,
+        ctx: CandidateSetupAuditContext,
+        cascade_path: Sequence[str],
+    ) -> AIVetoDecision:
+        """Call local OpenAI-compatible vLLM / SGLang endpoint synchronously."""
+        if not self.vllm_endpoint:
+            raise RuntimeError("local_vllm endpoint not configured")
+        blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
+        prompt = self.aegis.build_aegis_prompt(blinded)
+        model_id = self.vllm_model
+
+        def _invoke(p_txt: str) -> str:
+            body_bytes = json.dumps(self._build_local_vllm_body(model_id, p_txt)).encode("utf-8")
+            req = urllib.request.Request(
+                self.vllm_endpoint,
+                data=body_bytes,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"local_vllm HTTP {resp.status}")
+                resp_json = json.loads(resp.read().decode("utf-8"))
+                return self._extract_local_vllm_text(resp_json)
+
+        t0 = time.perf_counter()
+        raw_text = _invoke(prompt)
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        return self._verify_and_finalize_ai_response(
+            raw_text=raw_text,
+            ctx=ctx,
+            blinded=blinded,
+            latency_ms=latency_ms,
+            provider_used=AIProviderName.LOCAL_VLLM.value,
+            cascade_path=cascade_path,
+            model_used=model_id,
+            start_perf=t0,
+            swap_evaluator=_invoke,
+        )
+
+    async def _call_local_vllm_async(
+        self,
+        ctx: CandidateSetupAuditContext,
+        cascade_path: Sequence[str],
+    ) -> AIVetoDecision:
+        """Async call to local OpenAI-compatible vLLM / SGLang server with Structured Outputs."""
+        if not self.vllm_endpoint:
+            raise RuntimeError("local_vllm endpoint not configured")
+        blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
+        prompt = self.aegis.build_aegis_prompt(blinded)
+        model_id = self.vllm_model
+        timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async def _invoke(p_txt: str) -> str:
+                body = self._build_local_vllm_body(model_id, p_txt)
+                async with session.post(
+                    self.vllm_endpoint,
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status != 200:
+                        err_txt = await resp.text()
+                        raise RuntimeError(f"local_vllm HTTP {resp.status}: {err_txt[:120]}")
+                    resp_json = await resp.json()
+                    return self._extract_local_vllm_text(resp_json)
+
+            t0 = time.perf_counter()
+            raw_text = await _invoke(prompt)
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+            return await self._verify_and_finalize_ai_response_async(
+                raw_text=raw_text,
+                ctx=ctx,
+                blinded=blinded,
+                latency_ms=latency_ms,
+                provider_used=AIProviderName.LOCAL_VLLM.value,
+                cascade_path=cascade_path,
+                model_used=model_id,
+                start_perf=t0,
+                swap_evaluator=_invoke,
+            )
+
     def _call_studio_api_sync(
         self,
         ctx: CandidateSetupAuditContext,
         cascade_path: Sequence[str],
     ) -> AIVetoDecision:
-        """Call Google AI Studio REST API with adaptive model selection & intra-provider cascade."""
+        """Call Google AI Studio REST API with adaptive model selection & header auth."""
         if not self.api_key:
             raise RuntimeError("studio_api not ready: GEMINI_API_KEY is empty")
 
         blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
         prompt = self.aegis.build_aegis_prompt(blinded)
-        payload_bytes = json.dumps(
-            {
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 450,
-                    "responseMimeType": "application/json",
-                },
-            }
-        ).encode("utf-8")
-
         candidate_models = self._get_ranked_model_ids("studio_api", ctx, self.model)
         last_exc: Exception | None = None
         for model_id in candidate_models:
             t0 = time.perf_counter()
-            url = self.GEMINI_ENDPOINT_TEMPLATE.format(model=model_id, api_key=self.api_key)
-            req = urllib.request.Request(
-                url,
-                data=payload_bytes,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
+            url = self.GEMINI_ENDPOINT_TEMPLATE.format(model=model_id)
+
+            def _invoke_studio(p_txt: str, target_url: str = url) -> str:
+                payload_bytes = json.dumps(
+                    {
+                        "contents": [{"parts": [{"text": p_txt}]}],
+                        "generationConfig": {
+                            "temperature": 0.1,
+                            "maxOutputTokens": 450,
+                            "responseMimeType": "application/json",
+                        },
+                    }
+                ).encode("utf-8")
+                req = urllib.request.Request(
+                    target_url,
+                    data=payload_bytes,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-goog-api-key": self.api_key,
+                    },
+                    method="POST",
+                )
                 with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                    latency_ms = (time.perf_counter() - t0) * 1000.0
                     if resp.status != 200:
                         raise RuntimeError(f"studio_api HTTP {resp.status}")
                     resp_json = json.loads(resp.read().decode("utf-8"))
-                    raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-                    return self._verify_and_finalize_ai_response(
-                        raw_text=raw_text,
-                        ctx=ctx,
-                        blinded=blinded,
-                        latency_ms=latency_ms,
-                        provider_used=AIProviderName.STUDIO_API.value,
-                        cascade_path=cascade_path,
-                        model_used=model_id,
-                        start_perf=t0,
-                    )
+                    return resp_json["candidates"][0]["content"]["parts"][0]["text"]
+
+            try:
+                raw_text = _invoke_studio(prompt)
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                return self._verify_and_finalize_ai_response(
+                    raw_text=raw_text,
+                    ctx=ctx,
+                    blinded=blinded,
+                    latency_ms=latency_ms,
+                    provider_used=AIProviderName.STUDIO_API.value,
+                    cascade_path=cascade_path,
+                    model_used=model_id,
+                    start_perf=t0,
+                    swap_evaluator=_invoke_studio,
+                )
             except Exception as exc:
                 last_exc = exc
                 err_s = str(exc)
@@ -814,45 +1281,57 @@ class AIVetoCommittee:
         ctx: CandidateSetupAuditContext,
         cascade_path: Sequence[str],
     ) -> AIVetoDecision:
-        """Async call to Google AI Studio REST API with adaptive model selection & cascade."""
+        """Async call to Google AI Studio REST API with header auth & Shield 5 order-swap."""
         if not self.api_key:
             raise RuntimeError("studio_api not ready: GEMINI_API_KEY is empty")
 
         blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
         prompt = self.aegis.build_aegis_prompt(blinded)
-        body = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 450,
-                "responseMimeType": "application/json",
-            },
-        }
         candidate_models = self._get_ranked_model_ids("studio_api", ctx, self.model)
         last_exc: Exception | None = None
         timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for model_id in candidate_models:
                 t0 = time.perf_counter()
-                url = self.GEMINI_ENDPOINT_TEMPLATE.format(model=model_id, api_key=self.api_key)
-                try:
-                    async with session.post(url, json=body) as resp:
-                        latency_ms = (time.perf_counter() - t0) * 1000.0
+                url = self.GEMINI_ENDPOINT_TEMPLATE.format(model=model_id)
+
+                async def _invoke_studio_async(p_txt: str, target_url: str = url) -> str:
+                    body = {
+                        "contents": [{"parts": [{"text": p_txt}]}],
+                        "generationConfig": {
+                            "temperature": 0.1,
+                            "maxOutputTokens": 450,
+                            "responseMimeType": "application/json",
+                        },
+                    }
+                    async with session.post(
+                        target_url,
+                        json=body,
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-goog-api-key": self.api_key,
+                        },
+                    ) as resp:
                         if resp.status != 200:
                             err_txt = await resp.text()
                             raise RuntimeError(f"studio_api HTTP {resp.status}: {err_txt[:120]}")
                         resp_json = await resp.json()
-                        raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-                        return self._verify_and_finalize_ai_response(
-                            raw_text=raw_text,
-                            ctx=ctx,
-                            blinded=blinded,
-                            latency_ms=latency_ms,
-                            provider_used=AIProviderName.STUDIO_API.value,
-                            cascade_path=cascade_path,
-                            model_used=model_id,
-                            start_perf=t0,
-                        )
+                        return resp_json["candidates"][0]["content"]["parts"][0]["text"]
+
+                try:
+                    raw_text = await _invoke_studio_async(prompt)
+                    latency_ms = (time.perf_counter() - t0) * 1000.0
+                    return await self._verify_and_finalize_ai_response_async(
+                        raw_text=raw_text,
+                        ctx=ctx,
+                        blinded=blinded,
+                        latency_ms=latency_ms,
+                        provider_used=AIProviderName.STUDIO_API.value,
+                        cascade_path=cascade_path,
+                        model_used=model_id,
+                        start_perf=t0,
+                        swap_evaluator=_invoke_studio_async,
+                    )
                 except Exception as exc:
                     last_exc = exc
                     err_s = str(exc)
@@ -892,23 +1371,27 @@ class AIVetoCommittee:
 
         for model_id in candidate_models:
             t0 = time.perf_counter()
-            cmd = [
-                agy_exe,
-                "-p",
-                prompt,
-                "--output-format",
-                "json",
-                "--print-timeout",
-                f"{timeout_int}s",
-                "--disable-slash-commands",
-            ]
-            if model_id != "default":
-                cmd.extend(["--model", model_id])
-            else:
-                cmd.extend(["--effort", "low"])
-            try:
+
+            def _build_cmd(p_txt: str, mid: str = model_id) -> list[str]:
+                cmd = [
+                    agy_exe,
+                    "-p",
+                    p_txt,
+                    "--output-format",
+                    "json",
+                    "--print-timeout",
+                    f"{timeout_int}s",
+                    "--disable-slash-commands",
+                ]
+                if mid != "default":
+                    cmd.extend(["--model", mid])
+                else:
+                    cmd.extend(["--effort", "low"])
+                return cmd
+
+            def _invoke_agy(p_txt: str, mid: str = model_id) -> str:
                 proc = subprocess.run(
-                    cmd,
+                    _build_cmd(p_txt, mid),
                     cwd=iso_dir,
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
@@ -917,7 +1400,6 @@ class AIVetoCommittee:
                     encoding="utf-8",
                     errors="replace",
                 )
-                latency_ms = (time.perf_counter() - t0) * 1000.0
                 stdout_txt = (proc.stdout or "").strip()
                 stderr_txt = (proc.stderr or "").strip()
                 combined_low = (stdout_txt + "\n" + stderr_txt).lower()
@@ -925,10 +1407,14 @@ class AIVetoCommittee:
                     tok in combined_low
                     for tok in ("credits", "balance is too low", "too low to continue", "quota", "resource_exhausted", "429")
                 ):
-                    raise RuntimeError(f"QUOTA_EXHAUSTED ({model_id}): {(stdout_txt or stderr_txt)[:180]}")
+                    raise RuntimeError(f"QUOTA_EXHAUSTED ({mid}): {(stdout_txt or stderr_txt)[:180]}")
                 if not stdout_txt:
                     raise RuntimeError(f"agy_pro exited {proc.returncode} with empty stdout: {stderr_txt[:160]}")
+                return stdout_txt
 
+            try:
+                stdout_txt = _invoke_agy(prompt)
+                latency_ms = (time.perf_counter() - t0) * 1000.0
                 decision = self._verify_and_finalize_ai_response(
                     raw_text=stdout_txt,
                     ctx=ctx,
@@ -938,6 +1424,7 @@ class AIVetoCommittee:
                     cascade_path=cascade_path,
                     model_used=model_id,
                     start_perf=t0,
+                    swap_evaluator=_invoke_agy,
                 )
                 self._agy_consecutive_failures = 0
                 return decision
@@ -973,8 +1460,118 @@ class AIVetoCommittee:
         ctx: CandidateSetupAuditContext,
         cascade_path: Sequence[str],
     ) -> AIVetoDecision:
-        """Run `_call_agy_pro_sync` in a worker thread so the async event loop never blocks."""
-        return await asyncio.to_thread(self._call_agy_pro_sync, ctx, cascade_path)
+        """Native non-blocking `asyncio.create_subprocess_exec` invocation of `agy_pro` with clean timeout kill."""
+        now_utc = time.time()
+        if now_utc < self._agy_cooldown_until_utc:
+            rem_s = int(self._agy_cooldown_until_utc - now_utc)
+            raise RuntimeError(f"agy_pro in cooldown ({rem_s}s remaining); skipping to fallback")
+
+        agy_exe = self._cached_agy_path
+        if not agy_exe or not self._cached_agy_auth_ok:
+            raise RuntimeError("agy_pro not ready or not found")
+
+        blinded = self.aegis.normalize_ticker_blinded_telemetry(ctx)
+        prompt = self.aegis.build_aegis_prompt(blinded)
+        timeout_int = max(5, int(round(self.agy_timeout_seconds)))
+        iso_dir = self.get_isolated_temp_dir()
+        candidate_models = self._get_ranked_model_ids("agy_pro", ctx, "default")
+        if not candidate_models:
+            self._agy_cooldown_until_utc = time.time() + 600.0
+            raise RuntimeError("All agy_pro model families are quarantined/exhausted; falling back to pure_math + Z3")
+        last_exc: Exception | None = None
+
+        for model_id in candidate_models:
+            t0 = time.perf_counter()
+
+            async def _invoke_agy_async(p_txt: str, mid: str = model_id) -> str:
+                cmd = [
+                    agy_exe,
+                    "-p",
+                    p_txt,
+                    "--output-format",
+                    "json",
+                    "--print-timeout",
+                    f"{timeout_int}s",
+                    "--disable-slash-commands",
+                ]
+                if mid != "default":
+                    cmd.extend(["--model", mid])
+                else:
+                    cmd.extend(["--effort", "low"])
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=iso_dir,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    raw_out, raw_err = await asyncio.wait_for(
+                        proc.communicate(),
+                        timeout=float(timeout_int) + 4.0,
+                    )
+                except asyncio.TimeoutError as exc:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except OSError:
+                        pass
+                    raise TimeoutError(f"agy_pro async timed out after {timeout_int + 4}s") from exc
+
+                stdout_txt = (raw_out or b"").decode("utf-8", errors="replace").strip()
+                stderr_txt = (raw_err or b"").decode("utf-8", errors="replace").strip()
+                combined_low = (stdout_txt + "\n" + stderr_txt).lower()
+                if any(
+                    tok in combined_low
+                    for tok in ("credits", "balance is too low", "too low to continue", "quota", "resource_exhausted", "429")
+                ):
+                    raise RuntimeError(f"QUOTA_EXHAUSTED ({mid}): {(stdout_txt or stderr_txt)[:180]}")
+                if not stdout_txt:
+                    raise RuntimeError(f"agy_pro exited {proc.returncode} with empty stdout: {stderr_txt[:160]}")
+                return stdout_txt
+
+            try:
+                stdout_txt = await _invoke_agy_async(prompt)
+                latency_ms = (time.perf_counter() - t0) * 1000.0
+                decision = await self._verify_and_finalize_ai_response_async(
+                    raw_text=stdout_txt,
+                    ctx=ctx,
+                    blinded=blinded,
+                    latency_ms=latency_ms,
+                    provider_used=AIProviderName.AGY_PRO.value,
+                    cascade_path=cascade_path,
+                    model_used=model_id,
+                    start_perf=t0,
+                    swap_evaluator=_invoke_agy_async,
+                )
+                self._agy_consecutive_failures = 0
+                return decision
+            except Exception as exc:
+                last_exc = exc
+                err_s = str(exc)
+                self.model_selector.record_failure(
+                    "agy_pro",
+                    model_id,
+                    err_s,
+                    is_quota_or_429=(
+                        "quota" in err_s.lower()
+                        or "429" in err_s
+                        or "exhaust" in err_s.lower()
+                        or "credits" in err_s.lower()
+                        or "balance" in err_s.lower()
+                    ),
+                )
+                logger.warning("agy_pro async model %s failed (%s); cascading...", model_id, err_s)
+
+        self._agy_consecutive_failures += 1
+        if self._agy_consecutive_failures >= 2:
+            self._agy_cooldown_until_utc = time.time() + 600.0
+            logger.warning(
+                "agy_pro failed %d times in a row (%s). Entering 10-minute cooldown to pure_math.",
+                self._agy_consecutive_failures,
+                last_exc,
+            )
+        raise last_exc or RuntimeError("agy_pro async failed")
 
     def _evaluate_pure_math_fallback(
         self,
@@ -1058,6 +1655,15 @@ class AIVetoCommittee:
                     logger.warning("%s; cascading to next AI tier...", err_msg)
                     continue
 
+            if provider == AIProviderName.LOCAL_VLLM.value:
+                try:
+                    return self._call_local_vllm_sync(ctx, cascade_path=attempted)
+                except Exception as exc:
+                    err_msg = f"local_vllm failed ({exc})"
+                    errors.append(err_msg)
+                    logger.warning("%s; cascading to next AI tier...", err_msg)
+                    continue
+
             if provider == AIProviderName.AGY_PRO.value:
                 try:
                     return self._call_agy_pro_sync(ctx, cascade_path=attempted)
@@ -1122,6 +1728,15 @@ class AIVetoCommittee:
                     return await self._call_studio_api_async(ctx, cascade_path=attempted)
                 except Exception as exc:
                     err_msg = f"studio_api failed ({exc})"
+                    errors.append(err_msg)
+                    logger.warning("%s; cascading to next AI tier...", err_msg)
+                    continue
+
+            if provider == AIProviderName.LOCAL_VLLM.value:
+                try:
+                    return await self._call_local_vllm_async(ctx, cascade_path=attempted)
+                except Exception as exc:
+                    err_msg = f"local_vllm failed ({exc})"
                     errors.append(err_msg)
                     logger.warning("%s; cascading to next AI tier...", err_msg)
                     continue

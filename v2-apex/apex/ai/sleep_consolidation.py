@@ -269,7 +269,19 @@ class SleepWakeConsolidator:
             audits_consolidated=audits_cnt,
         )
 
+        existing_raw: dict[str, Any] = {}
+        if self.memory_path.exists():
+            try:
+                loaded = json.loads(self.memory_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    existing_raw = loaded
+            except Exception:
+                existing_raw = {}
+
         payload = snap.to_json_dict()
+        if "hyperion_compute_profile" in existing_raw and "hyperion_compute_profile" not in payload:
+            payload["hyperion_compute_profile"] = existing_raw["hyperion_compute_profile"]
+
         self.memory_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.memory_path.with_suffix(".json.tmp")
         tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -354,22 +366,27 @@ class SleepWakeConsolidator:
         canary_evaluator: Callable[[CandidateSetupAuditContext], AIVetoDecision] | None = None,
         now_utc: float | None = None,
     ) -> SleepWakeCycleResult:
-        """Execute Phase A -> Phase C -> Phase B in one clean Circadian Sleep-Wake cycle."""
+        """Execute Phase A (Purge) -> Phase B (Consolidate) -> Phase C (Wake-Up Audit) in order."""
         purge_stats = self.phase_a_purge_working_memory(
             ai_committee=ai_committee,
             feed_router=feed_router,
+        )
+        snap, ckpt_id = self.phase_b_consolidate_semantic_memory(
+            trigger_reason=trigger_reason,
+            purged_cache_entries=purge_stats["total_purged"],
+            canary_passed=True,
+            hydra_nbbo=hydra_nbbo,
+            now_utc=now_utc,
         )
         canary_ok, status_msg = self.phase_c_morning_wakeup_audit(
             ai_committee=ai_committee,
             canary_evaluator=canary_evaluator,
         )
-        snap, ckpt_id = self.phase_b_consolidate_semantic_memory(
-            trigger_reason=trigger_reason,
-            purged_cache_entries=purge_stats["total_purged"],
-            canary_passed=canary_ok,
-            hydra_nbbo=hydra_nbbo,
-            now_utc=now_utc,
-        )
+        if not canary_ok and hasattr(self.ledger_db, "update_consolidation_checkpoint_canary"):
+            try:
+                self.ledger_db.update_consolidation_checkpoint_canary(ckpt_id, False, status_msg)
+            except Exception:
+                pass
         logger.info("%s (Cycle #%d)", status_msg, snap.cycle_number)
         return SleepWakeCycleResult(
             cycle_number=snap.cycle_number,

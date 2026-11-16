@@ -53,7 +53,9 @@ def test_web_cockpit_http_ws_csrf_and_port_fallback() -> None:
             assert "PocketBot Apex" in html
 
         state = _http_get_json(f"{url1}/api/state")
-        csrf = state["csrf_token"]
+        assert "csrf_token" not in state
+        csrf_body = _http_get_json(f"{url1}/api/csrf")
+        csrf = csrf_body["csrf_token"]
         assert isinstance(csrf, str) and len(csrf) >= 16
 
         # Missing or bad CSRF must be rejected with 403

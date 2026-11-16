@@ -26,6 +26,13 @@ from apex.quant.correlation_shield import (
     PositionRiskSpec,
     decompose_symbol_factors,
 )
+from apex.quant.neural_alpha import (
+    MultiResolutionWindow,
+    NeuralAlphaBatchResult,
+    NeuralAlphaForecast,
+    NeuralAlphaForecaster,
+    compute_realized_bipower_variation,
+)
 
 __all__ = [
     "MarketRegime",
@@ -46,4 +53,9 @@ __all__ = [
     "FactorExposureVerdict",
     "PositionRiskSpec",
     "decompose_symbol_factors",
+    "MultiResolutionWindow",
+    "NeuralAlphaBatchResult",
+    "NeuralAlphaForecast",
+    "NeuralAlphaForecaster",
+    "compute_realized_bipower_variation",
 ]

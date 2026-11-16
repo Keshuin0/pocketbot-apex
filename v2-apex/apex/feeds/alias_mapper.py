@@ -433,10 +433,18 @@ class SmartAliasMapper:
         s = symbol.strip()
         # Common suffixes
         s = re.sub(r"\.(OQ|NYSE|NASDAQ|cash|pro|raw|ecn|std)$", "", s, flags=re.IGNORECASE)
-        # Trailing 'm' or '_i' for micro/institution accounts when symbol has 6+ chars
-        if len(s) == 7 and s.endswith("m") and s[:6].isalpha():
-            s = s[:6]
-        elif s.endswith("_i"):
+        # Trailing 'm'/'M' or '_i'/'_I' for micro/institution accounts when symbol has 6-char FX/metal/crypto root
+        if len(s) == 7 and s.endswith(("m", "M")) and s[:6].isalpha():
+            root6 = s[:6]
+            is_fx6 = root6[:3] in FOREX_CURRENCIES and root6[3:6] in FOREX_CURRENCIES
+            is_known6 = (
+                root6 in METAL_ALIASES
+                or root6 in ENERGY_ALIASES
+                or any(root6.startswith(c) and root6[len(c):] in {"USD", "EUR"} for c in CRYPTO_BASES)
+            )
+            if is_fx6 or is_known6:
+                s = root6
+        elif s.endswith(("_i", "_I")):
             s = s[:-2]
         return s
 
@@ -499,7 +507,7 @@ class SmartAliasMapper:
 
         # Crypto
         for c in CRYPTO_BASES:
-            if clean_sym.startswith(c) and (clean_sym.endswith("USD") or clean_sym.endswith("EUR") or clean_sym.endswith("USDT")):
+            if clean_sym.startswith(c) and clean_sym[len(c):] in {"USD", "EUR", "USDT", "USDC", "GBP", "AUD"}:
                 return AssetClass.CRYPTO
 
         # Indices
