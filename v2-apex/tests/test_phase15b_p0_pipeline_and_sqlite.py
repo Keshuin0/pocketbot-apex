@@ -10,8 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from apex.cockpit.tui_dashboard import BrokerExecutionEvent
-from apex.engine.canonical_pipeline import AgentPipelineTrace, Canonical11AgentPipeline, PipelineStageResult
+from apex.engine.canonical_pipeline import Canonical11AgentPipeline
 from apex.execution.position_manager import AutonomousPositionOrchestrator, PositionDecision
 from apex.feeds.dual_router import MarketFeedRouter
 from apex.feeds.models import AssetClass, Candle, DiscoveredSymbol, Side, Tick

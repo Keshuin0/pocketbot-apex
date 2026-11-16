@@ -128,8 +128,8 @@ class TelegramRemoteController:
                         llots = float(getattr(lp, "lots", 0.0) or (lp.get("lots", 0.0) if isinstance(lp, dict) else 0.0))
                         lprofit = float(getattr(lp, "profit", 0.0) or (lp.get("profit", 0.0) if isinstance(lp, dict) else 0.0))
                         lines.append(f"• `{lsym}` `{llots:.2f}` PnL `{lprofit:+.2f}`")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Skipping unparseable live position entry: %s", exc)
             if len(lines) == 1:
                 lines.append("• No open positions.")
             return "\n".join(lines)
@@ -143,8 +143,8 @@ class TelegramRemoteController:
                 try:
                     mfe_stats = self.ledger_db.compute_mfe_mae_capture()
                     closed_cnt = int(mfe_stats.get("closed_count", 0))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("MFE/MAE telemetry unavailable for /daily: %s", exc)
             return (
                 f"📈 *Daily Risk & Performance*\n"
                 f"• Equity: `${eq:,.2f}`\n"
@@ -178,8 +178,8 @@ class TelegramRemoteController:
             if self.mode_change_callback is not None:
                 try:
                     self.mode_change_callback("resume")
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("mode_change_callback('resume') raised: %s", exc)
             return "▶️ *Scanning RESUMED.* Execution checks re-armed."
 
         if cmd == "/mode":
@@ -236,8 +236,8 @@ class TelegramRemoteController:
             upd_id = int(update.get("update_id", 0))
             if upd_id >= self._last_update_id:
                 self._last_update_id = upd_id + 1
-        except (TypeError, ValueError):
-            pass
+        except (TypeError, ValueError) as exc:
+            logger.debug("Malformed Telegram update_id ignored: %s", exc)
 
         msg = update.get("message") or update.get("edited_message")
         if not isinstance(msg, dict):

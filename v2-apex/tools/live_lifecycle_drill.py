@@ -364,10 +364,7 @@ def run_live_lifecycle_drill(
     pos_id = order_ticket
     hold_secs = max(1, int(hold_seconds))
     last_floating = 0.0
-    sltp_retcode = -1
-    close_retcode = -1
     close_deal_id = 0
-    close_px = fill_price
     orchestrator = AutonomousPositionOrchestrator()
     open_ts = time.time()
 

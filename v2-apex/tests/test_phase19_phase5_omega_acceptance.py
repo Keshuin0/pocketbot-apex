@@ -32,7 +32,6 @@ from apex.ai.model_selector import AdaptiveModelSelector, ModelTier
 from apex.ai.sleep_consolidation import SleepWakeConsolidator
 from apex.ai.veto_committee import (
     AIVetoCommittee,
-    AIVetoDecision,
     AIProviderName,
     CandidateSetupAuditContext,
 )
@@ -840,15 +839,16 @@ def test_omega5_telegram_security_markdownv2_and_polling(
 
 
 def test_omega5_tui_cli_replay_cpcv_positions_and_confirm_mode(tmp_path: Path) -> None:
-    # (a) Standalone TUI CLI preview entrypoint exits cleanly
-    proc = subprocess.run(
-        [sys.executable, "-m", "apex.cockpit.tui_dashboard", "--help"],
-        cwd=str(WORKSPACE_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    assert proc.returncode == 0
+    # (a) Standalone TUI CLI preview entrypoint exits cleanly (both --help and snapshot render)
+    for tui_args in (["--help"], ["--equity", "12500", "--mode", "DEMO-CONFIRM"]):
+        proc = subprocess.run(
+            [sys.executable, "-m", "apex.cockpit.tui_dashboard", *tui_args],
+            cwd=str(WORKSPACE_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert proc.returncode == 0
 
     # (b) Replay Engine: tier-aware M5 preference, AUTO_TOP12 handling, CPCV/PBO/DSR, finite PF, non-overlapping trades
     seen_tfs: list[tuple[str, str]] = []

@@ -1118,8 +1118,8 @@ class CTraderOpenApiFeed:
             if getattr(reactor, "running", False) and not isInIOThread():
                 reactor.callFromThread(self._client.send, req)
                 return None
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Twisted reactor dispatch unavailable, falling back to direct send: %s", exc)
         return self._client.send(req)
 
     def _handle_trendbars_res(self, extracted: oa_msg.ProtoOAGetTrendbarsRes) -> list[Candle]:

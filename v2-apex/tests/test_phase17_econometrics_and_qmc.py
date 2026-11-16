@@ -20,7 +20,6 @@ from apex.feeds.models import Candle, DOMAnalytics, Side
 from apex.quant.contagion_oracle import ContagionOracle
 from apex.quant.correlation_shield import (
     CorrelationShield,
-    PositionRiskSpec,
     compute_ledoit_wolf_and_tail_correlation,
     compute_tail_crash_correlation,
 )

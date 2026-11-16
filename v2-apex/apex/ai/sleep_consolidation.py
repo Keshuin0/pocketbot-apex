@@ -385,8 +385,8 @@ class SleepWakeConsolidator:
         if not canary_ok and hasattr(self.ledger_db, "update_consolidation_checkpoint_canary"):
             try:
                 self.ledger_db.update_consolidation_checkpoint_canary(ckpt_id, False, status_msg)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Optional canary checkpoint status update skipped: %s", exc)
         logger.info("%s (Cycle #%d)", status_msg, snap.cycle_number)
         return SleepWakeCycleResult(
             cycle_number=snap.cycle_number,

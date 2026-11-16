@@ -1514,8 +1514,8 @@ class AIVetoCommittee:
                     try:
                         proc.kill()
                         await proc.wait()
-                    except OSError:
-                        pass
+                    except OSError as kill_exc:
+                        logger.debug("agy_pro cleanup after timeout: %s", kill_exc)
                     raise TimeoutError(f"agy_pro async timed out after {timeout_int + 4}s") from exc
 
                 stdout_txt = (raw_out or b"").decode("utf-8", errors="replace").strip()

@@ -14,9 +14,9 @@ from ctrader_open_api.messages import (
 from apex.execution.position_manager import AutonomousPositionOrchestrator
 from apex.execution.router import DualBrokerExecutionRouter, ExecutionOrderRequest
 from apex.feeds.alias_mapper import SmartAliasMapper
-from apex.feeds.ctrader_feed import CTRADER_VOLUME_CENTS_PER_UNIT, CTraderOpenApiFeed
+from apex.feeds.ctrader_feed import CTRADER_VOLUME_CENTS_PER_UNIT
 from apex.feeds.dual_router import MarketFeedRouter
-from apex.feeds.hydra_nbbo import HydraNBBOEngine, ResolvedMeshTopology, VenueFeeProfile
+from apex.feeds.hydra_nbbo import HydraNBBOEngine, VenueFeeProfile
 from apex.feeds.models import AssetClass, Candle, ContractSpec, Side, Tick
 
 
