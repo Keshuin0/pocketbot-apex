@@ -301,6 +301,14 @@ class ApexTUIDashboard:
 
 if __name__ == "__main__":
     import argparse
+    import os
+    import sys
+
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(description="PocketBot Apex TUI Cockpit Diagnostic Preview")
     parser.add_argument("--equity", type=float, default=10000.0, help="Displayed equity balance")
