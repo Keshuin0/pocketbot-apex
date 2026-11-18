@@ -11,7 +11,7 @@ aiohttp>=3.9.0
 python-dotenv>=1.0.0
 rich>=13.7.0
 pytest>=8.0.0
-z3-solver>=4.12.0
+z3-solver>=5.4.1.0
 
 # Optional GPU Acceleration (installed via 10_ENABLE_GPU_TURBO.bat / setup_gpu_acceleration.py):
 #   NVIDIA CUDA 13.x: cupy-cuda13x[ctk]
