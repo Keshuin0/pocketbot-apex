@@ -1,7 +1,7 @@
 # Core PocketBot Apex Institutional Quant, Broker & AI Dependencies
 MetaTrader5>=5.0.45
 numpy>=1.26.0
-scipy>=1.12.0
+scipy>=1.18.1
 numba>=0.60.0
 ctrader-open-api>=0.9.2
 twisted>=24.3.0
